@@ -113,10 +113,11 @@ class TrafficDecisionModule:
         crop = frame[y1:y2, x1:x2]
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         
-        # Red has two masks in HSV (wraps around 180)
-        lower_red1 = np.array([0, 70, 50])
-        upper_red1 = np.array([10, 255, 255])
-        lower_red2 = np.array([170, 70, 50])
+        # Red has two masks in HSV (wraps around 180). We widen it slightly
+        # because the camera exposure can shift the red light towards orange/white.
+        lower_red1 = np.array([0, 50, 50])
+        upper_red1 = np.array([12, 255, 255])
+        lower_red2 = np.array([160, 50, 50])
         upper_red2 = np.array([180, 255, 255])
         
         mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
@@ -205,25 +206,29 @@ class TrafficDecisionModule:
         # Priority: Red Light > Stop Sign > Obstacle > Normal
         
         if sees_red_light:
+            if self.state != "SYS_STOP": print("\n🛑 [YOLO] Red Light Detected! Halting car.")
             self.state = "SYS_STOP"
             self.reason = "RED LIGHT"
             
         elif obstacle_in_path:
+            if self.state != "SYS_STOP": print(f"\n⚠️ [YOLO] Obstacle Detected in Path! Halting car ({self.reason}).")
             self.state = "SYS_STOP"
             # reason already set by the specific label
             
         elif sees_close_stop_sign:
             if self.stop_sign_timer == 0.0:
                 # Start the stopping timer
+                print(f"\n🛑 [YOLO] Stop Sign reached! Halting for {self.halt_duration} seconds...")
                 self.stop_sign_timer = now
                 self.state = "SYS_STOP"
                 self.reason = "STOP SIGN (HALTING)"
             elif now - self.stop_sign_timer < self.halt_duration:
                 # Still halting at the sign
                 self.state = "SYS_STOP"
-                self.reason = "STOP SIGN (HALTING)"
+                self.reason = f"STOP SIGN ({self.halt_duration - (now - self.stop_sign_timer):.1f}s)"
             else:
                 # Finished waiting at stop sign, proceed and initiate cooldown
+                print("\n✅ [YOLO] Stop Sign complete. Proceeding (Cooldown active).")
                 self.stop_sign_timer = 0.0
                 self.stop_sign_cooldown = now + self.cooldown_duration
                 self.state = "SYS_GO"
@@ -234,8 +239,9 @@ class TrafficDecisionModule:
             if self.stop_sign_timer > 0.0:
                 if now - self.stop_sign_timer < self.halt_duration:
                     self.state = "SYS_STOP"
-                    self.reason = "STOP SIGN (HALTING)"
+                    self.reason = f"STOP SIGN ({self.halt_duration - (now - self.stop_sign_timer):.1f}s)"
                 else:
+                    print("\n✅ [YOLO] Stop Sign complete. Proceeding (Cooldown active).")
                     self.stop_sign_timer = 0.0
                     self.stop_sign_cooldown = now + self.cooldown_duration
                     self.state = "SYS_GO"
@@ -640,7 +646,13 @@ class BFMC_Pilot:
                 total_offset  = RIGHT_LANE_OFFSET_PX + ((cv2.getTrackbarPos("Fine Offset", "BFMC_v2_LANE_VIEW") - 50) * 2)
                 base_speed    = cv2.getTrackbarPos("Base Speed", "BFMC_v2_LANE_VIEW")
 
-                frame = self.picam2.capture_array() if self.cam_ok else np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+                if self.cam_ok:
+                    frame = self.picam2.capture_array()
+                    # FIX: Picamera2 often outputs RGB arrays even if BGR888 is requested on Pi5.
+                    # OpenCV expects BGR. This flips the color channels to fix the 'bluish' filter.
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                else:
+                    frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
 
                 # --- 1. RUN YOLO TRAFFIC LOGIC OVER RAW FRAME ---
                 yolo_dbg_frame = self.traffic_module.update(frame)
