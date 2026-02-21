@@ -138,10 +138,10 @@ class TrafficDecisionModule:
         center_x = (x1 + x2) / 2
         bottom_y = y2
         
-        # Middle 70% of screen horizontally
-        in_horizontal_path = (frame_w * 0.15) < center_x < (frame_w * 0.85)
-        # Bottom 60% of screen vertically (in our physical path)
-        is_close = bottom_y > (frame_h * 0.40)
+        # Middle 60% of screen horizontally
+        in_horizontal_path = (frame_w * 0.20) < center_x < (frame_w * 0.80)
+        # Bottom 40% of screen vertically (in our physical path very close)
+        is_close = bottom_y > (frame_h * 0.60)
         
         return in_horizontal_path and is_close
 
@@ -185,25 +185,26 @@ class TrafficDecisionModule:
 
             # --- Rule Logic ---
             if label == "traffic-light":
-                # Only check light if it's reasonably close (height > 10px)
-                if box_h > 10 and self._is_light_red(frame_bgr, x1, y1, x2, y2):
+                # Must be very near (height > 25px instead of 10)
+                if box_h > 25 and self._is_light_red(frame_bgr, x1, y1, x2, y2):
                     sees_red_light = True
                     cv2.putText(dbg_frame, "RED LIGHT", (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
                     
             elif label == "stop-sign":
-                # Detect earlier (height > 25px instead of 45px)
-                if box_h > 25 and now > self.stop_sign_cooldown:
+                # Must be near (height > 55px instead of 25px)
+                if box_h > 55 and now > self.stop_sign_cooldown:
                     sees_close_stop_sign = True
                     
             elif label in ["car", "pedestrian", "closed-road-stand", "no-entry-road-sign"]:
-                # If these are in our direct path, we must halt. 
-                # (No-entry effectively acts as a solid obstacle until alternate routing is implemented)
-                if self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
+                # If these are in our direct path and quite large.
+                if box_h > 50 and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
                     obstacle_in_path = True
                     self.reason = f"OBSTACLE ({label})"
                     
             elif label == "crosswalk-sign":
-                sees_crosswalk = True
+                # Only slow down if it's near
+                if box_h > 40:
+                    sees_crosswalk = True
                 
             elif label in ["highway-entry-sign", "highway-exit-sign", "priority-road-sign"]:
                 # Informational signs, simply overlay text on screen
@@ -642,8 +643,73 @@ class BFMC_Pilot:
         self._fps = 0.9 * self._fps + 0.1 * (1.0 / max(now - self._fps_t, 1e-6))
         self._fps_t = now
 
+    def auto_calibrate_horizon(self, frame):
+        """
+        Dynamically finds the vanishing point (horizon) using Hough lines
+        on the raw camera frame to automatically adjust the BEV perspective transform.
+        """
+        print("[INIT] Auto-Calibrating Camera Pitch / Horizon...")
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        
+        # Only look at the bottom half to avoid background noise above the track
+        h, w = edges.shape
+        roi = np.zeros_like(edges)
+        cv2.fillPoly(roi, [np.array([[(0, h), (0, h//2 + 50), (w, h//2 + 50), (w, h)]])], 255)
+        masked_edges = cv2.bitwise_and(edges, roi)
+
+        lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, 50, minLineLength=40, maxLineGap=20)
+        
+        if lines is None:
+            print("[INIT] Calibration failed (no lines). Using default horizon.")
+            return
+
+        left_lines, right_lines = [], []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x1 == x2: continue
+            slope = (y2 - y1) / (x2 - x1)
+            b = y1 - slope * x1
+            if -1.5 < slope < -0.3: left_lines.append((slope, b))
+            elif 0.3 < slope < 1.5: right_lines.append((slope, b))
+
+        if not left_lines or not right_lines:
+            print("[INIT] Calibration failed (missing left/right lanes). Using default.")
+            return
+
+        # Median slopes and intercepts
+        l_m = np.median([l[0] for l in left_lines])
+        l_b = np.median([l[1] for l in left_lines])
+        r_m = np.median([r[0] for r in right_lines])
+        r_b = np.median([r[1] for r in right_lines])
+
+        if l_m == r_m: return
+
+        # Intersection
+        vx = (r_b - l_b) / (l_m - r_m)
+        vy = l_m * vx + l_b
+
+        # Safely update the SRC_PTS top Y-coordinates to the new horizon
+        horizon_y = max(100, min(int(vy) + 30, h - 100)) # Ensure it's sensible, add 30px margin below exact vanishing point
+        print(f"[INIT] Horizon found at Y={horizon_y}. Updating BEV.")
+        
+        global SRC_PTS
+        SRC_PTS[0][1] = horizon_y
+        SRC_PTS[1][1] = horizon_y
+        
+        self.M = cv2.getPerspectiveTransform(SRC_PTS, DST_PTS)
+
     def run(self):
         print("\nBFMC Pilot v3 (with YOLO): STARTING...")
+        
+        # Auto-Calibrate on the very first valid frame
+        if self.cam_ok:
+            # throw away the first 10 frames to let camera auto-exposure settle
+            for _ in range(10): self.picam2.capture_array()
+            init_frame = cv2.cvtColor(self.picam2.capture_array(), cv2.COLOR_RGB2BGR)
+            self.auto_calibrate_horizon(init_frame)
+            
         try:
             while True:
                 t_frame_start = time.time()
