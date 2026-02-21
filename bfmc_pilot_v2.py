@@ -242,7 +242,7 @@ class HybridLaneTracker:
         if sl is not None and sr is not None:
             # Both lines visible: pure midpoint — car centred in lane.
             # DUAL_OFFSET_PX = 0 by default; tweak if needed.
-            return (ev(sl) + ev(sr)) / 2.0 + DUAL_OFFSET_PX, "DUAL"
+            return (ev(sl) + ev(sr)) / 2.0 + extra_offset_px + DUAL_OFFSET_PX, "DUAL"
 
         # Ghost-line extrapolation: synthesise the missing line and apply
         # an anchor offset so the car holds a sensible position.
@@ -250,13 +250,13 @@ class HybridLaneTracker:
             # Only RIGHT edge visible → synthesise left divider.
             # Offset LEFT (SINGLE_EDGE_OFFSET_PX < 0) to stay away from edge.
             ghost_sl = sr - np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(ghost_sl) + ev(sr)) / 2.0 + SINGLE_EDGE_OFFSET_PX, "GHOST_L"
+            return (ev(ghost_sl) + ev(sr)) / 2.0 + extra_offset_px + SINGLE_EDGE_OFFSET_PX, "GHOST_L"
 
         if sl is not None and sr is None:
             # Only LEFT divider visible → synthesise right edge.
             # Offset RIGHT (SINGLE_DIV_OFFSET_PX > 0) to stay in right lane.
             ghost_sr = sl + np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(sl) + ev(ghost_sr)) / 2.0 + SINGLE_DIV_OFFSET_PX, "GHOST_R"
+            return (ev(sl) + ev(ghost_sr)) / 2.0 + extra_offset_px + SINGLE_DIV_OFFSET_PX, "GHOST_R"
 
         return None, "LOST"
 
@@ -539,10 +539,50 @@ class DividerGuard:
         if div_corr > 0 and edge_corr > 0:
             # Divider priority: net correction is at least +DEADBAND in divider direction
             correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN)
-        else:
-            correction = div_corr - edge_corr
+        return steer_angle + correction, speed_scale, triggered, div_corr, edge_corr
 
-        return steer_angle + correction, speed_scale, triggered
+
+# ===========================================================================
+# ADAPTIVE OFFSET CONTROLLER (Intelligent Lane Targeting)
+# ===========================================================================
+class AdaptiveOffsetController:
+    """
+    Acts as a real-time cost function for lane positioning.
+    - Reward: Slowly decays back to the nominal center if driving safely.
+    - Penalty: Rapidly shifts the lane offset away from any triggered boundary.
+    """
+    def __init__(self, base_offset=70):
+        self.base_offset = float(base_offset)
+        self.current_offset = float(base_offset)
+        
+        # Bounds (how far left/right it's allowed to self-adjust)
+        self.min_offset = base_offset - 60  # max shift left
+        self.max_offset = base_offset + 60  # max shift right
+        
+        # Learning rates
+        self.safe_decay_rate = 0.05    # pixels per frame to drift back to center
+        self.penalty_rate    = 3.0     # pixels per frame to shove away from danger
+        
+    def update(self, div_corr, edge_corr):
+        # 1. Apply Penalty if we are too close to a boundary
+        if div_corr > 0:
+            # We are too close to the left divider. Penalty: Shift Target Right.
+            self.current_offset += self.penalty_rate
+        elif edge_corr > 0:
+            # We are too close to the right edge. Penalty: Shift Target Left.
+            self.current_offset -= self.penalty_rate
+        else:
+            # 2. Earn Reward if safe: slowly decay back to the mathematically ideal center
+            if self.current_offset > self.base_offset + self.safe_decay_rate:
+                self.current_offset -= self.safe_decay_rate
+            elif self.current_offset < self.base_offset - self.safe_decay_rate:
+                self.current_offset += self.safe_decay_rate
+            else:
+                self.current_offset = self.base_offset
+                
+        # Clamp to reasonable bounds so it doesn't wander off the screen
+        self.current_offset = max(self.min_offset, min(self.max_offset, self.current_offset))
+        return self.current_offset
 
 
 # ===========================================================================
@@ -596,6 +636,9 @@ class BFMC_Pilot:
         self.rbt     = RoundaboutNavigator()
         self.jct     = JunctionDetector()
         self.guard   = DividerGuard()
+        
+        # Adaptive UI Replacement
+        self.adaptive_offset = AdaptiveOffsetController(base_offset=RIGHT_LANE_OFFSET_PX)
 
         # State
         self.smooth_steer  = 0.0
@@ -609,11 +652,7 @@ class BFMC_Pilot:
         self._fps   = 0.0
 
         # UI window
-        cv2.namedWindow("BFMC_v2")
-        cv2.createTrackbar("Look Ahead",    "BFMC_v2", 150, 300, lambda x: None)
-        cv2.createTrackbar("Lane Width PX", "BFMC_v2", 280, 400, lambda x: None)
-        cv2.createTrackbar("Fine Offset",   "BFMC_v2",  50, 100, lambda x: None)
-        cv2.createTrackbar("Base Speed",    "BFMC_v2",  50, 150, lambda x: None)
+        cv2.namedWindow("BFMC_v2_ADAPTIVE")
 
     # ------------------------------------------------------------------
     # IMAGE PROCESSING
@@ -686,15 +725,13 @@ class BFMC_Pilot:
             while True:
                 t_frame_start = time.time()
 
-                # --- Read trackbars ---
-                look_ahead    = cv2.getTrackbarPos("Look Ahead",    "BFMC_v2")
-                lane_width_px = cv2.getTrackbarPos("Lane Width PX", "BFMC_v2")
-                fine_offset   = cv2.getTrackbarPos("Fine Offset",   "BFMC_v2")
-                base_speed    = cv2.getTrackbarPos("Base Speed",    "BFMC_v2")
-
-                # fine_offset: slider 50=neutral, <50=left, >50=right
-                fine_px      = (fine_offset - 50) * 2
-                total_offset = RIGHT_LANE_OFFSET_PX + fine_px
+                # --- Hardcoded Optimal Pilot Parameters ---
+                look_ahead    = 150
+                lane_width_px = 280
+                base_speed    = 50
+                
+                # fine_offset: NOW FULLY ADAPTIVE
+                total_offset = self.adaptive_offset.current_offset
 
                 # --- Capture frame ---
                 if self.cam_ok:
@@ -780,11 +817,17 @@ class BFMC_Pilot:
                 guard_right = (self.tracker.sr
                                if self.tracker.right_stale == 0 else None)
 
-                raw_steer_guarded, guard_spd, guard_on = self.guard.apply(
+                raw_steer_guarded, guard_spd, guard_on, div_corr, edge_corr = self.guard.apply(
                     steer_angle,
                     guard_left,
                     guard_right,
                     y_eval=y_eval)
+                    
+                # ADAPTIVE OFFSET: Update cost function
+                if lost:
+                    self.adaptive_offset.update(0, 0) # Decay to center when lost
+                else:
+                    self.adaptive_offset.update(div_corr, edge_corr)
 
                 # BUG FIX: Reset smooth_guard when lane is lost so stale
                 # corrections don't persist into the new lane after recovery.
@@ -872,7 +915,7 @@ class BFMC_Pilot:
                 cv2.putText(dbg, line2, (10, 462),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 200), 2)
 
-                cv2.imshow("BFMC_v2", dbg)
+                cv2.imshow("BFMC_v2_ADAPTIVE", dbg)
 
                 # FIX: Frame-rate cap so state-machine frame counts are stable
                 elapsed = time.time() - t_frame_start
