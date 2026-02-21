@@ -278,6 +278,49 @@ class TrafficDecisionModule:
 
 
 # ===========================================================================
+# ADAPTIVE OFFSET CONTROLLER (Intelligent Lane Targeting)
+# ===========================================================================
+class AdaptiveOffsetController:
+    """
+    Acts as a real-time cost function for lane positioning.
+    - Reward: Slowly decays back to the nominal center if driving safely.
+    - Penalty: Rapidly shifts the lane offset away from any triggered boundary.
+    """
+    def __init__(self, base_offset=70):
+        self.base_offset = float(base_offset)
+        self.current_offset = float(base_offset)
+        
+        # Bounds (how far left/right it's allowed to self-adjust)
+        self.min_offset = base_offset - 60  # max shift left
+        self.max_offset = base_offset + 60  # max shift right
+        
+        # Learning rates
+        self.safe_decay_rate = 0.05    # pixels per frame to drift back to center
+        self.penalty_rate    = 3.0     # pixels per frame to shove away from danger
+        
+    def update(self, div_corr, edge_corr):
+        # 1. Apply Penalty if we are too close to a boundary
+        if div_corr > 0:
+            # We are too close to the left divider. Penalty: Shift Target Right.
+            self.current_offset += self.penalty_rate
+        elif edge_corr > 0:
+            # We are too close to the right edge. Penalty: Shift Target Left.
+            self.current_offset -= self.penalty_rate
+        else:
+            # 2. Earn Reward if safe: slowly decay back to the mathematically ideal center
+            if self.current_offset > self.base_offset + self.safe_decay_rate:
+                self.current_offset -= self.safe_decay_rate
+            elif self.current_offset < self.base_offset - self.safe_decay_rate:
+                self.current_offset += self.safe_decay_rate
+            else:
+                self.current_offset = self.base_offset
+                
+        # Clamp to reasonable bounds so it doesn't wander off the screen
+        self.current_offset = max(self.min_offset, min(self.max_offset, self.current_offset))
+        return self.current_offset
+
+
+# ===========================================================================
 # HYBRID LANE TRACKER (From v2)
 # ===========================================================================
 class HybridLaneTracker:
@@ -562,8 +605,12 @@ class DividerGuard:
                 edge_corr = min(self.GAIN * err, self.MAX_CORR)
                 speed_scale, triggered = min(speed_scale, max(0.5, 1.0 - err / 120.0)), True
 
-        correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN) if (div_corr > 0 and edge_corr > 0) else (div_corr - edge_corr)
-        return steer_angle + correction, speed_scale, triggered
+        if div_corr > 0 and edge_corr > 0:
+            correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN)
+        else:
+            correction = div_corr - edge_corr
+
+        return steer_angle + correction, speed_scale, triggered, div_corr, edge_corr
 
 
 # ===========================================================================
@@ -612,6 +659,11 @@ class BFMC_Pilot:
         self.rbt     = RoundaboutNavigator()
         self.jct     = JunctionDetector()
         self.guard   = DividerGuard()
+        
+        # --- Intelligent Self-Adapting Controllers ---
+        self.adaptive_offset = AdaptiveOffsetController(base_offset=RIGHT_LANE_OFFSET_PX)
+        # Default lane width if auto-cal fails. Varies dynamically with camera pitch.
+        self.dynamic_lane_width_px = 280
 
         self.smooth_steer = 0.0
         self.smooth_guard = 0.0
@@ -621,11 +673,8 @@ class BFMC_Pilot:
 
         self._fps_t, self._fps = time.time(), 0.0
 
-        cv2.namedWindow("BFMC_v2_LANE_VIEW")
-        cv2.createTrackbar("Look Ahead",    "BFMC_v2_LANE_VIEW", 150, 300, lambda x: None)
-        cv2.createTrackbar("Lane Width PX", "BFMC_v2_LANE_VIEW", 280, 400, lambda x: None)
-        cv2.createTrackbar("Fine Offset",   "BFMC_v2_LANE_VIEW",  50, 100, lambda x: None)
-        cv2.createTrackbar("Base Speed",    "BFMC_v2_LANE_VIEW",  50, 150, lambda x: None)
+        cv2.namedWindow("BFMC_YOLO_VIEW")
+        cv2.namedWindow("BFMC_v2_LANE_VIEW") # Added for consistency with the two-window display
 
     def _get_bev(self, frame):
         warped_colour = cv2.warpPerspective(frame, self.M, (640, 480))
@@ -699,6 +748,23 @@ class BFMC_Pilot:
         SRC_PTS[1][1] = horizon_y
         
         self.M = cv2.getPerspectiveTransform(SRC_PTS, DST_PTS)
+        
+        # ==========================================================
+        # HORIZON MATH FIX: Calculate dynamically decoupled lane width
+        # The physical 0.35m lane becomes narrower/wider in BEV 
+        # pixels when you tilt the camera's trapezoid. Let's calculate
+        # exactly how many pixels one real physical lane should be
+        # at the new mapped perspective!
+        # ==========================================================
+        bottom_width_src = SRC_PTS[3][0] - SRC_PTS[2][0] # Camera Bottom base (usually ~560px)
+        bottom_width_dst = DST_PTS[3][0] - DST_PTS[2][0] # BEV Bottom base (usually ~340px)
+        
+        # Estimate the new Pixels-Per-Meter representation based on the mapping base ratio
+        track_physical_width_m = LANE_WIDTH_M * 2.0  # (Assume standard track is 2 lanes wide = 0.70m)
+        self.dynamic_lane_width_px = int((bottom_width_dst / bottom_width_src) * (640.0 / track_physical_width_m) * LANE_WIDTH_M)
+        self.dynamic_lane_width_px = max(200, min(400, self.dynamic_lane_width_px)) # Sane bounds
+        
+        print(f"[INIT] Adjusted internal Lane Width to {self.dynamic_lane_width_px}px based on camera angle.")
 
     def run(self):
         print("\nBFMC Pilot v3 (with YOLO): STARTING...")
@@ -714,10 +780,14 @@ class BFMC_Pilot:
             while True:
                 t_frame_start = time.time()
 
-                look_ahead    = max(cv2.getTrackbarPos("Look Ahead", "BFMC_v2_LANE_VIEW"), 60)
-                lane_width_px = cv2.getTrackbarPos("Lane Width PX", "BFMC_v2_LANE_VIEW")
-                total_offset  = RIGHT_LANE_OFFSET_PX + ((cv2.getTrackbarPos("Fine Offset", "BFMC_v2_LANE_VIEW") - 50) * 2)
-                base_speed    = cv2.getTrackbarPos("Base Speed", "BFMC_v2_LANE_VIEW")
+                # --- Hardcoded Optimal Pilot Parameters ---
+                look_ahead    = 150
+                # Use dynamically calibrated calculation!
+                lane_width_px = self.dynamic_lane_width_px 
+                base_speed    = 50
+                
+                # ADAPTIVE OFFSET replaces trackbar
+                total_offset = self.adaptive_offset.current_offset
 
                 if self.cam_ok:
                     frame = self.picam2.capture_array()
@@ -756,11 +826,14 @@ class BFMC_Pilot:
 
                 guard_left  = self.tracker.sl if self.tracker.left_stale == 0 else None
                 guard_right = self.tracker.sr if self.tracker.right_stale == 0 else None
-                steer_guarded, guard_spd, guard_on = self.guard.apply(steer_angle, guard_left, guard_right, y_eval=y_eval)
+                steer_guarded, guard_spd, guard_on, div_corr, edge_corr = self.guard.apply(steer_angle, guard_left, guard_right, y_eval=y_eval)
 
+                # --- ADAPTIVE OFFSET: Update cost function ---
                 if target_x is None:
+                    self.adaptive_offset.update(0, 0)
                     self.smooth_guard, guard_on = 0.0, False
                 else:
+                    self.adaptive_offset.update(div_corr, edge_corr)
                     self.smooth_guard = (self.GUARD_EMA * (steer_guarded - steer_angle) + (1.0 - self.GUARD_EMA) * self.smooth_guard)
                 steer_angle += self.smooth_guard
 
@@ -798,7 +871,7 @@ class BFMC_Pilot:
                 cv2.putText(dbg, line1, (10,  26), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
                 cv2.putText(dbg, line2, (10, 462), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 200), 2)
 
-                self._update_fps()
+                cv2.imshow("BFMC_YOLO_VIEW", yolo_dbg_frame) # Changed to yolo_dbg_frame as per instruction
                 
                 # SHOW TWO WINDOWS AS REQUESTED
                 cv2.imshow("BFMC_v2_LANE_VIEW", dbg)
