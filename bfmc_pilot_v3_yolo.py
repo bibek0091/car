@@ -376,15 +376,15 @@ class HybridLaneTracker:
             return None, "JCT_LOST"
 
         if sl is not None and sr is not None:
-            return (ev(sl) + ev(sr)) / 2.0 + DUAL_OFFSET_PX, "DUAL"
+            return (ev(sl) + ev(sr)) / 2.0 + extra_offset_px + DUAL_OFFSET_PX, "DUAL"
 
         if sr is not None and sl is None:
             ghost_sl = sr - np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(ghost_sl) + ev(sr)) / 2.0 + SINGLE_EDGE_OFFSET_PX, "GHOST_L"
+            return (ev(ghost_sl) + ev(sr)) / 2.0 + extra_offset_px + SINGLE_EDGE_OFFSET_PX, "GHOST_L"
 
         if sl is not None and sr is None:
             ghost_sr = sl + np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(sl) + ev(ghost_sr)) / 2.0 + SINGLE_DIV_OFFSET_PX, "GHOST_R"
+            return (ev(sl) + ev(ghost_sr)) / 2.0 + extra_offset_px + SINGLE_DIV_OFFSET_PX, "GHOST_R"
 
         return None, "LOST"
 
