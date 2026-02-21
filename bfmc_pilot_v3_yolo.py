@@ -99,35 +99,37 @@ class TrafficDecisionModule:
         
     def _is_light_red(self, frame, x1, y1, x2, y2):
         """
-        Crops the traffic light bounding box and checks if the brightest
-        pixels fall into the RED Hue range in HSV space.
+        Determines if a traffic light is red by checking if the TOP THIRD
+        of the bounding box is the brightest section (standard vertical lights),
+        which is robust against camera LED blooming.
         """
-        # Ensure coordinates are within frame bounds safely
         h, w = frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         
-        if x2 - x1 < 5 or y2 - y1 < 5:
+        box_h = y2 - y1
+        if box_h < 10 or (x2 - x1) < 5:
             return False # Too small to process
             
         crop = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        
+        # Split into thirds
+        third = max(1, box_h // 3)
+        top_mean = np.mean(gray[:third, :])
+        bot_mean = np.mean(gray[-third:, :])
+        
+        # Heuristic 1: If top is significantly brighter than bottom, it's Red
+        if top_mean > bot_mean + 10:
+            return True
+            
+        # Heuristic 2: HSV Color fallback (super generous hue mask)
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mask1 = cv2.inRange(hsv, np.array([0, 50, 50]), np.array([15, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([160, 50, 50]), np.array([180, 255, 255]))
+        red_ratio = cv2.countNonZero(cv2.bitwise_or(mask1, mask2)) / (box_h * (x2 - x1))
         
-        # Red has two masks in HSV (wraps around 180). We widen it slightly
-        # because the camera exposure can shift the red light towards orange/white.
-        lower_red1 = np.array([0, 50, 50])
-        upper_red1 = np.array([12, 255, 255])
-        lower_red2 = np.array([160, 50, 50])
-        upper_red2 = np.array([180, 255, 255])
-        
-        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        red_mask = cv2.bitwise_or(mask1, mask2)
-        
-        # If more than 5% of the bounding box is illuminated red
-        red_ratio = cv2.countNonZero(red_mask) / (crop.shape[0] * crop.shape[1])
-        return red_ratio > 0.05
-
+        return red_ratio > 0.02
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         """
         Determines if the bounding box of a car/pedestrian is physically
@@ -136,10 +138,10 @@ class TrafficDecisionModule:
         center_x = (x1 + x2) / 2
         bottom_y = y2
         
-        # Middle 50% of screen horizontally
-        in_horizontal_path = (frame_w * 0.25) < center_x < (frame_w * 0.75)
-        # Bottom 40% of screen vertically (close to us)
-        is_close = bottom_y > (frame_h * 0.60)
+        # Middle 70% of screen horizontally
+        in_horizontal_path = (frame_w * 0.15) < center_x < (frame_w * 0.85)
+        # Bottom 60% of screen vertically (in our physical path)
+        is_close = bottom_y > (frame_h * 0.40)
         
         return in_horizontal_path and is_close
 
@@ -183,24 +185,29 @@ class TrafficDecisionModule:
 
             # --- Rule Logic ---
             if label == "traffic-light":
-                # Only check light if it's reasonably close (height > 20px)
-                if box_h > 20 and self._is_light_red(frame_bgr, x1, y1, x2, y2):
+                # Only check light if it's reasonably close (height > 10px)
+                if box_h > 10 and self._is_light_red(frame_bgr, x1, y1, x2, y2):
                     sees_red_light = True
-                    cv2.putText(dbg_frame, "RED DETECTED", (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
+                    cv2.putText(dbg_frame, "RED LIGHT", (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
                     
             elif label == "stop-sign":
-                # We only stop if the sign is close enough (e.g. height > 45px)
-                # and we are not currently in cooldown from just completing a stop.
-                if box_h > 45 and now > self.stop_sign_cooldown:
+                # Detect earlier (height > 25px instead of 45px)
+                if box_h > 25 and now > self.stop_sign_cooldown:
                     sees_close_stop_sign = True
                     
-            elif label in ["car", "pedestrian", "closed-road-stand"]:
+            elif label in ["car", "pedestrian", "closed-road-stand", "no-entry-road-sign"]:
+                # If these are in our direct path, we must halt. 
+                # (No-entry effectively acts as a solid obstacle until alternate routing is implemented)
                 if self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
                     obstacle_in_path = True
                     self.reason = f"OBSTACLE ({label})"
                     
             elif label == "crosswalk-sign":
                 sees_crosswalk = True
+                
+            elif label in ["highway-entry-sign", "highway-exit-sign", "priority-road-sign"]:
+                # Informational signs, simply overlay text on screen
+                cv2.putText(dbg_frame, f"INFO: {label}", (x1, y1-30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
                 
         # 3. State Machine Overrides
         # Priority: Red Light > Stop Sign > Obstacle > Normal
