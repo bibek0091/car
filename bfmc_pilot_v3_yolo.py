@@ -64,7 +64,8 @@ LANE_WIDTH_M         = 0.35    # one-lane physical width (m)
 # ===========================================================================
 # CAMERA - Bird's Eye View calibration
 # ===========================================================================
-SRC_PTS = np.float32([[200, 260], [440, 260], [40,  450], [600, 450]])
+# SRC: [TL, TR, BL, BR] - Top points raised from 260 to 180 to view further ahead
+SRC_PTS = np.float32([[150, 180], [490, 180], [20, 480], [620, 480]])
 DST_PTS = np.float32([[150,   0], [490,   0], [150, 480], [490, 480]])
 
 # ===========================================================================
@@ -519,14 +520,15 @@ class DividerGuard:
 # ===========================================================================
 class BFMC_Pilot:
 
-    STEER_EMA_SLOW = 0.25
-    STEER_EMA_FAST = 0.50
-    GUARD_EMA      = 0.55
+    STEER_EMA_SLOW = 0.45   # Faster response on straights
+    STEER_EMA_FAST = 0.70   # Much faster snap on tight corners
+    GUARD_EMA      = 0.70   # Faster safety guard engagement
     MAX_STEER      = 30.0
-    MAX_STEER_RATE = 5.0
+    MAX_STEER_RATE = 15.0   # Lifted from 5.0 -> 15.0 to allow aggressive evasion
 
-    HIGH_CURV_THRESH = 0.003
-    MED_CURV_THRESH  = 0.0015
+    HIGH_CURV_THRESH = 0.0025 # Engage high-curve speed slow down earlier
+    MED_CURV_THRESH  = 0.0010
+
     HIGH_CURV_SCALE  = 0.60
     MED_CURV_SCALE   = 0.80
     DUAL_SPEED_SCALE = 1.15
