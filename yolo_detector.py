@@ -7,6 +7,7 @@ class PreTrainedYoloDetector:
         Initializes the custom BFMC YOLO models.
         """
         print(f"Loading primary BFMC YOLO model '{model_version}'...")
+        # Loads the user-trained BFMC weights
         self.model = YOLO(model_version)
         print(f"Loading secondary Traffic Color YOLO model '{traffic_model}'...")
         try:
@@ -28,7 +29,9 @@ class PreTrainedYoloDetector:
            filtered_detections: List of dicts with bounding boxes and labels
         """
         
-        # Run inference using the main model
+        # Run inference using the model. 
+        # By passing no specific 'classes' filter, our custom model 
+        # will automatically return all 15 Bosch Custom Objects.
         results = self.model.predict(
             source=frame_bgr, 
             conf=conf_threshold, 
@@ -36,48 +39,53 @@ class PreTrainedYoloDetector:
         )
         
         filtered_detections = []
+        
+        # Parse the results (there's only 1 frame, so index 0)
         result = results[0]
         
         for box in result.boxes:
+            # Bounding box coordinates (xyxy)
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            
+            # Confidence score and Class ID
             confidence = box.conf[0].item()
             cls_id = int(box.cls[0].item())
+            
+            # Get human readable label
             label = self.model.names[cls_id]
             
-            # Skip the main model's traffic light to let the secondary model handle it
-            if label == "traffic-light":
-                continue
-                
-            filtered_detections.append({
+            det_payload = {
                 "label": label,
                 "confidence": confidence,
                 "bbox": (x1, y1, x2, y2)
-            })
+            }
             
-        # Run inference using the secondary traffic model
-        if getattr(self, "traffic_model", None):
-            traffic_results = self.traffic_model.predict(
-                source=frame_bgr, 
-                # Lower threshold slightly for the specialized model to mimic the test bench
-                conf=max(0.15, conf_threshold - 0.1), 
-                verbose=False
-            )
-            t_result = traffic_results[0]
-            
-            for box in t_result.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                confidence = box.conf[0].item()
-                cls_id = int(box.cls[0].item())
-                color_label = self.traffic_model.names[cls_id] # "red", "green", "yellow", "off"
+            # OPTION A: Targeted Crop Inference (Ultra-Fast)
+            if label == "traffic-light" and getattr(self, "traffic_model", None):
+                # We pad the crop by 5 pixels so the model has edge context
+                h, w = frame_bgr.shape[:2]
+                pad = 5
+                cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+                cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+                crop = frame_bgr[cy1:cy2, cx1:cx2]
                 
-                # We inject this dynamically so bfmc_pilot sees it as a traffic light 
-                # but with an explicit color classification attached.
-                filtered_detections.append({
-                    "label": "traffic-light",
-                    "color": color_label,
-                    "confidence": confidence,
-                    "bbox": (x1, y1, x2, y2)
-                })
+                if crop.size > 0:
+                    # Run the heavy traffic model only on this microscopic crop image
+                    t_res = self.traffic_model.predict(
+                        source=crop, 
+                        imgsz=96,           # Run at tiny resolution for ~5ms inference
+                        conf=max(0.15, conf_threshold - 0.1), 
+                        verbose=False
+                    )
+                    
+                    if len(t_res[0].boxes) > 0:
+                        # Extract the best color match
+                        best_t_box = max(t_res[0].boxes, key=lambda b: b.conf[0].item())
+                        t_cls_id = int(best_t_box.cls[0].item())
+                        color_label = self.traffic_model.names[t_cls_id]
+                        det_payload["color"] = color_label
+                        
+            filtered_detections.append(det_payload)
             
         return filtered_detections
 

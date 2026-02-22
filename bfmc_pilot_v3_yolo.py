@@ -218,7 +218,7 @@ class TrafficDecisionModule:
 
             # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
-                # Natively extract the YOLO classification from the secondary model
+                # Natively extract the YOLO classification from the targeted crop
                 tl_color = det.get("color", "off")
                 is_red = (tl_color == "red")
                 is_green = (tl_color == "green")
