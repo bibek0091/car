@@ -133,6 +133,7 @@ class TrafficDecisionModule:
         self.active_detections = self.detector.detect_traffic_signals(raw_frame, conf_threshold=0.4)
         
         sees_red_light = sees_close_stop_sign = obstacle_in_path = sees_crosswalk = False
+        light_status = "NONE"
         
         for det in self.active_detections:
             label, (x1, y1, x2, y2), conf = det["label"], det["bbox"], det["confidence"]
