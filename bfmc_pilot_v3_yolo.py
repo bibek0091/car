@@ -167,7 +167,9 @@ class TrafficDecisionModule:
                     # At <30cm (approx 110px+ height), we drop anchor
                     light_status = "[RED] HALT" if is_red else "[GREEN] CLEAR"
                     if is_red:
-                        self.state, self.reason = "SYS_STOP", "RED LIGHT"
+                        self.state, self.reason = "SYS_STOP", "RED LIGHT (PRIORITY)"
+                        # Break immediately; do not let any other lower-priority sign override this STOP
+                        break
             
             else:
                 # All other signs only trigger physical car actions when within ~15cm (140px tall)
