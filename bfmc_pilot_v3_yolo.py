@@ -197,6 +197,20 @@ class TrafficDecisionModule:
         red_ratio = cv2.countNonZero(red_mask) / (box_h * box_w)
         return red_ratio > 0.08 # Relaxed threshold to reduce false negatives
 
+    def _is_light_green(self, frame, x1, y1, x2, y2):
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        box_h, box_w = y2 - y1, x2 - x1
+        if box_h < 15 or box_w < 10: return False
+        
+        crop = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        mask_green = cv2.inRange(hsv, np.array([40, 50, 150]), np.array([90, 255, 255]))
+        green_ratio = cv2.countNonZero(mask_green) / (box_h * box_w)
+        return green_ratio > 0.08
+
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         # BUG 8: Check if ANY part of bbox overlaps path region instead of just center
         in_horizontal_path = (x1 < frame_w * 0.80) and (x2 > frame_w * 0.20)
@@ -260,20 +274,21 @@ class TrafficDecisionModule:
             # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
                 is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
+                is_green = self._is_light_green(raw_frame, x1, y1, x2, y2)
                 
                 # Debug logging
                 crop = raw_frame[y1:y2, x1:x2]
                 if crop.size > 0 and (is_red or (box_h >= 70 and not is_red)):
                     hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
                     mean_hsv = np.mean(hsv_crop, axis=(0,1))
-                    print(f"DEBUG TL: box_h={box_h}, is_red={is_red}, HSV={mean_hsv}")
+                    print(f"DEBUG TL: box_h={box_h}, is_red={is_red}, is_green={is_green}, HSV={mean_hsv}")
                 
                 distance_cat = "UNKNOWN"
                 if box_h < 40: distance_cat = "FAR"
                 elif box_h < 70: distance_cat = "APPROACH"
                 elif box_h >= 70: distance_cat = "HALT"
                 
-                current_tl_state = self.tl_fsm.update(is_red, not is_red, distance_cat)
+                current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
                 
                 # React based on state machine
                 if current_tl_state == "LIGHT_APPROACHING":
@@ -282,6 +297,9 @@ class TrafficDecisionModule:
                 elif current_tl_state in ["LIGHT_RED_STOPPING", "LIGHT_RED_STOPPED"]:
                     light_status = "[RED] HALT" 
                     commit_state(1, "SYS_STOP", "RED LIGHT (PRIORITY)")
+                elif current_tl_state == "LIGHT_GREEN_GO":
+                    light_status = "[GREEN] CLEAR"
+                    commit_state(99, "SYS_GO", "GREEN LIGHT CLEAR")
                 else:
                     light_status = "[GREEN] CLEAR"
             
@@ -373,6 +391,7 @@ class TrafficLightStateMachine:
     def __init__(self):
         self.state = "NO_LIGHT"
         self.frames_in_state = 0
+        self.frames_stopping = 0
         self.last_seen_red = 0.0
         
     def update(self, is_red_detected, is_green_detected, distance_category):
@@ -392,12 +411,15 @@ class TrafficLightStateMachine:
         elif self.state == "LIGHT_APPROACHING":
             if is_red_detected and distance_category == "HALT":
                 self.state = "LIGHT_RED_STOPPING"
+                self.frames_stopping = 1
             elif not is_red_detected:
                 self.state = "NO_LIGHT"
         elif self.state == "LIGHT_RED_STOPPING":
-            # Once stopping, wait until green to go (with min stop time)
-            self.last_seen_red = time.time()
-            self.state = "LIGHT_RED_STOPPED"
+            self.frames_stopping += 1
+            if self.frames_stopping >= 2:
+                # Once stopping, wait until green to go (with min stop time)
+                self.last_seen_red = time.time()
+                self.state = "LIGHT_RED_STOPPED"
         elif self.state == "LIGHT_RED_STOPPED":
             if is_green_detected and (time.time() - self.last_seen_red > 2.0):
                 self.state = "LIGHT_GREEN_GO"
