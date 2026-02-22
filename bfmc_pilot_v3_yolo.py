@@ -596,9 +596,8 @@ class BFMC_Pilot:
     MED_CURV_SCALE   = 0.80
     DUAL_SPEED_SCALE = 1.15
 
-    def __init__(self, sim_mode=False, dashboard=None):
+    def __init__(self, sim_mode=False):
         self.sim_mode = sim_mode
-        self.dashboard = dashboard
         self.running = True
         self.handler   = STM32_SerialHandler()
         self.connected = False if sim_mode else self.handler.connect()
@@ -663,85 +662,100 @@ class BFMC_Pilot:
         cv2.polylines(img, [pts], isClosed=False, color=colour, thickness=3)
 
     # -------------------------------------------------------------
-    # TESLA-STYLE DASHBOARD RENDERER (ULTRA REALISTIC)
+    # TESLA-STYLE DASHBOARD RENDERER (ULTRA REALISTIC OpenCV)
     # -------------------------------------------------------------
     def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct):
         # Master Canvas: 1280x720 (HD)
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
         
-        # 1. Main Background: The raw 720p YOLO feed acts as the reality view
+        # 1. Main Background: The raw 720p YOLO feed acts as the reality view 
+        # (It takes up the whole screen, UI floats over it)
         canvas[0:720, 0:1280] = yolo_hd
         
         # 2. Sleek Dark Glassmorphism Overlay for the UI telemetry (Right Side)
         overlay = canvas.copy()
-        cv2.rectangle(overlay, (880, 0), (1280, 720), (10, 10, 15), -1)
-        # Gradient drop shadow effect on the divider
-        for i in range(20): cv2.line(overlay, (880 - i, 0), (880 - i, 720), (10, 10, 15), max(1, int(15 - i*0.8)))
         
-        # Top-Left Stats overlay (compact Glassmorphism)
-        cv2.rectangle(overlay, (20, 20), (320, 80), (15, 15, 20), -1)
-        cv2.addWeighted(overlay, 0.90, canvas, 0.10, 0, canvas)
+        # Black styling
+        BG_COLOR = (25, 25, 30)
+        TEXT_LIGHT = (220, 220, 220)
+        TEXT_DIM   = (120, 120, 120)
+        BLUE_BOSCH = (212, 120, 0) # BGR
         
-        # 3. Telemetry: Digital Speedometer (Tesla Model 3 style, large top right)
-        cv2.putText(canvas, f"{int(abs(speed))}", (920, 120), cv2.FONT_HERSHEY_DUPLEX, 4.0, (255, 255, 255), 5)
-        cv2.putText(canvas, "CM/S", (1100, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120, 120, 120), 2)
-        cv2.putText(canvas, "MAX", (1100, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
-        cv2.putText(canvas, str(int(self.MAX_STEER)), (1150, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
-        cv2.line(canvas, (920, 140), (1240, 140), (40, 40, 45), 2)
-
-        # 4. Telemetry: Navigation & Autopilot States (Clean subtle text)
-        cv2.putText(canvas, "AUTOPILOT", (920, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-        nav_col = (0, 255, 100) if nav_state == "NORMAL" else (0, 165, 255)
-        cv2.putText(canvas, nav_state, (920, 210), cv2.FONT_HERSHEY_DUPLEX, 0.8, nav_col, 1)
+        # Right Panel Overlay
+        cv2.rectangle(overlay, (800, 0), (1280, 720), BG_COLOR, -1)
+        # Bottom Control Panel Overlay
+        cv2.rectangle(overlay, (0, 600), (800, 720), BG_COLOR, -1)
         
-        cv2.putText(canvas, "LANE ANCHOR", (1100, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-        cv2.putText(canvas, anchor, (1100, 210), cv2.FONT_HERSHEY_DUPLEX, 0.6, (200, 200, 200), 1)
-
-        # 5. Traffic AI Decision Block (High contrast, modern bounding box)
+        # Top-Left Stats overlay (compact)
+        cv2.rectangle(overlay, (20, 20), (320, 80), BG_COLOR, -1)
+        
+        cv2.addWeighted(overlay, 0.95, canvas, 0.05, 0, canvas)
+        
+        # --- RIGHT TELEMETRY PANEL ---
+        cv2.putText(canvas, "TELEMETRY SENSORS", (830, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_BOSCH, 2)
+        cv2.putText(canvas, f"GPS: LAT 46.771200 | LON 23.623600", (830, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        
+        # Speed & Steer Grid
+        cv2.putText(canvas, "SPEED", (830, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        cv2.putText(canvas, f"{int(abs(speed))}", (830, 160), cv2.FONT_HERSHEY_DUPLEX, 2.0, TEXT_LIGHT, 2)
+        cv2.putText(canvas, "cm/s", (920, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1)
+        
+        cv2.putText(canvas, "STEER", (1050, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        cv2.putText(canvas, f"{steer_angle:+.1f}", (1050, 160), cv2.FONT_HERSHEY_DUPLEX, 1.5, TEXT_LIGHT, 2)
+        cv2.putText(canvas, "deg", (1170, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1)
+        
+        # Battery Indicator
+        cv2.putText(canvas, "BATTERY CAPACITY", (830, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        cv2.rectangle(canvas, (830, 225), (1200, 245), (60, 60, 60), 1)
+        fill_w = int((batt_pct / 100.0) * 368)
+        cv2.rectangle(canvas, (831, 226), (831 + fill_w, 244), BLUE_BOSCH, -1)
+        cv2.putText(canvas, f"{batt_pct:.1f}%", (1210, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
+        
+        # IMU & Sys
+        cv2.putText(canvas, "IMU: PITCH 0.0 | ROLL 0.0 | YAW 0.0", (830, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        cv2.putText(canvas, "SYS: CPU 12% | RAM 40% | TEMP 45.0C", (830, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        
+        # --- VISION ENGINE ---
+        cv2.putText(canvas, "AI VISION ENGINE", (830, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_BOSCH, 2)
+        
         state_col = (0, 255, 0)
         if traffic_state == "SYS_STOP": state_col = (0, 0, 255)
         elif traffic_state == "SYS_SLOW": state_col = (0, 165, 255)
         elif traffic_state == "SYS_LIMIT": state_col = (0, 255, 255)
         
-        cv2.rectangle(canvas, (920, 240), (1240, 360), (30, 30, 35), -1)
-        cv2.putText(canvas, "VISION INTELLIGENCE", (940, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
-        cv2.putText(canvas, traffic_state, (940, 310), cv2.FONT_HERSHEY_DUPLEX, 1.2, state_col, 2)
-        cv2.putText(canvas, traffic_reason, (940, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 1)
+        cv2.putText(canvas, f"TRAFFIC STATE: {traffic_state}", (830, 420), cv2.FONT_HERSHEY_DUPLEX, 0.8, state_col, 2)
+        cv2.putText(canvas, f"REASON: {traffic_reason}", (830, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 1)
         
-        # 5.5. Dedicated Traffic Light Status
-        tl_col = (70, 70, 70)
+        nav_col = (0, 255, 100) if nav_state == "NORMAL" else (0, 165, 255)
+        cv2.putText(canvas, f"NAV MODE: {nav_state} (Anchor: {anchor})", (830, 490), cv2.FONT_HERSHEY_SIMPLEX, 0.6, nav_col, 1)
+        
+        tl_col = (100, 100, 100)
         if light_status == "[RED]": tl_col = (50, 50, 255)
         elif light_status == "[GREEN/OFF]": tl_col = (50, 255, 50)
-        cv2.putText(canvas, f"SIGNAL: {light_status}", (1100, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.4, tl_col, 1)
+        cv2.putText(canvas, f"SIGNAL INFO: {light_status}", (830, 530), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 1)
         
-        # 6. Simulated Battery Gauge (Sleek bottom corner)
-        cv2.putText(canvas, "ENERGY", (920, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-        cv2.rectangle(canvas, (920, 435), (1200, 460), (40, 40, 45), 2)
-        fill_w = int((batt_pct / 100.0) * 276)
-        fill_col = (0, 255, 0) if batt_pct > 20 else (0, 0, 255)
-        cv2.rectangle(canvas, (922, 437), (922 + fill_w, 458), fill_col, -1)
-        cv2.putText(canvas, f"{batt_pct:.1f}%", (1210, 452), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # LED Indicators
+        cv2.rectangle(canvas, (830, 570), (950, 600), (0, 0, 100) if "STOP" in traffic_reason else (30,30,30), -1)
+        cv2.putText(canvas, "STOP SIGN", (840, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
         
-        # 7. Steering Wheel Visualizer (Curved arc for realism)
-        cv2.putText(canvas, "STEERING APEX", (920, 520), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
-        arc_center = (1080, 700)
-        cv2.ellipse(canvas, arc_center, (160, 160), 180, 0, 180, (40, 40, 45), 4)
-        cv2.circle(canvas, (1080, 540), 6, (200, 200, 200), -1) # Dead center
+        cv2.rectangle(canvas, (960, 570), (1080, 600), (0, 100, 100) if "PEDESTRIAN" in traffic_reason else (30,30,30), -1)
+        cv2.putText(canvas, "PEDESTRIAN", (970, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
         
-        # Map +/- 30 degrees to the arc
-        steer_rad = math.radians(steer_angle * 2.5) # Scale for visual arc width
-        sx = int(1080 + 160 * math.sin(steer_rad))
-        sy = int(700 - 160 * math.cos(steer_rad))
-        cv2.circle(canvas, (sx, sy), 12, (255, 100, 50), -1)
-        cv2.line(canvas, arc_center, (sx, sy), (255, 100, 50), 2)
-        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (920, 550), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
+        cv2.rectangle(canvas, (1090, 570), (1220, 600), (0, 100, 0) if anchor != "LOST" else (0, 30, 0), -1)
+        cv2.putText(canvas, "LANE KEEP", (1100, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
 
-        # 8. Mini-Map / Radar (Bird's Eye View Lane Debug - Bottom Left)
-        radar = cv2.resize(lane_dbg, (320, 240))
-        cv2.rectangle(radar, (0,0), (320,240), (100,100,250), 2)
-        canvas[460:700, 20:340] = radar
-        cv2.putText(canvas, "RADAR ENV", (25, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        # --- BOTTOM CONTROL PANEL ---
+        cv2.putText(canvas, "AUTONOMOUS MODE ACTIVE", (40, 650), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.rectangle(canvas, (320, 620), (520, 680), (0, 0, 150), -1)
+        cv2.putText(canvas, "E-STOP [SPACE]", (340, 655), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_LIGHT, 2)
         
+        # Radar (Top Left)
+        radar_h, radar_w = 180, 240
+        radar = cv2.resize(lane_dbg, (radar_w, radar_h))
+        cv2.rectangle(radar, (0,0), (radar_w-1, radar_h-1), (255,255,255), 2)
+        canvas[100:100+radar_h, 30:30+radar_w] = radar
+        cv2.putText(canvas, "LANE FINDER", (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
         return canvas
 
     def _update_fps(self):
@@ -904,41 +918,26 @@ class BFMC_Pilot:
                 # Drain the fake battery slowly over time
                 sim_batt_pct = max(0.0, sim_batt_pct - 0.005)
 
-                if hasattr(self, 'dashboard') and self.dashboard is not None:
-                    self.dashboard.push_frame(yolo_dbg)
-                    self.dashboard.push_radar(lane_dbg)
-                    self.dashboard.push_telemetry({
-                        'speed': speed,
-                        'steering': steer_angle,
-                        'battery': sim_batt_pct,
-                        'lat': 46.7712 + (time.time() * 0.00001) % 0.001,
-                        'lon': 23.6236 + (time.time() * 0.00001) % 0.001,
-                        'pitch': 0.0,
-                        'roll': 0.0,
-                        'yaw': steer_angle,
-                        'traffic': traffic_state,
-                        'nav': nav_state,
-                        'light': light_status,
-                        'reason': self.traffic_module.reason if self.traffic_module else "CLEAR",
-                        'anchor': anchor
-                    })
-                    elapsed = time.time() - t_frame_start
-                    wait_time = max(0.001, FRAME_PERIOD - elapsed)
-                    time.sleep(wait_time)
-                else:                 
-                    # Render the luxurious Tesla UI Dashboard natively via OpenCV fallback
-                    dashboard_ui = self._render_dashboard(
-                        yolo_dbg, lane_dbg, speed, steer_angle, 
-                        traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
-                        light_status, nav_state, anchor, sim_batt_pct
-                    )
-                    
-                    cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                    cv2.imshow("BFMC_MASTER_VIEW", dashboard_ui)
+                # Render the luxurious Professional UI natively via OpenCV
+                dashboard_ui = self._render_dashboard(
+                    yolo_dbg, lane_dbg, speed, steer_angle, 
+                    traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
+                    light_status, nav_state, anchor, sim_batt_pct
+                )
+                
+                cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow("BFMC_MASTER_VIEW", dashboard_ui)
 
-                    elapsed = time.time() - t_frame_start
-                    wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
-                    if cv2.waitKey(wait_ms) == ord("q"): break
+                elapsed = time.time() - t_frame_start
+                wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
+                
+                key = cv2.waitKey(wait_ms)
+                if key == ord("q"): 
+                    break
+                elif key == ord(" "): 
+                    print("MANUAL ESTOP TRIGGERED!")
+                    speed = 0.0
+                    self.handler.set_speed(0.0)
 
         except KeyboardInterrupt: pass
         finally: 
@@ -958,31 +957,6 @@ class BFMC_Pilot:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BFMC Modular Traffic & Lane Pilot")
     parser.add_argument("--sim", action="store_true", help="Simulation mode")
-    parser.add_argument("--noui", action="store_true", help="Run without PyQt5 dashboard")
     args = parser.parse_args()
     
-    if args.noui:
-        BFMC_Pilot(sim_mode=args.sim).run()
-    else:
-        try:
-            from bfmc_dashboard import BFMCDashboard
-            from PyQt5.QtWidgets import QApplication
-            import sys
-            import threading
-            
-            app = QApplication(sys.argv)
-            dash = BFMCDashboard()
-            
-            pilot = BFMC_Pilot(sim_mode=args.sim, dashboard=dash)
-            
-            # Start pilot in background thread
-            pilot_thread = threading.Thread(target=pilot.run, daemon=True)
-            pilot_thread.start()
-            
-            # Show dashboard and run Qt event loop
-            dash.show()
-            sys.exit(app.exec_())
-            
-        except ImportError as e:
-            print(f"Warning: PyQt5 or Dashboard not available ({e}). Running in headless/legacy OpenCV UI mode.")
-            BFMC_Pilot(sim_mode=args.sim).run()
+    BFMC_Pilot(sim_mode=args.sim).run()
