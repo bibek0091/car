@@ -20,18 +20,13 @@ import sys
 from ultralytics import YOLO
 
 class PreTrainedYoloDetector:
-    def __init__(self, global_model="best.pt", led_model="runs/detect/custom_toy_traffic/weights/best.pt"):
+    def __init__(self, global_model="best.pt"):
         """
-        Initializes a Two-Stage Cascading YOLO pipeline.
+        Initializes a single-stage YOLO pipeline.
         - global_model: The original Bosch model (detects cars, stop signs, pedestrians, track bounds)
-        - led_model: The Custom Train model (only detects red/green LED glowing dots)
         """
         print(f"Loading Global YOLO Scanner '{global_model}'...")
         self.global_model = YOLO(global_model)
-        
-        print(f"Loading Specialized LED Classifier '{led_model}'...")
-        self.led_model = YOLO(led_model)
-        print(f"LED Model class names: {self.led_model.names}")
 
     def detect_traffic_signals(self, frame_bgr, conf_threshold=0.3):
         # 1. RUN GLOBAL SCAN (Finds signs, cars, and the base structure of the traffic light)
@@ -210,15 +205,15 @@ class TrafficDecisionModule:
         green_pixels = cv2.countNonZero(mask_green)
         
         # Absolute Mass Thresholds: Eliminates "small red color or far away red color"
-        # We only want BIG red/green glowing blobs.
-        MIN_GLOW_MASS = 150 
+        # Since a 10x10 LED is 100 pixels, 150 was way too high. Lowered to 30 pixels.
+        MIN_GLOW_MASS = 30 
         
         if red_pixels > MIN_GLOW_MASS and red_pixels > green_pixels:
-            return "RED"
+            return "RED", red_pixels
         elif green_pixels > MIN_GLOW_MASS:
-            return "GREEN"
+            return "GREEN", green_pixels
             
-        return "NONE"
+        return "NONE", max(red_pixels, green_pixels)
 
     def _is_light_red(self, label):
         l = label.lower()
@@ -293,10 +288,11 @@ class TrafficDecisionModule:
             cv2.putText(yolo_dbg, f"{label} {conf:.2f} [{box_h}px]", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
             # --- 2. LOGICAL PROXIMITY RULES ---
-            if label == "traffic-light":
+            label_lower = label.lower()
+            if "traffic" in label_lower and "light" in label_lower:
                 # We revert to classical OpenCV HSV math. Look inside the giant plastic
                 # YOLO Traffic Light bounding box for actual RED/GREEN blooming pixels.
-                color_state = self._is_light_glowing(raw_frame, x1, y1, x2, y2)
+                color_state, pixel_count = self._is_light_glowing(raw_frame, x1, y1, x2, y2)
                 
                 is_red = (color_state == "RED")
                 is_green = (color_state == "GREEN")
@@ -310,7 +306,7 @@ class TrafficDecisionModule:
                 elif box_h >= 70: distance_cat = "HALT"
                 
                 current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
-                print(f"TL DETECTION: color_state='{color_state}' dist={distance_cat} fsm={current_tl_state}")
+                print(f"TL DETECTION: color='{color_state}' pixels={pixel_count} dist={distance_cat} fsm={current_tl_state}")
                 
                 # React based on state machine
                 if current_tl_state == "LIGHT_APPROACHING":
