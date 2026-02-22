@@ -260,7 +260,7 @@ class TrafficDecisionModule:
             # --- 1. ALWAYS DRAW DETECTIONS ---
             color = (0, 255, 0)
             if label in ["stop-sign", "no-entry-road-sign"]: color = (0, 0, 255)
-            elif label == "traffic-light": color = (0, 255, 255)
+            elif label in ["traffic red", "green", "yellow"]: color = (0, 255, 255)
             elif label in ["car", "pedestrian", "closed-road-stand"]: color = (255, 0, 255)
             elif "speed-limit" in label: color = (255, 255, 0)
             elif label in ["crosswalk-sign", "parking-sign", "highway-sign", "priority-sign"]: color = (255, 128, 0)
