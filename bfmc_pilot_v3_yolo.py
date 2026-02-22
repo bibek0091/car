@@ -98,6 +98,29 @@ class TrafficDecisionModule:
         self.cooldown_duration = 5.0 
         self.active_detections = []
         
+    def _is_light_glowing(self, frame, x1, y1, x2, y2):
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        box_h, box_w = y2 - y1, x2 - x1
+        if box_h < 15 or box_w < 10: return False
+        
+        crop = frame[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        
+        # Check for glowing Red, Yellow, or Green. S > 50 avoids white/grey, V > 150 ensures brightness
+        mask_red1 = cv2.inRange(hsv, np.array([0, 50, 150]), np.array([10, 255, 255]))
+        mask_red2 = cv2.inRange(hsv, np.array([170, 50, 150]), np.array([180, 255, 255]))
+        mask_yellow = cv2.inRange(hsv, np.array([15, 50, 150]), np.array([35, 255, 255]))
+        mask_green = cv2.inRange(hsv, np.array([40, 50, 150]), np.array([90, 255, 255]))
+        
+        glow_mask = cv2.bitwise_or(mask_red1, mask_red2)
+        glow_mask = cv2.bitwise_or(glow_mask, mask_yellow)
+        glow_mask = cv2.bitwise_or(glow_mask, mask_green)
+        
+        glow_ratio = cv2.countNonZero(glow_mask) / (box_h * box_w)
+        return glow_ratio > 0.05
+
     def _is_light_red(self, frame, x1, y1, x2, y2):
         h, w = frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
@@ -158,6 +181,12 @@ class TrafficDecisionModule:
 
         for det in self.active_detections:
             label, (x1, y1, x2, y2), conf = det["label"], det["bbox"], det["confidence"]
+            
+            # --- 0. COMPLETELY IGNORE OFF TRAFFIC LIGHTS ---
+            if label == "traffic-light":
+                if not self._is_light_glowing(raw_frame, x1, y1, x2, y2):
+                    continue
+                    
             box_h = y2 - y1
             active_labels.append(label)
             
