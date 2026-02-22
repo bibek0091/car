@@ -2,19 +2,13 @@ import cv2
 from ultralytics import YOLO
 
 class PreTrainedYoloDetector:
-    def __init__(self, model_version="best.pt", traffic_model="best_traffic_med_yolo_v8.pt"):
+    def __init__(self, model_version="best.pt"):
         """
-        Initializes the custom BFMC YOLO models.
+        Initializes the custom BFMC YOLO model.
         """
-        print(f"Loading primary BFMC YOLO model '{model_version}'...")
+        print(f"Loading custom BFMC YOLO model '{model_version}'...")
         # Loads the user-trained BFMC weights
         self.model = YOLO(model_version)
-        print(f"Loading secondary Traffic Color YOLO model '{traffic_model}'...")
-        try:
-            self.traffic_model = YOLO(traffic_model)
-        except Exception as e:
-            print(f"WARNING: traffic model not found: {e}")
-            self.traffic_model = None
 
     def detect_traffic_signals(self, frame_bgr, conf_threshold=0.3):
         """
@@ -54,38 +48,11 @@ class PreTrainedYoloDetector:
             # Get human readable label
             label = self.model.names[cls_id]
             
-            det_payload = {
+            filtered_detections.append({
                 "label": label,
                 "confidence": confidence,
                 "bbox": (x1, y1, x2, y2)
-            }
-            
-            # OPTION A: Targeted Crop Inference (Ultra-Fast)
-            if label == "traffic-light" and getattr(self, "traffic_model", None):
-                # We pad the crop by 5 pixels so the model has edge context
-                h, w = frame_bgr.shape[:2]
-                pad = 5
-                cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
-                cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
-                crop = frame_bgr[cy1:cy2, cx1:cx2]
-                
-                if crop.size > 0:
-                    # Run the heavy traffic model only on this microscopic crop image
-                    t_res = self.traffic_model.predict(
-                        source=crop, 
-                        imgsz=96,           # Run at tiny resolution for ~5ms inference
-                        conf=max(0.15, conf_threshold - 0.1), 
-                        verbose=False
-                    )
-                    
-                    if len(t_res[0].boxes) > 0:
-                        # Extract the best color match
-                        best_t_box = max(t_res[0].boxes, key=lambda b: b.conf[0].item())
-                        t_cls_id = int(best_t_box.cls[0].item())
-                        color_label = self.traffic_model.names[t_cls_id]
-                        det_payload["color"] = color_label
-                        
-            filtered_detections.append(det_payload)
+            })
             
         return filtered_detections
 
