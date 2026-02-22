@@ -264,6 +264,42 @@ class TrafficDecisionModule:
         return 1.0
 
 
+class AutonomousJunctionPlanner:
+    def decide_junction_direction(self, warped_binary, left_fit, right_fit, lane_width_px):
+        h, w = warped_binary.shape
+        left_roi = warped_binary[0:240, 0:320]
+        right_roi = warped_binary[0:240, 320:640]
+        straight_roi = warped_binary[0:240, 200:440]
+        
+        weights = np.linspace(2.0, 0.5, 240).reshape(-1, 1)
+        left_score = np.sum(left_roi * weights) / (320 * 240)
+        right_score = np.sum(right_roi * weights) / (320 * 240)
+        straight_score = np.sum(straight_roi * weights) / (240 * 240)
+        
+        scores = {"LEFT": left_score, "RIGHT": right_score, "STRAIGHT": straight_score}
+        best_dir = max(scores, key=scores.get)
+        
+        total = sum(scores.values())
+        confidence = scores[best_dir] / max(total, 1e-6)
+        
+        if confidence < 0.4: return "RIGHT", 0.3
+        return best_dir, confidence
+
+class DeadReckoningNavigator:
+    def __init__(self):
+        self.last_valid_target = 320.0
+        self.last_valid_curvature = 0.0
+
+    def predict_target(self, frames_lost, last_speed, last_steering):
+        time_lost = frames_lost / max(TARGET_FPS, 1)
+        lateral_drift = last_steering * 2.0 * time_lost
+        predicted_target = self.last_valid_target + lateral_drift
+        if abs(self.last_valid_curvature) > 0.001:
+            predicted_target += self.last_valid_curvature * 5000 * time_lost
+        predicted_target = np.clip(predicted_target, 150, 490)
+        confidence = max(0.0, 1.0 - frames_lost / 30.0)
+        return predicted_target, confidence
+
 # ===========================================================================
 # HYBRID LANE TRACKER V2 LOGIC
 # ===========================================================================
@@ -288,6 +324,7 @@ class HybridLaneTracker:
         self.right_conf = 0
         self.left_stale  = 0
         self.right_stale = 0
+        self.dead_reckoner = DeadReckoningNavigator()
 
     def update(self, warped_binary):
         nz  = warped_binary.nonzero()
@@ -345,7 +382,7 @@ class HybridLaneTracker:
         self.mode = "TRACKING" if (has_l or has_r or self.sl is not None or self.sr is not None) else "SEARCH"
         return self.sl, self.sr, dbg, mode_label
 
-    def get_target_x(self, y_eval, lane_width_px, extra_offset_px=0, nav_state="NORMAL"):
+    def get_target_x(self, y_eval, lane_width_px, extra_offset_px=0, nav_state="NORMAL", frames_lost=0, last_speed=0.0, last_steering=0.0):
         sl = self.sl
         sr = self.sr
         hw = lane_width_px / 2.0
@@ -401,24 +438,26 @@ class HybridLaneTracker:
         
         # BLIND CORNER FALLBACK
         if sl is None and sr is None:
-            # Complete loss: We rely on the interactive prompt
-            return 320.0 + extra_offset_px, "BLIND_CORNER"
+            predicted_x, confidence = self.dead_reckoner.predict_target(
+                frames_lost, last_speed, last_steering
+            )
+            return predicted_x + extra_offset_px, f"DEAD_RECKONING_{confidence:.2f}"
         
         # Scenario 1: Both lines perfectly visible. Center it mathematically.
         if sl is not None and sr is not None:
-            return (ev(sl) + ev(sr)) / 2.0 + extra_offset_px, "CENTERED_DUAL"
+            base_x, anchor = (ev(sl) + ev(sr)) / 2.0, "CENTERED_DUAL"
             
         # Scenario 2: Only right line visible. Project center leftwards by hw.
         elif sr is not None:
-            return ev(sr) - hw + extra_offset_px, "CENTERED_FROM_RIGHT"
+            base_x, anchor = ev(sr) - hw, "CENTERED_FROM_RIGHT"
             
         # Scenario 3: Only left divider visible. Project center rightwards by hw.
         elif sl is not None:
-            return ev(sl) + hw + extra_offset_px, "CENTERED_FROM_LEFT"
-
-        # Complete loss
-        # Default back to far right side of screen based on recent lane width estimates
-        return 320.0 + (lane_width_px * 0.40) + extra_offset_px, "LOST"
+            base_x, anchor = ev(sl) + hw, "CENTERED_FROM_LEFT"
+            
+        self.dead_reckoner.last_valid_target = base_x
+        self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
+        return base_x + extra_offset_px, anchor
 
     def get_curvature(self, y_eval):
         fit = self.sr if self.sr is not None else self.sl
@@ -547,8 +586,9 @@ class JunctionDetector:
 
     def __init__(self):
         self.state, self.entry_count, self.exit_count, self.frames_in_jct = "NORMAL", 0, 0, 0
-        self.user_choice = None  # Tracks the user's manual branch decision ("LEFT" / "RIGHT")
-        self.prompt_timer = 0.0 # BUG 4: Timer for deadlock timeout
+        self.user_choice = None
+        self.prompt_timer = 0.0
+        self.planner = AutonomousJunctionPlanner()
 
     def update(self, warped_binary, left_conf, right_conf, left_fit, right_fit, lane_width_px, active_labels):
         h, w = warped_binary.shape
@@ -594,14 +634,15 @@ class JunctionDetector:
                 self.prompt_timer = time.time() # BUG 4: Start timeout timer
                 
         elif self.state == "JUNCTION_PROMPT":
-            # Wait with timeout in PROMPT state until the main loop injects user_choice
-            if self.user_choice == "RIGHT":
+            direction, confidence = self.planner.decide_junction_direction(
+                warped_binary, left_fit, right_fit, lane_width_px
+            )
+            if confidence > 0.6:
+                self.state = f"JUNCTION_{direction}"
+                self.user_choice = direction
+            else:
                 self.state = "JUNCTION_RIGHT"
-            elif self.user_choice == "LEFT":
-                self.state = "JUNCTION_LEFT"
-            # BUG 4: Add PROMPT_TIMEOUT=10.0 seconds. Default to RIGHT turn after timeout
-            elif time.time() - self.prompt_timer > 10.0:
-                self.state = "JUNCTION_RIGHT"
+                self.user_choice = "RIGHT"
                 
         elif self.state.startswith("JUNCTION_"):
             # We are actively executing a branch
@@ -960,6 +1001,10 @@ class BFMC_Pilot:
         try:
             while self.running:
                 t_frame_start = time.time()
+                
+                if getattr(self, '_manual_estop', False) and (time.time() - getattr(self, '_estop_timestamp', time.time()) > 3.0):
+                    self._manual_estop = False
+                    print("E-STOP AUTO-RECOVERY: Resuming autonomous operation")
 
                 look_ahead    = cv2.getTrackbarPos("Look Ahead",    "BFMC_MASTER_VIEW")
                 lane_width_px = cv2.getTrackbarPos("Lane Width PX", "BFMC_MASTER_VIEW")
@@ -1029,20 +1074,8 @@ class BFMC_Pilot:
                 eff_la = max(60, eff_la)
                 y_eval = max(0, 480 - eff_la)
 
-                target_x, anchor = tracker.get_target_x(y_eval, lane_width_px, total_offset, nav_state)
+                target_x, anchor = tracker.get_target_x(y_eval, lane_width_px, total_offset, nav_state, self.lost_frames, getattr(self, '_last_speed', 0.0), getattr(self, 'prev_steer', 0.0))
                 
-                # Dynamic Interactivity Handling for Blind Corners
-                if anchor == "BLIND_CORNER":
-                    # If we lost both lines, we wait for human input injected via keyboard
-                    speed = 0.0
-                    if getattr(self, '_blind_override', None) == "LEFT":
-                        target_x, anchor = 320.0 - (lane_width_px * 0.5), "BLIND_FORCED_L"
-                    elif getattr(self, '_blind_override', None) == "RIGHT":
-                        target_x, anchor = 320.0 + (lane_width_px * 0.5), "BLIND_FORCED_R"
-                else:
-                    # BUG 3: Add reset logic when anchor != "BLIND_CORNER"
-                    if hasattr(self, '_blind_override'): self._blind_override = None
-                        
                 # Dynamic Autonomous Lane Swapping
                 if traffic_state == "SYS_LANE_CHANGE_LEFT" and target_x is not None:
                     # Forcibly subtract a full lane width to move the car into the oncoming left lane
@@ -1087,9 +1120,12 @@ class BFMC_Pilot:
                 curvature = tracker.get_curvature(y_eval)
                 # BUG 19: E-Stop persistent flag check
                 if getattr(self, '_manual_estop', False): speed = 0.0
-                elif self.lost_frames > LOST_GRACE_FRAMES: speed = 0.0
                 elif base_speed == 0: speed = 0.0
-                elif nav_state == "JUNCTION_PROMPT" or anchor == "BLIND_CORNER": speed = 0.0 # HALT car to wait for human input
+                elif nav_state == "JUNCTION_PROMPT": speed = 0.0 # HALT momentarily
+                elif anchor.startswith("DEAD_RECKONING"):
+                    try: conf = float(anchor.split("_")[2])
+                    except: conf = 0.5
+                    speed = base_speed * (0.3 + 0.4 * conf)
                 elif nav_state == "ROUNDABOUT": speed = base_speed * self.rbt.SPEED_SCALE
                 elif nav_state.startswith("JUNCTION"): speed = base_speed * 0.55
                 elif curvature > self.HIGH_CURV_THRESH: speed = base_speed * self.HIGH_CURV_SCALE
@@ -1103,6 +1139,7 @@ class BFMC_Pilot:
                     speed *= max(0.3, 1.0 - self.lost_frames / LOST_GRACE_FRAMES)
 
                 speed = speed * traffic_mult * (guard_spd if guard_on else 1.0)
+                self._last_speed = speed
                 steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_angle))
 
                 # -------------------------------------------------------------
@@ -1166,19 +1203,8 @@ class BFMC_Pilot:
                     print("MANUAL ESTOP TRIGGERED!")
                     speed = 0.0
                     self._manual_estop = True # BUG 19: Local speed was wiped, persisted E-Stop state
+                    self._estop_timestamp = time.time()
                     self.handler.set_speed(0.0)
-                elif key == ord("l"):
-                    if nav_state == "JUNCTION_PROMPT":
-                        print("USER DIRECTED: LEFT TURN")
-                        self.jct.user_choice = "LEFT"
-                    elif anchor == "BLIND_CORNER":
-                        self._blind_override = "LEFT"
-                elif key == ord("r"):
-                    if nav_state == "JUNCTION_PROMPT":
-                        print("USER DIRECTED: RIGHT TURN")
-                        self.jct.user_choice = "RIGHT"
-                    elif anchor == "BLIND_CORNER":
-                        self._blind_override = "RIGHT"
 
         except KeyboardInterrupt: pass
         finally: 
