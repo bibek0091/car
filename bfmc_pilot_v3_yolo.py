@@ -20,16 +20,21 @@ import sys
 from ultralytics import YOLO
 
 class PreTrainedYoloDetector:
-    def __init__(self, model_version="runs/detect/custom_toy_traffic/weights/best.pt"):
+    def __init__(self, global_model="best.pt", led_model="runs/detect/custom_toy_traffic/weights/best.pt"):
         """
-        Initializes the custom trained YOLO model exclusively for the BFMC 
-        Toy Traffic Lights (Red, Green, Yellow).
+        Initializes a Two-Stage Cascading YOLO pipeline.
+        - global_model: The original Bosch model (detects cars, stop signs, pedestrians, track bounds)
+        - led_model: The Custom Train model (only detects red/green LED glowing dots)
         """
-        print(f"Loading custom BFMC YOLO model '{model_version}'...")
-        self.model = YOLO(model_version)
+        print(f"Loading Global YOLO Scanner '{global_model}'...")
+        self.global_model = YOLO(global_model)
+        
+        print(f"Loading Specialized LED Classifier '{led_model}'...")
+        self.led_model = YOLO(led_model)
 
     def detect_traffic_signals(self, frame_bgr, conf_threshold=0.3):
-        results = self.model.predict(
+        # 1. RUN GLOBAL SCAN (Finds signs, cars, and the base structure of the traffic light)
+        results = self.global_model.predict(
             source=frame_bgr, 
             conf=conf_threshold, 
             verbose=False
@@ -42,13 +47,40 @@ class PreTrainedYoloDetector:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
             confidence = box.conf[0].item()
             cls_id = int(box.cls[0].item())
-            label = self.model.names[cls_id]
+            label = self.global_model.names[cls_id]
             
-            filtered_detections.append({
-                "label": label,
-                "confidence": confidence,
-                "bbox": (x1, y1, x2, y2)
-            })
+            # --- 2. CASCADING SECONDARY INFERENCE ---
+            # If the Global Scanner found the massive plastic traffic light body...
+            if label == "traffic-light":
+                # Crop *only* that traffic light out
+                crop_y1, crop_y2 = max(0, y1), min(frame_bgr.shape[0], y2)
+                crop_x1, crop_x2 = max(0, x1), min(frame_bgr.shape[1], x2)
+                tl_crop = frame_bgr[crop_y1:crop_y2, crop_x1:crop_x2]
+                
+                if tl_crop.size > 0:
+                    # Instantly pass the 50x50 pixel box to the Specialized LED Model
+                    # We lower the confidence threshold heavily here to catch faint LEDs
+                    led_results = self.led_model.predict(source=tl_crop, conf=0.15, verbose=False)
+                    
+                    for led_box in led_results[0].boxes:
+                        led_conf = led_box.conf[0].item()
+                        led_id = int(led_box.cls[0].item())
+                        led_label = self.led_model.names[led_id]
+                        
+                        # Add the LED color detection directly into the global list
+                        # We use the global bounding box geometry so the pilot knows how far away it is
+                        filtered_detections.append({
+                            "label": led_label,
+                            "confidence": led_conf,
+                            "bbox": (x1, y1, x2, y2)
+                        })
+            else:
+                # Append standard global detections (Stop Sign, Car, Crosswalk, etc)
+                filtered_detections.append({
+                    "label": label,
+                    "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2)
+                })
             
         return filtered_detections
 
@@ -275,10 +307,13 @@ class TrafficDecisionModule:
                 is_red = self._is_light_red(label)
                 is_green = self._is_light_green(label)
                 
-                # We bypass height thresholds entirely for the custom YOLO model!
-                # Since the model only draws a box around the tiny LED bulb itself,
-                # the height (box_h) will always be tiny (10-20px). If we see Red anywhere, we MUST HALT.
-                distance_cat = "HALT"
+                # We have reverted to checking distance! Because the Secondary LED 
+                # model inherits the giant bounding box from the Primary Bosch model, 
+                # we can accurately scale distance again based on the plastic base.
+                distance_cat = "UNKNOWN"
+                if box_h < 40: distance_cat = "FAR"
+                elif box_h < 70: distance_cat = "APPROACH"
+                elif box_h >= 70: distance_cat = "HALT"
                 
                 current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
                 
