@@ -50,38 +50,12 @@ class PreTrainedYoloDetector:
             cls_id = int(box.cls[0].item())
             label = self.global_model.names[cls_id]
             
-            # --- 2. CASCADING SECONDARY INFERENCE ---
-            # If the Global Scanner found the massive plastic traffic light body...
-            if label == "traffic-light":
-                # Crop *only* that traffic light out
-                crop_y1, crop_y2 = max(0, y1), min(frame_bgr.shape[0], y2)
-                crop_x1, crop_x2 = max(0, x1), min(frame_bgr.shape[1], x2)
-                tl_crop = frame_bgr[crop_y1:crop_y2, crop_x1:crop_x2]
-                
-                if tl_crop.size > 0:
-                    # Instantly pass the 50x50 pixel box to the Specialized LED Model
-                    # We lower the confidence threshold heavily here to catch faint LEDs
-                    led_results = self.led_model.predict(source=tl_crop, conf=0.15, verbose=False)
-                    
-                    for led_box in led_results[0].boxes:
-                        led_conf = led_box.conf[0].item()
-                        led_id = int(led_box.cls[0].item())
-                        led_label = self.led_model.names[led_id]
-                        
-                        # Add the LED color detection directly into the global list
-                        # We use the global bounding box geometry so the pilot knows how far away it is
-                        filtered_detections.append({
-                            "label": led_label,
-                            "confidence": led_conf,
-                            "bbox": (x1, y1, x2, y2)
-                        })
-            else:
-                # Append standard global detections (Stop Sign, Car, Crosswalk, etc)
-                filtered_detections.append({
-                    "label": label,
-                    "confidence": confidence,
-                    "bbox": (x1, y1, x2, y2)
-                })
+            # Append standard global detections (Stop Sign, Car, Crosswalk, etc)
+            filtered_detections.append({
+                "label": label,
+                "confidence": confidence,
+                "bbox": (x1, y1, x2, y2)
+            })
             
         return filtered_detections
 
@@ -212,27 +186,39 @@ class TrafficDecisionModule:
         self.last_process_time = time.time()
         
     def _is_light_glowing(self, frame, x1, y1, x2, y2):
+        """
+        Uses Classical OpenCV HSV masking to find blooming LEDs inside the traffic light bounding box.
+        Returns 'RED', 'GREEN', or 'NONE' based on absolute pixel mass (to eliminate far away lights).
+        """
         h, w = frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False
+        if box_h < 15 or box_w < 10: return "NONE"
         
         crop = frame[y1:y2, x1:x2]
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         
-        # Check for glowing Red, Yellow, or Green. S > 50 avoids white/grey, V > 150 ensures brightness
-        mask_red1 = cv2.inRange(hsv, np.array([0, 50, 150]), np.array([10, 255, 255]))
-        mask_red2 = cv2.inRange(hsv, np.array([170, 50, 150]), np.array([180, 255, 255]))
-        mask_yellow = cv2.inRange(hsv, np.array([15, 50, 150]), np.array([35, 255, 255]))
-        mask_green = cv2.inRange(hsv, np.array([40, 50, 150]), np.array([90, 255, 255]))
+        # Check for glowing Red or Green. S > 50 avoids white/grey, V > 150 ensures brightness
+        mask_red1  = cv2.inRange(hsv, np.array([0, 50, 150]), np.array([10, 255, 255]))
+        mask_red2  = cv2.inRange(hsv, np.array([170, 50, 150]), np.array([180, 255, 255]))
+        mask_green = cv2.inRange(hsv, np.array([50, 50, 150]), np.array([90, 255, 255]))
         
-        glow_mask = cv2.bitwise_or(mask_red1, mask_red2)
-        glow_mask = cv2.bitwise_or(glow_mask, mask_yellow)
-        glow_mask = cv2.bitwise_or(glow_mask, mask_green)
+        red_mask   = cv2.bitwise_or(mask_red1, mask_red2)
         
-        glow_ratio = cv2.countNonZero(glow_mask) / (box_h * box_w)
-        return glow_ratio > 0.05
+        red_pixels = cv2.countNonZero(red_mask)
+        green_pixels = cv2.countNonZero(mask_green)
+        
+        # Absolute Mass Thresholds: Eliminates "small red color or far away red color"
+        # We only want BIG red/green glowing blobs.
+        MIN_GLOW_MASS = 150 
+        
+        if red_pixels > MIN_GLOW_MASS and red_pixels > green_pixels:
+            return "RED"
+        elif green_pixels > MIN_GLOW_MASS:
+            return "GREEN"
+            
+        return "NONE"
 
     def _is_light_red(self, label):
         l = label.lower()
@@ -307,11 +293,13 @@ class TrafficDecisionModule:
             cv2.putText(yolo_dbg, f"{label} {conf:.2f} [{box_h}px]", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
             # --- 2. LOGICAL PROXIMITY RULES ---
-            label_lower = label.lower()
-            if any(c in label_lower for c in ["red", "green", "yellow", "orange", "traffic", "led", "light", "signal"]):
-                # The YOLO Custom Model natively handles color classification now.
-                is_red = self._is_light_red(label)
-                is_green = self._is_light_green(label)
+            if label == "traffic-light":
+                # We revert to classical OpenCV HSV math. Look inside the giant plastic
+                # YOLO Traffic Light bounding box for actual RED/GREEN blooming pixels.
+                color_state = self._is_light_glowing(raw_frame, x1, y1, x2, y2)
+                
+                is_red = (color_state == "RED")
+                is_green = (color_state == "GREEN")
                 
                 # We have reverted to checking distance! Because the Secondary LED 
                 # model inherits the giant bounding box from the Primary Bosch model, 
@@ -322,7 +310,7 @@ class TrafficDecisionModule:
                 elif box_h >= 70: distance_cat = "HALT"
                 
                 current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
-                print(f"TL DETECTION: label='{label}' is_red={is_red} is_green={is_green} dist={distance_cat} fsm={current_tl_state}")
+                print(f"TL DETECTION: color_state='{color_state}' dist={distance_cat} fsm={current_tl_state}")
                 
                 # React based on state machine
                 if current_tl_state == "LIGHT_APPROACHING":
