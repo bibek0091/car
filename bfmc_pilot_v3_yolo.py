@@ -621,13 +621,13 @@ class DividerGuard:
 class BFMC_Pilot:
 
     # -------------------------------------------------------------
-    # LUXURY STEERING DYNAMICS (Tesla-Style Smoothness)
+    # AGGRESSIVE STEERING DYNAMICS (High Performance)
     # -------------------------------------------------------------
-    STEER_EMA_SLOW = 0.85   # VERY slow EMA for hyper-smooth lane following
-    STEER_EMA_FAST = 0.40   # Faster only for extreme emergency corrections
-    GUARD_EMA      = 0.70   
-    MAX_STEER      = 30.0
-    MAX_STEER_RATE = 2.0    # Slower max-change rate for luxurious turns
+    STEER_EMA_SLOW = 0.40   # Accepts 60% of new steering signal instantly
+    STEER_EMA_FAST = 0.10   # Accepts 90% of emergency steering instantly
+    GUARD_EMA      = 0.30   # Apply divider guard saves rapidly
+    MAX_STEER      = 45.0   # Expanded physical steering rack limit
+    MAX_STEER_RATE = 15.0   # Allow violent 15-deg/frame snaps instead of sluggish 2-deg loops
 
     HIGH_CURV_THRESH = 0.0025 # Engage high-curve speed slow down earlier
     MED_CURV_THRESH  = 0.0010
