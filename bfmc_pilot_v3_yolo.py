@@ -204,18 +204,18 @@ class TrafficDecisionModule:
             # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
                 is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
-                # BUG 14: Add hysteresis transitions between distance zones (55 and 105 instead of 60 and 110)
-                if box_h < 55:
+                # React from a greater distance
+                if box_h < 40:
                     light_status = "[RED] FAR" if is_red else "[GREEN] FAR"
-                elif box_h < 105:
+                elif box_h < 85:
                     light_status = "[RED] APPROACH" if is_red else "[GREEN] APPROACH"
                     if is_red: commit_state(4, "SYS_SLOW", "RED LIGHT AHEAD")
-                elif box_h >= 105: # BUG 1: Changed to elif to fix orphaned else
+                elif box_h >= 85:
                     light_status = "[RED] HALT" if is_red else "[GREEN] CLEAR"
                     if is_red: commit_state(1, "SYS_STOP", "RED LIGHT (PRIORITY)")
             
             else:
-                if box_h < 140:
+                if box_h < 90: # React to signs from a further distance
                     continue
 
                 if label == "stop-sign":
@@ -647,11 +647,11 @@ class RoundaboutNavigator:
 
 class DividerGuard:
     # 80px Lethal Zone: The car MUST NOT ever touch the center divider.
-    DIVIDER_SAFE_PX = 80 
-    EDGE_SAFE_PX    = 40
-    GAIN            = 0.20 # Massive correction gain
-    MAX_CORR        = 18.0 # Allowing enormous steering spikes for emergency saves
-    DEADBAND_PX     = 5
+    DIVIDER_SAFE_PX = 110 
+    EDGE_SAFE_PX    = 70
+    GAIN            = 0.35 # Massive correction gain
+    MAX_CORR        = 25.0 # Allowing enormous steering spikes for emergency saves
+    DEADBAND_PX     = 2
 
     def apply(self, steer_angle, left_fit, right_fit, y_eval=440, car_x=320):
         # We want the car in the middle, but heavily penalize touching the center divider
