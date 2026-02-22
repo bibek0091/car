@@ -297,9 +297,18 @@ class HybridLaneTracker:
             return None, "RBT_LOST"
 
         if nav_state == "JUNCTION":
-            if sr is not None: return ev(sr) - hw + extra_offset_px, "JCT_EDGE"
-            if sl is not None: return ev(sl) + hw + extra_offset_px, "JCT_DIV"
-            return None, "JCT_LOST"
+            # STRICT RIGHT PRIORITY: Always hunt the right edge first.
+            if sr is not None:
+                # Car anchors off the right line, offset inwards by half lane width
+                return ev(sr) - hw + extra_offset_px, "JCT_RIGHT_EDGE"
+            if sl is not None:
+                # If right is lost but left divider exists, project a massive ghost lane
+                # completely across the intersection to force the car to the right lane
+                ghost_right = sl + np.array([0.0, 0.0, float(lane_width_px)])
+                return ev(ghost_right) - hw + extra_offset_px, "JCT_DIV_GHOST_R"
+            
+            # If both lines are lost in the intersection void, just dead-reckon straight
+            return 320.0 + RIGHT_LANE_OFFSET_PX, "JCT_BLIND"
 
         if sl is not None and sr is not None:
             return (ev(sl) + ev(sr)) / 2.0 + DUAL_OFFSET_PX, "DUAL"
