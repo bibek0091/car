@@ -132,16 +132,15 @@ class TrafficDecisionModule:
         
         sees_red_light = sees_close_stop_sign = obstacle_in_path = sees_crosswalk = False
         light_status = "NONE"
+        active_labels = []
         
         for det in self.active_detections:
             label, (x1, y1, x2, y2), conf = det["label"], det["bbox"], det["confidence"]
             box_h = y2 - y1
+            active_labels.append(label)
             
-            # PROXIMITY CHECK: Approx 15cm distance means the sign takes up a
-            # massive portion of the 1280x720 HD frame.
-            if box_h < 140:
-                continue
-            
+            # --- 1. ALWAYS DRAW DETECTIONS ---
+            # Even if they are miles away, we want the YOLO HUD to look active and intelligent.
             color = (0, 255, 0)
             if label in ["stop-sign", "no-entry-road-sign"]: color = (0, 0, 255)
             elif label == "traffic-light": color = (0, 255, 255)
@@ -150,37 +149,51 @@ class TrafficDecisionModule:
             elif label in ["crosswalk-sign", "parking-sign", "highway-sign", "priority-sign"]: color = (255, 128, 0)
                 
             cv2.rectangle(yolo_dbg, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(yolo_dbg, f"{label} {conf:.2f}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.putText(yolo_dbg, f"{label} {conf:.2f} [{box_h}px]", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
+            # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
-                # Only analyze if it passes proximity check (e.g. 15cm)
-                if self._is_light_red(raw_frame, x1, y1, x2, y2):
-                    self.state, self.reason = "SYS_STOP", "RED LIGHT"
-                    light_status = "[RED]"
+                # Traffic lights are tracked continuously at all ranges
+                is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
+                
+                if box_h < 60:
+                    light_status = "[RED] FAR" if is_red else "[GREEN] FAR"
+                elif box_h < 110:
+                    # At roughly 30cm-50cm, we recognize we are approaching a light
+                    light_status = "[RED] APPROACH" if is_red else "[GREEN] APPROACH"
+                    if is_red and self.state not in ["SYS_STOP", "SYS_HALT"]:
+                        self.state, self.reason = "SYS_SLOW", "RED LIGHT AHEAD"
                 else:
-                    # Seen, but not red. Safe to go.
-                    light_status = "[GREEN/OFF]"
-                    
-            elif label == "stop-sign" and now > self.stop_sign_cooldown:
-                if self.stop_sign_timer == 0.0:
-                    self.stop_sign_timer = now
-                self.state, self.reason = "SYS_STOP", "STOP SIGN"
-            elif label in ["car", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                # Obstacle in the right lane -> Trigger an evasion maneuver into the left lane
-                self.state, self.reason = "SYS_LANE_CHANGE_LEFT", f"EVADING ({label})"
-            elif label == "pedestrian" and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                # Unlike cars/stands, we MUST stop for pedestrians, no swerving around them
-                self.state, self.reason = "SYS_STOP", "PEDESTRIAN IN PATH"
-            elif label == "crosswalk-sign":
-                # Only register if we aren't already stopping
-                if self.state not in ["SYS_STOP", "SYS_HALT"]:
-                    self.state, self.reason = "SYS_SLOW", "CROSSWALK ZONE"
-            elif "speed-limit" in label:
-                if self.state not in ["SYS_STOP", "SYS_HALT"]:
-                    self.state, self.reason = "SYS_LIMIT", f"SPEED LIMIT ZONE"
-            elif label in ["parking-sign", "highway-sign", "priority-sign"]:
-                # Information signs - track them but default to GO state
-                cv2.putText(yolo_dbg, f"INFO: {label}", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    # At <30cm (approx 110px+ height), we drop anchor
+                    light_status = "[RED] HALT" if is_red else "[GREEN] CLEAR"
+                    if is_red:
+                        self.state, self.reason = "SYS_STOP", "RED LIGHT"
+            
+            else:
+                # All other signs only trigger physical car actions when within ~15cm (140px tall)
+                if box_h < 140:
+                    continue
+
+                if label == "stop-sign" and now > self.stop_sign_cooldown:
+                    if self.stop_sign_timer == 0.0:
+                        self.stop_sign_timer = now
+                    self.state, self.reason = "SYS_STOP", "STOP SIGN"
+                elif label in ["car", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
+                    # If we are at a crosswalk, DO NOT SWERVE. Stop and wait.
+                    if "crosswalk-sign" in [d["label"] for d in self.active_detections]:
+                        self.state, self.reason = "SYS_STOP", f"OBSTACLE AT CROSSWALK"
+                    else:
+                        self.state, self.reason = "SYS_LANE_CHANGE_LEFT", f"EVADING ({label})"
+                elif label == "pedestrian" and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
+                    self.state, self.reason = "SYS_STOP", "PEDESTRIAN IN PATH"
+                elif label == "crosswalk-sign":
+                    if self.state not in ["SYS_STOP", "SYS_HALT"]:
+                        self.state, self.reason = "SYS_SLOW", "CROSSWALK ZONE"
+                elif "speed-limit" in label:
+                    if self.state not in ["SYS_STOP", "SYS_HALT"]:
+                        self.state, self.reason = "SYS_LIMIT", f"SPEED LIMIT ZONE"
+                elif label in ["parking-sign", "highway-sign", "priority-sign"]:
+                    cv2.putText(yolo_dbg, f"INFO: {label}", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                 
         # Stop sign logic handles timers overriding immediate frame detections
         if self.stop_sign_timer > 0.0:
@@ -195,7 +208,7 @@ class TrafficDecisionModule:
             self.state, self.reason = "SYS_GO", "CLEAR PATH"
 
         cv2.putText(yolo_dbg, f"TRAFFIC: {self.state} | {self.reason}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255) if self.state == "SYS_STOP" else (0,255,0), 3)
-        return self.state, self.get_speed_multiplier(), light_status, yolo_dbg
+        return self.state, self.get_speed_multiplier(), light_status, active_labels, yolo_dbg
         
     def get_speed_multiplier(self):
         if self.state == "SYS_STOP": return 0.0
@@ -704,7 +717,7 @@ class BFMC_Pilot:
     # -------------------------------------------------------------
     # TESLA-STYLE DASHBOARD RENDERER (ULTRA REALISTIC OpenCV)
     # -------------------------------------------------------------
-    def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct):
+    def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct, active_labels, topology):
         # Master Canvas: 1280x720 (HD)
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
         
@@ -803,29 +816,33 @@ class BFMC_Pilot:
         
         cv2.putText(canvas, "TRAFFIC SIGNAL:", (1080, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
         tl_col = TEXT_DIM
-        if light_status == "[RED]": tl_col = RED_LUM
-        elif light_status == "[GREEN/OFF]": tl_col = GREEN_LUM
+        if "RED" in light_status: tl_col = RED_LUM
+        elif "GREEN" in light_status: tl_col = GREEN_LUM
         cv2.putText(canvas, light_status, (1080, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 2, cv2.LINE_AA)
         
-        # LED Status Board
-        cv2.line(canvas, (base_x, 560), (1240, 560), (50, 50, 50), 1)
-        cv2.putText(canvas, "SYSTEM FLAGS", (base_x, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "ROAD TOPOLOGY:", (860, 570), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        top_col = GREEN_LUM if "DUAL" in topology else (0, 200, 255) if "BLIND" in topology else BLUE_NEON
+        cv2.putText(canvas, topology, (860, 595), cv2.FONT_HERSHEY_SIMPLEX, 0.6, top_col, 2, cv2.LINE_AA)
         
-        # Stop Sign LED
-        c_stop = RED_LUM if "STOP" in traffic_reason else (40, 40, 40)
-        cv2.rectangle(canvas, (base_x, 610), (base_x + 110, 640), c_stop, -1)
-        cv2.putText(canvas, "STOP SIGN", (base_x + 15, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_MAIN, 1, cv2.LINE_AA)
+        # LED Status Board (Dynamic Grid)
+        cv2.line(canvas, (base_x, 610), (1240, 610), (50, 50, 50), 1)
         
-        # Pedestrian LED
-        c_ped = (0, 200, 255) if "PEDESTRIAN" in traffic_reason else (40, 40, 40)
-        cv2.rectangle(canvas, (base_x + 125, 610), (base_x + 235, 640), c_ped, -1)
-        cv2.putText(canvas, "PEDESTRIAL", (base_x + 135, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0) if c_ped!=(40,40,40) else TEXT_MAIN, 1, cv2.LINE_AA)
+        def draw_led_icon(x, y, label, is_active, active_color, txt_color=TEXT_MAIN):
+            bg = active_color if is_active else (40, 40, 40)
+            cv2.rectangle(canvas, (x, y), (x + 85, y + 30), bg, -1)
+            tx = (0,0,0) if is_active and bg != RED_LUM else txt_color
+            cv2.putText(canvas, label, (x + 5, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, tx, 1, cv2.LINE_AA)
+            
+        draw_led_icon(860,    630, "STOP",       "stop-sign" in active_labels, RED_LUM)
+        draw_led_icon(955,   630, "PEDESTRN",   "pedestrian" in active_labels, (0, 200, 255))
+        draw_led_icon(1050,  630, "X-WALK",     "crosswalk-sign" in active_labels, GREEN_LUM)
+        draw_led_icon(1145,  630, "PARKING",    "parking-sign" in active_labels, BLUE_NEON)
         
-        # Lane Keep LED
-        c_lane = GREEN_LUM if anchor != "LOST" else (40, 40, 40)
-        cv2.rectangle(canvas, (base_x + 250, 610), (base_x + 360, 640), c_lane, -1)
-        cv2.putText(canvas, "LANE KEEP", (base_x + 265, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0) if c_lane!=(40,40,40) else TEXT_MAIN, 1, cv2.LINE_AA)
-        
+        draw_led_icon(860,    670, "HIGHWAY",    "highway-sign" in active_labels, BLUE_NEON)
+        draw_led_icon(955,   670, "PRIORITY",   "priority-sign" in active_labels, (0, 200, 255))
+        draw_led_icon(1050,  670, "NO ENTRY",   "no-entry-road-sign" in active_labels, RED_LUM)
+        draw_led_icon(1145,  670, "LIMIT",      any("limit" in x for x in active_labels), (0, 255, 255))
+
         # --- BOTTOM CONTROL BAR ---
         cv2.putText(canvas, "AUTONOMOUS MODE ACTIVE", (40, 670), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_LUM, 2, cv2.LINE_AA)
         
@@ -903,9 +920,9 @@ class BFMC_Pilot:
                 # 2. INTELLIGENT TRAFFIC MODULE ON RAW FRAME
                 # -------------------------------------------------------------
                 if self.traffic_module:
-                    traffic_state, traffic_mult, light_status, yolo_dbg = self.traffic_module.process_raw_frame(raw_frame)
+                    traffic_state, traffic_mult, light_status, active_labels, yolo_dbg = self.traffic_module.process_raw_frame(raw_frame)
                 else:
-                    traffic_state, traffic_mult, light_status, yolo_dbg = "SYS_GO", 1.0, "NONE", raw_frame.copy()
+                    traffic_state, traffic_mult, light_status, active_labels, yolo_dbg = "SYS_GO", 1.0, "NONE", [], raw_frame.copy()
 
                 # -------------------------------------------------------------
                 # 3. ADVANCED BEV LANE MODULE ON RAW FRAME
@@ -919,6 +936,15 @@ class BFMC_Pilot:
                 jct_state = self.jct.update(warped, tracker.left_conf, tracker.right_conf, tracker.left_fit, tracker.right_fit, lane_width_px)
                 rbt_state = self.rbt.update(tracker.left_fit, tracker.right_fit, lane_width_px)
                 nav_state = rbt_state if rbt_state == "ROUNDABOUT" else jct_state
+
+                # Determine Road Topology
+                has_l_lane = tracker.left_conf >= tracker.MIN_PIX_OK
+                has_r_lane = tracker.right_conf >= tracker.MIN_PIX_OK
+                
+                topology = "BLIND CORNER"
+                if has_l_lane and has_r_lane: topology = "DUAL LANE"
+                elif has_l_lane: topology = "SINGLE LANE (LEFT)"
+                elif has_r_lane: topology = "SINGLE LANE (RIGHT)"
 
                 # -------------------------------------------------------------
                 # 5. STEERING CONTROLLER
@@ -1047,7 +1073,7 @@ class BFMC_Pilot:
                 dashboard_ui = self._render_dashboard(
                     yolo_dbg, lane_dbg, speed, steer_angle, 
                     traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
-                    light_status, nav_state, anchor, sim_batt_pct
+                    light_status, nav_state, anchor, sim_batt_pct, active_labels, topology
                 )
                 
                 cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
