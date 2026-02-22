@@ -308,7 +308,7 @@ class TrafficDecisionModule:
 
             # --- 2. LOGICAL PROXIMITY RULES ---
             label_lower = label.lower()
-            if any(c in label_lower for c in ["red", "green", "yellow", "orange", "traffic"]):
+            if any(c in label_lower for c in ["red", "green", "yellow", "orange", "traffic", "led", "light", "signal"]):
                 # The YOLO Custom Model natively handles color classification now.
                 is_red = self._is_light_red(label)
                 is_green = self._is_light_green(label)
@@ -362,10 +362,6 @@ class TrafficDecisionModule:
                 elif label in ["parking-sign", "highway-sign", "priority-sign"]:
                     cv2.putText(yolo_dbg, f"INFO: {label}", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                 
-        # Commit the mathematically highest priority state found in the frame
-        self.state = proposed_state
-        self.reason = proposed_reason
-        
         # Stop sign logic handles timers overriding immediate frame detections
         if self.stop_sign_timer > 0.0:
             if now - self.stop_sign_timer < self.halt_duration:
@@ -373,8 +369,13 @@ class TrafficDecisionModule:
                 pass
             else:
                 self.stop_sign_timer, self.stop_sign_cooldown = 0.0, now + self.cooldown_duration
-                if self.state == "SYS_STOP" and "STOP SIGN" in self.reason:
+                if "STOP SIGN" in proposed_reason and proposed_state == "SYS_STOP":
                     self.state, self.reason = "SYS_GO", "STOP SIGN (CLEARED)"
+
+        print(f"[TL_DEBUG] proposed_state={proposed_state} proposed_reason={proposed_reason} stop_timer={self.stop_sign_timer:.2f}")
+        # Commit the mathematically highest priority state found in the frame
+        self.state = proposed_state
+        self.reason = proposed_reason
 
         cv2.putText(yolo_dbg, f"TRAFFIC: {self.state} | {self.reason}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255) if self.state == "SYS_STOP" else (0,255,0), 3)
         return self.state, self.get_speed_multiplier(), light_status, active_labels, yolo_dbg
@@ -434,8 +435,9 @@ class TrafficLightStateMachine:
             self.last_seen_red = time.time()
             if distance_category == "HALT":
                 self.state = "LIGHT_RED_STOPPED"
-            elif distance_category == "APPROACH" and self.state not in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"]:
-                self.state = "LIGHT_APPROACHING"
+            elif distance_category == "APPROACH":
+                if self.state not in ["LIGHT_RED_STOPPED"]:
+                    self.state = "LIGHT_RED_STOPPING"
             elif self.state == "NO_LIGHT":
                 self.state = "LIGHT_DETECTED_FAR"
                 
