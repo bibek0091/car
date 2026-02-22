@@ -165,8 +165,12 @@ class TrafficDecisionModule:
                 if self.stop_sign_timer == 0.0:
                     self.stop_sign_timer = now
                 self.state, self.reason = "SYS_STOP", "STOP SIGN"
-            elif label in ["car", "pedestrian", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                self.state, self.reason = "SYS_STOP", f"OBSTACLE ({label})"
+            elif label in ["car", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
+                # Obstacle in the right lane -> Trigger an evasion maneuver into the left lane
+                self.state, self.reason = "SYS_LANE_CHANGE_LEFT", f"EVADING ({label})"
+            elif label == "pedestrian" and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
+                # Unlike cars/stands, we MUST stop for pedestrians, no swerving around them
+                self.state, self.reason = "SYS_STOP", "PEDESTRIAN IN PATH"
             elif label == "crosswalk-sign":
                 # Only register if we aren't already stopping
                 if self.state not in ["SYS_STOP", "SYS_HALT"]:
@@ -196,6 +200,7 @@ class TrafficDecisionModule:
     def get_speed_multiplier(self):
         if self.state == "SYS_STOP": return 0.0
         elif self.state == "SYS_SLOW": return 0.60 
+        elif self.state == "SYS_LANE_CHANGE_LEFT": return 0.60 # Slow down during the swerve
         elif self.state == "SYS_LIMIT": return 0.75
         return 1.0
 
@@ -330,21 +335,27 @@ class HybridLaneTracker:
             return base_x + extra_offset_px, anchor_type
 
         # ---------------------------------------------------------
-        # BRUTE FORCE RIGHT PRIORITY (NORMAL DRIVING)
+        # BRUTE FORCE MIDDLE-LANE PRIORITY (NORMAL DRIVING)
         # ---------------------------------------------------------
-        # If the right line is visible AT ALL, lock onto it and hug its edge.
-        # Ignore the left line entirely to prevent centering drift.
-        if sr is not None:
-            # Shift heavily left from the right-hand boundary (approx 40% of lane width)
-            # This ensures the car's body fits entirely inside the right lane
-            offset_px = lane_width_px * 0.40
-            return ev(sr) - offset_px + extra_offset_px, "HUGGING_RIGHT"
+        # The user requested PERFECT center-lane tracking.
+        # We must never hug to the right or drift to the left.
+        
+        # BLIND CORNER FALLBACK
+        if sl is None and sr is None:
+            # Complete loss: We rely on the interactive prompt
+            return 320.0 + extra_offset_px, "BLIND_CORNER"
+        
+        # Scenario 1: Both lines perfectly visible. Center it mathematically.
+        if sl is not None and sr is not None:
+            return (ev(sl) + ev(sr)) / 2.0 + extra_offset_px, "CENTERED_DUAL"
             
-        # If right line is totally lost but left is visible, project a ghost right line
-        if sl is not None and sr is None:
-            ghost_sr = sl + np.array([0.0, 0.0, float(lane_width_px)])
-            offset_px = lane_width_px * 0.40
-            return ev(ghost_sr) - offset_px + extra_offset_px, "GHOSTING_RIGHT"
+        # Scenario 2: Only right line visible. Project center leftwards by hw.
+        elif sr is not None:
+            return ev(sr) - hw + extra_offset_px, "CENTERED_FROM_RIGHT"
+            
+        # Scenario 3: Only left divider visible. Project center rightwards by hw.
+        elif sl is not None:
+            return ev(sl) + hw + extra_offset_px, "CENTERED_FROM_LEFT"
 
         # Complete loss
         # Default back to far right side of screen based on recent lane width estimates
@@ -472,8 +483,7 @@ class LanePerceptionModule:
 class JunctionDetector:
     ENTRY_FRAMES       = 5
     EXIT_FRAMES        = 8
-    CROSS_ENERGY_RATIO = 1.4
-    WIDTH_RATIO_HIGH   = 1.6
+    RATIO_EARLY_WARN   = 1.7 # If upper BEV lane width is 1.7x normal, it's a junction approaching
     MIN_BOT_ENERGY     = 500
 
     def __init__(self):
@@ -483,20 +493,23 @@ class JunctionDetector:
     def update(self, warped_binary, left_conf, right_conf, left_fit, right_fit, lane_width_px):
         h, w = warped_binary.shape
         both_lost = (left_conf < 200) and (right_conf < 200)
-        hist_top = float(np.sum(warped_binary[:h // 2, :]))
-        hist_bot = float(np.sum(warped_binary[h // 2:, :]))
+        
+        # Look far ahead (y=150 is the top 30% of the BEV frame)
+        approaching_wide_gap = False
+        if left_fit is not None and right_fit is not None:
+            lx_far = np.polyval(left_fit,  150)
+            rx_far = np.polyval(right_fit, 150)
+            if (rx_far - lx_far) > lane_width_px * self.RATIO_EARLY_WARN: 
+                approaching_wide_gap = True
 
+        hist_bot = float(np.sum(warped_binary[h // 2:, :]))
+        hist_top = float(np.sum(warped_binary[:h // 2, :]))
         cross_energy = False
         if hist_bot > self.MIN_BOT_ENERGY:
-            cross_energy = (hist_top / hist_bot) > self.CROSS_ENERGY_RATIO
+            # Standard intersection geometry
+            cross_energy = (hist_top / hist_bot) > 1.4
 
-        wide_lane = False
-        if left_fit is not None and right_fit is not None:
-            lx = np.polyval(left_fit,  h - 50)
-            rx = np.polyval(right_fit, h - 50)
-            if (rx - lx) > lane_width_px * self.WIDTH_RATIO_HIGH: wide_lane = True
-
-        evidence = both_lost or cross_energy or wide_lane
+        evidence = approaching_wide_gap or cross_energy or both_lost
 
         if self.state == "NORMAL":
             self.entry_count = self.entry_count + 1 if evidence else 0
@@ -559,45 +572,42 @@ class RoundaboutNavigator:
 
 
 class DividerGuard:
-    DIVIDER_SAFE_PX = 55
-    EDGE_SAFE_PX    = 50
-    GAIN            = 0.09
-    MAX_CORR        = 8.0
+    # 80px Lethal Zone: The car MUST NOT ever touch the center divider.
+    DIVIDER_SAFE_PX = 80 
+    EDGE_SAFE_PX    = 40
+    GAIN            = 0.20 # Massive correction gain
+    MAX_CORR        = 18.0 # Allowing enormous steering spikes for emergency saves
     DEADBAND_PX     = 5
 
     def apply(self, steer_angle, left_fit, right_fit, y_eval=440, car_x=320):
-        # We want the car on the right, so we heavily penalize drifting left
-        # and almost disable penalizing drifting right (unless touching the grass)
+        # We want the car in the middle, but heavily penalize touching the center divider
         correction, speed_scale, triggered = 0.0, 1.0, False
         div_corr = 0.0
         
-        # Left Divider (Center line) - Strong repulsion to keep car right
+        # Left Divider (Center line) - Overwhelming penalty forcefield
         if left_fit is not None:
             div_x = float(np.polyval(left_fit, y_eval))
-            # Increased safe distance from center divider to push car further right
-            safe_dist = self.DIVIDER_SAFE_PX + 40 
             gap = car_x - div_x
-            if gap < safe_dist - self.DEADBAND_PX:
-                err = float(safe_dist - gap)
-                # Double the gain to violently push away from the center
-                div_corr = min((self.GAIN * 2.0) * err, self.MAX_CORR * 1.5)
-                speed_scale = min(speed_scale, max(0.5, 1.0 - err / 120.0))
+            if gap < self.DIVIDER_SAFE_PX - self.DEADBAND_PX:
+                err = float(self.DIVIDER_SAFE_PX - gap)
+                # Triple the impact of the error to violently shove the car rightwards
+                div_corr = min((self.GAIN * 3.0) * err, self.MAX_CORR)
+                speed_scale = min(speed_scale, max(0.2, 1.0 - err / 60.0)) # Brake drastically during save
                 triggered   = True
 
-        # Right Edge - Weak repulsion (we want to hug it)
+        # Right Edge - Standard Weak Repulsion
         edge_corr = 0.0
         if right_fit is not None:
             edge_x = float(np.polyval(right_fit, y_eval))
             gap    = edge_x - car_x
-            # Very small safe distance so it can get extremely close to the edge
-            safe_dist = max(10, self.EDGE_SAFE_PX - 30)
-            if gap < safe_dist - self.DEADBAND_PX:
-                err = float(safe_dist - gap)
-                edge_corr = min(self.GAIN * err, self.MAX_CORR * 0.5)
-                speed_scale = min(speed_scale, max(0.5, 1.0 - err / 120.0))
+            if gap < self.EDGE_SAFE_PX - self.DEADBAND_PX:
+                err = float(self.EDGE_SAFE_PX - gap)
+                edge_corr = min(self.GAIN * err, self.MAX_CORR * 0.4)
+                speed_scale = min(speed_scale, max(0.5, 1.0 - err / 100.0))
                 triggered   = True
 
         if div_corr > 0 and edge_corr > 0:
+            # If trapped between both (super narrow lane), let the massive divider repulsion win
             correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN)
         else:
             correction = div_corr - edge_corr
@@ -784,7 +794,11 @@ class BFMC_Pilot:
         cv2.putText(canvas, f"REASON: {traffic_reason}", (base_x, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_col, 1, cv2.LINE_AA)
         
         cv2.putText(canvas, "NAVIGATION MODE:", (base_x, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        nav_col = GREEN_LUM if nav_state == "NORMAL" else (0, 165, 255)
+        
+        nav_col = GREEN_LUM
+        if nav_state != "NORMAL": nav_col = (0, 165, 255)
+        if anchor == "OVERTAKING_LEFT": nav_col = RED_LUM
+        
         cv2.putText(canvas, f"{nav_state} [{anchor}]", (base_x, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.6, nav_col, 2, cv2.LINE_AA)
         
         cv2.putText(canvas, "TRAFFIC SIGNAL:", (1080, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
@@ -821,16 +835,18 @@ class BFMC_Pilot:
         cv2.putText(canvas, "E-STOP [SPACE]", (345, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_MAIN, 2, cv2.LINE_AA)
         
         # --- INTERACTIVE MANUAL PROMPTS ---
-        if nav_state == "JUNCTION_PROMPT":
+        if nav_state == "JUNCTION_PROMPT" or anchor == "BLIND_CORNER":
             # Very aggressive visual takeover for interactive prompts
             blk = np.zeros_like(canvas)
             cv2.rectangle(blk, (150, 150), (670, 350), BG_COLOR, -1)
             cv2.rectangle(blk, (150, 150), (670, 350), BLUE_NEON, 3)
             
-            cv2.putText(blk, "JUNCTION DETECTED", (230, 200), cv2.FONT_HERSHEY_DUPLEX, 1.2, BLUE_NEON, 3, cv2.LINE_AA)
+            p_title = "JUNCTION APPROACHING" if nav_state == "JUNCTION_PROMPT" else "BLIND CORNER DETECTED"
+            
+            cv2.putText(blk, p_title, (230, 200), cv2.FONT_HERSHEY_DUPLEX, 1.2, BLUE_NEON, 3, cv2.LINE_AA)
             cv2.putText(blk, "AWAITING HUMAN DECISION...", (250, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_MAIN, 2, cv2.LINE_AA)
-            cv2.putText(blk, "PRESS [L] FOR LEFT TURN", (250, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
-            cv2.putText(blk, "PRESS [R] FOR RIGHT TURN", (250, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2, cv2.LINE_AA)
+            cv2.putText(blk, "PRESS [L] TO FOLLOW LEFT", (250, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.putText(blk, "PRESS [R] TO FOLLOW RIGHT", (250, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2, cv2.LINE_AA)
             
             # Blend
             cv2.addWeighted(blk, 0.9, canvas, 1.0, 0, canvas)
@@ -918,6 +934,21 @@ class BFMC_Pilot:
                 y_eval = max(0, 480 - eff_la)
 
                 target_x, anchor = tracker.get_target_x(y_eval, lane_width_px, total_offset, nav_state)
+                
+                # Dynamic Interactivity Handling for Blind Corners
+                if anchor == "BLIND_CORNER":
+                    # If we lost both lines, we wait for human input injected via keyboard
+                    speed = 0.0
+                    if getattr(self, '_blind_override', None) == "LEFT":
+                        target_x, anchor = 320.0 - (lane_width_px * 0.5), "BLIND_FORCED_L"
+                    elif getattr(self, '_blind_override', None) == "RIGHT":
+                        target_x, anchor = 320.0 + (lane_width_px * 0.5), "BLIND_FORCED_R"
+                        
+                # Dynamic Autonomous Lane Swapping
+                if traffic_state == "SYS_LANE_CHANGE_LEFT" and target_x is not None:
+                    # Forcibly subtract a full lane width to move the car into the oncoming left lane
+                    target_x -= lane_width_px
+                    anchor = "OVERTAKING_LEFT"
 
                 lost = target_x is None
                 if lost:
@@ -955,7 +986,7 @@ class BFMC_Pilot:
                 curvature = tracker.get_curvature(y_eval)
                 if self.lost_frames > LOST_GRACE_FRAMES: speed = 0.0
                 elif base_speed == 0: speed = 0.0
-                elif nav_state == "JUNCTION_PROMPT": speed = 0.0 # HALT car to wait for human input
+                elif nav_state == "JUNCTION_PROMPT" or anchor == "BLIND_CORNER": speed = 0.0 # HALT car to wait for human input
                 elif nav_state == "ROUNDABOUT": speed = base_speed * self.rbt.SPEED_SCALE
                 elif nav_state.startswith("JUNCTION"): speed = base_speed * 0.55
                 elif curvature > self.HIGH_CURV_THRESH: speed = base_speed * self.HIGH_CURV_SCALE
@@ -1032,12 +1063,18 @@ class BFMC_Pilot:
                     print("MANUAL ESTOP TRIGGERED!")
                     speed = 0.0
                     self.handler.set_speed(0.0)
-                elif key == ord("l") and nav_state == "JUNCTION_PROMPT":
-                    print("USER DIRECTED: LEFT TURN")
-                    self.jct.user_choice = "LEFT"
-                elif key == ord("r") and nav_state == "JUNCTION_PROMPT":
-                    print("USER DIRECTED: RIGHT TURN")
-                    self.jct.user_choice = "RIGHT"
+                elif key == ord("l"):
+                    if nav_state == "JUNCTION_PROMPT":
+                        print("USER DIRECTED: LEFT TURN")
+                        self.jct.user_choice = "LEFT"
+                    elif anchor == "BLIND_CORNER":
+                        self._blind_override = "LEFT"
+                elif key == ord("r"):
+                    if nav_state == "JUNCTION_PROMPT":
+                        print("USER DIRECTED: RIGHT TURN")
+                        self.jct.user_choice = "RIGHT"
+                    elif anchor == "BLIND_CORNER":
+                        self._blind_override = "RIGHT"
 
         except KeyboardInterrupt: pass
         finally: 
