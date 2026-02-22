@@ -130,17 +130,32 @@ class TrafficDecisionModule:
         
         self.active_detections = self.detector.detect_traffic_signals(raw_frame, conf_threshold=0.4)
         
-        sees_red_light = sees_close_stop_sign = obstacle_in_path = sees_crosswalk = False
         light_status = "NONE"
         active_labels = []
         
+        # Priority System: Lower number = Higher Priority.
+        # 1: Hard STOP (Red Light / Obstacle in Crosswalk)
+        # 2: Timed STOP (Stop Sign)
+        # 3: EVASION (Lane Change)
+        # 4: SLOW (Crosswalk / Speed Limit / Yellow Light)
+        # 99: GO (Default)
+        highest_priority = 99
+        proposed_state = "SYS_GO"
+        proposed_reason = "CLEAR PATH"
+        
+        def commit_state(priority, state, reason):
+            nonlocal highest_priority, proposed_state, proposed_reason
+            if priority < highest_priority:
+                highest_priority = priority
+                proposed_state = state
+                proposed_reason = reason
+
         for det in self.active_detections:
             label, (x1, y1, x2, y2), conf = det["label"], det["bbox"], det["confidence"]
             box_h = y2 - y1
             active_labels.append(label)
             
             # --- 1. ALWAYS DRAW DETECTIONS ---
-            # Even if they are miles away, we want the YOLO HUD to look active and intelligent.
             color = (0, 255, 0)
             if label in ["stop-sign", "no-entry-road-sign"]: color = (0, 0, 255)
             elif label == "traffic-light": color = (0, 255, 255)
@@ -153,61 +168,51 @@ class TrafficDecisionModule:
 
             # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
-                # Traffic lights are tracked continuously at all ranges
                 is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
-                
                 if box_h < 60:
                     light_status = "[RED] FAR" if is_red else "[GREEN] FAR"
                 elif box_h < 110:
-                    # At roughly 30cm-50cm, we recognize we are approaching a light
                     light_status = "[RED] APPROACH" if is_red else "[GREEN] APPROACH"
-                    if is_red and self.state not in ["SYS_STOP", "SYS_HALT"]:
-                        self.state, self.reason = "SYS_SLOW", "RED LIGHT AHEAD"
+                    if is_red: commit_state(4, "SYS_SLOW", "RED LIGHT AHEAD")
                 else:
-                    # At <30cm (approx 110px+ height), we drop anchor
                     light_status = "[RED] HALT" if is_red else "[GREEN] CLEAR"
-                    if is_red:
-                        self.state, self.reason = "SYS_STOP", "RED LIGHT (PRIORITY)"
-                        # Break immediately; do not let any other lower-priority sign override this STOP
-                        break
+                    if is_red: commit_state(1, "SYS_STOP", "RED LIGHT (PRIORITY)")
             
             else:
-                # All other signs only trigger physical car actions when within ~15cm (140px tall)
                 if box_h < 140:
                     continue
 
                 if label == "stop-sign" and now > self.stop_sign_cooldown:
                     if self.stop_sign_timer == 0.0:
                         self.stop_sign_timer = now
-                    self.state, self.reason = "SYS_STOP", "STOP SIGN"
+                    commit_state(2, "SYS_STOP", "STOP SIGN")
                 elif label in ["car", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                    # If we are at a crosswalk, DO NOT SWERVE. Stop and wait.
                     if "crosswalk-sign" in [d["label"] for d in self.active_detections]:
-                        self.state, self.reason = "SYS_STOP", f"OBSTACLE AT CROSSWALK"
+                        commit_state(1, "SYS_STOP", f"OBSTACLE AT CROSSWALK")
                     else:
-                        self.state, self.reason = "SYS_LANE_CHANGE_LEFT", f"EVADING ({label})"
+                        commit_state(3, "SYS_LANE_CHANGE_LEFT", f"EVADING ({label})")
                 elif label == "pedestrian" and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                    self.state, self.reason = "SYS_STOP", "PEDESTRIAN IN PATH"
+                    commit_state(1, "SYS_STOP", "PEDESTRIAN IN PATH")
                 elif label == "crosswalk-sign":
-                    if self.state not in ["SYS_STOP", "SYS_HALT"]:
-                        self.state, self.reason = "SYS_SLOW", "CROSSWALK ZONE"
+                    commit_state(4, "SYS_SLOW", "CROSSWALK ZONE")
                 elif "speed-limit" in label:
-                    if self.state not in ["SYS_STOP", "SYS_HALT"]:
-                        self.state, self.reason = "SYS_LIMIT", f"SPEED LIMIT ZONE"
+                    commit_state(4, "SYS_LIMIT", f"SPEED LIMIT ZONE")
                 elif label in ["parking-sign", "highway-sign", "priority-sign"]:
                     cv2.putText(yolo_dbg, f"INFO: {label}", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                 
+        # Commit the mathematically highest priority state found in the frame
+        self.state = proposed_state
+        self.reason = proposed_reason
+        
         # Stop sign logic handles timers overriding immediate frame detections
         if self.stop_sign_timer > 0.0:
             if now - self.stop_sign_timer < self.halt_duration:
-                self.state, self.reason = "SYS_STOP", "STOP SIGN (WAIT)"
+                # Still waiting
+                pass
             else:
                 self.stop_sign_timer, self.stop_sign_cooldown = 0.0, now + self.cooldown_duration
                 if self.state == "SYS_STOP" and "STOP SIGN" in self.reason:
                     self.state, self.reason = "SYS_GO", "STOP SIGN (CLEARED)"
-                    
-        if self.state not in ["SYS_STOP", "SYS_SLOW", "SYS_LIMIT"]:
-            self.state, self.reason = "SYS_GO", "CLEAR PATH"
 
         cv2.putText(yolo_dbg, f"TRAFFIC: {self.state} | {self.reason}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255) if self.state == "SYS_STOP" else (0,255,0), 3)
         return self.state, self.get_speed_multiplier(), light_status, active_labels, yolo_dbg
@@ -505,7 +510,7 @@ class JunctionDetector:
         self.state, self.entry_count, self.exit_count, self.frames_in_jct = "NORMAL", 0, 0, 0
         self.user_choice = None  # Tracks the user's manual branch decision ("LEFT" / "RIGHT")
 
-    def update(self, warped_binary, left_conf, right_conf, left_fit, right_fit, lane_width_px):
+    def update(self, warped_binary, left_conf, right_conf, left_fit, right_fit, lane_width_px, active_labels):
         h, w = warped_binary.shape
         both_lost = (left_conf < 200) and (right_conf < 200)
         
@@ -524,7 +529,12 @@ class JunctionDetector:
             # Standard intersection geometry
             cross_energy = (hist_top / hist_bot) > 1.4
 
-        evidence = approaching_wide_gap or cross_energy or both_lost
+        # A zebra crossing generates massive pixel energy in the BEV frame, mimicking a junction.
+        # If YOLO actively sees a crosswalk sign, we suppress all junction evidence to avoid false positives.
+        if "crosswalk-sign" in active_labels:
+            evidence = False
+        else:
+            evidence = approaching_wide_gap or cross_energy or both_lost
 
         if self.state == "NORMAL":
             self.entry_count = self.entry_count + 1 if evidence else 0
@@ -935,7 +945,7 @@ class BFMC_Pilot:
                 # 4. NAVIGATION STATE MACHINES
                 # -------------------------------------------------------------
                 tracker = self.lane_module.tracker
-                jct_state = self.jct.update(warped, tracker.left_conf, tracker.right_conf, tracker.left_fit, tracker.right_fit, lane_width_px)
+                jct_state = self.jct.update(warped, tracker.left_conf, tracker.right_conf, tracker.left_fit, tracker.right_fit, lane_width_px, active_labels)
                 rbt_state = self.rbt.update(tracker.left_fit, tracker.right_fit, lane_width_px)
                 nav_state = rbt_state if rbt_state == "ROUNDABOUT" else jct_state
 
