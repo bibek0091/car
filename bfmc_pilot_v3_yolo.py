@@ -143,50 +143,53 @@ class TrafficDecisionModule:
                 continue
             
             color = (0, 255, 0)
-            if label == "stop-sign": color = (0, 0, 255)
+            if label in ["stop-sign", "no-entry-road-sign"]: color = (0, 0, 255)
             elif label == "traffic-light": color = (0, 255, 255)
             elif label in ["car", "pedestrian", "closed-road-stand"]: color = (255, 0, 255)
+            elif "speed-limit" in label: color = (255, 255, 0)
+            elif label in ["crosswalk-sign", "parking-sign", "highway-sign", "priority-sign"]: color = (255, 128, 0)
                 
             cv2.rectangle(yolo_dbg, (x1, y1), (x2, y2), color, 2)
             cv2.putText(yolo_dbg, f"{label} {conf:.2f}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             if label == "traffic-light" and self._is_light_red(raw_frame, x1, y1, x2, y2):
-                sees_red_light = True
+                self.state, self.reason = "SYS_STOP", "RED LIGHT"
             elif label == "stop-sign" and now > self.stop_sign_cooldown:
-                sees_close_stop_sign = True
+                if self.stop_sign_timer == 0.0:
+                    self.stop_sign_timer = now
+                self.state, self.reason = "SYS_STOP", "STOP SIGN"
             elif label in ["car", "pedestrian", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                obstacle_in_path, self.reason = True, f"OBSTACLE ({label})"
+                self.state, self.reason = "SYS_STOP", f"OBSTACLE ({label})"
             elif label == "crosswalk-sign":
-                sees_crosswalk = True
+                # Only register if we aren't already stopping
+                if self.state not in ["SYS_STOP", "SYS_HALT"]:
+                    self.state, self.reason = "SYS_SLOW", "CROSSWALK ZONE"
+            elif "speed-limit" in label:
+                if self.state not in ["SYS_STOP", "SYS_HALT"]:
+                    self.state, self.reason = "SYS_LIMIT", f"SPEED LIMIT ZONE"
+            elif label in ["parking-sign", "highway-sign", "priority-sign"]:
+                # Information signs - track them but default to GO state
+                cv2.putText(yolo_dbg, f"INFO: {label}", (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
                 
-        if sees_red_light:
-            self.state, self.reason = "SYS_STOP", "RED LIGHT"
-        elif obstacle_in_path:
-            self.state = "SYS_STOP"
-        elif sees_close_stop_sign:
-            if self.stop_sign_timer == 0.0:
-                self.stop_sign_timer, self.state, self.reason = now, "SYS_STOP", "STOP SIGN (HALTING)"
-            elif now - self.stop_sign_timer < self.halt_duration:
-                self.state, self.reason = "SYS_STOP", f"STOP SIGN (WAIT)"
+        # Stop sign logic handles timers overriding immediate frame detections
+        if self.stop_sign_timer > 0.0:
+            if now - self.stop_sign_timer < self.halt_duration:
+                self.state, self.reason = "SYS_STOP", "STOP SIGN (WAIT)"
             else:
-                self.stop_sign_timer, self.stop_sign_cooldown, self.state, self.reason = 0.0, now + self.cooldown_duration, "SYS_GO", "STOP SIGN (CLEARED)"
-        else:
-            if self.stop_sign_timer > 0.0:
-                if now - self.stop_sign_timer < self.halt_duration:
-                    self.state, self.reason = "SYS_STOP", f"STOP SIGN (WAIT)"
-                else:
-                    self.stop_sign_timer, self.stop_sign_cooldown, self.state = 0.0, now + self.cooldown_duration, "SYS_GO"
-            elif sees_crosswalk:
-                self.state, self.reason = "SYS_SLOW", "CROSSWALK ZONE"
-            else:
-                self.state, self.reason = "SYS_GO", "CLEAR PATH"
+                self.stop_sign_timer, self.stop_sign_cooldown = 0.0, now + self.cooldown_duration
+                if self.state == "SYS_STOP" and "STOP SIGN" in self.reason:
+                    self.state, self.reason = "SYS_GO", "STOP SIGN (CLEARED)"
+                    
+        if self.state not in ["SYS_STOP", "SYS_SLOW", "SYS_LIMIT"]:
+            self.state, self.reason = "SYS_GO", "CLEAR PATH"
 
         cv2.putText(yolo_dbg, f"TRAFFIC: {self.state} | {self.reason}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255) if self.state == "SYS_STOP" else (0,255,0), 3)
         return self.state, self.get_speed_multiplier(), yolo_dbg
         
     def get_speed_multiplier(self):
         if self.state == "SYS_STOP": return 0.0
-        elif self.state == "SYS_SLOW": return 0.70 
+        elif self.state == "SYS_SLOW": return 0.60 
+        elif self.state == "SYS_LIMIT": return 0.75
         return 1.0
 
 
@@ -399,12 +402,17 @@ class LanePerceptionModule:
             process_frame = raw_frame
             
         warped_colour = cv2.warpPerspective(process_frame, self.M_forward, (640, 480))
-        hls = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2HLS)
-        L   = self.clahe.apply(hls[:, :, 1])
+        # Use LAB color space, L channel (Lightness)
+        lab = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2LAB)
+        L = self.clahe.apply(lab[:, :, 0])
 
+        # Track is WHITE, lines are BLACK (dark spots).
+        # We need to adaptively threshold looking for the darkest areas
+        # cv2.THRESH_BINARY_INV will make the dark spots white (255)
+        # We use a positive C value (+15) so it aggressively filters out shadows
         binary = cv2.adaptiveThreshold(
             L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 31, -8)
+            cv2.THRESH_BINARY_INV, 31, 15)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         warped_binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
