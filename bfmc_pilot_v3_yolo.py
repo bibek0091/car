@@ -17,13 +17,40 @@ import logging
 import argparse
 import sys
 
-# ---------------------------------------------------------------------------
-# YOLO detector - graceful fallback
-# ---------------------------------------------------------------------------
-try:
-    from yolo_detector import PreTrainedYoloDetector
-except ImportError:
-    pass
+from ultralytics import YOLO
+
+class PreTrainedYoloDetector:
+    def __init__(self, model_version="runs/detect/custom_toy_traffic/weights/best.pt"):
+        """
+        Initializes the custom trained YOLO model exclusively for the BFMC 
+        Toy Traffic Lights (Red, Green, Yellow).
+        """
+        print(f"Loading custom BFMC YOLO model '{model_version}'...")
+        self.model = YOLO(model_version)
+
+    def detect_traffic_signals(self, frame_bgr, conf_threshold=0.3):
+        results = self.model.predict(
+            source=frame_bgr, 
+            conf=conf_threshold, 
+            verbose=False
+        )
+        
+        filtered_detections = []
+        result = results[0]
+        
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            confidence = box.conf[0].item()
+            cls_id = int(box.cls[0].item())
+            label = self.model.names[cls_id]
+            
+            filtered_detections.append({
+                "label": label,
+                "confidence": confidence,
+                "bbox": (x1, y1, x2, y2)
+            })
+            
+        return filtered_detections
 
 # ---------------------------------------------------------------------------
 # Serial handler - graceful fallback
@@ -173,50 +200,13 @@ class TrafficDecisionModule:
         glow_ratio = cv2.countNonZero(glow_mask) / (box_h * box_w)
         return glow_ratio > 0.05
 
-    def _is_light_red(self, frame, x1, y1, x2, y2):
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False 
-        
-        # Crop ONLY to the top 45% of the bounding box where the Red LED lives
-        y_mid = y1 + int(box_h * 0.45)
-        crop = frame[y1:y_mid, x1:x2]
-        cv2.imwrite("tl_debug_red_crop.jpg", crop) # HARDCORE DEBUG
-        
-        if crop.size == 0: return False
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        # Strict color bounds, but we only look in the top half
-        mask1 = cv2.inRange(hsv, np.array([0, 30, 150]), np.array([12, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([160, 30, 150]), np.array([180, 255, 255]))
-        red_mask = cv2.bitwise_or(mask1, mask2)
-        
-        # Instead of a ratio over the massive stand, we just need a cluster of red pixels
-        pixel_count = cv2.countNonZero(red_mask)
-        return pixel_count > 6
+    def _is_light_red(self, label):
+        """ Checks if YOLO explicitly classified the traffic light as RED """
+        return label == "traffic red"
 
-    def _is_light_green(self, frame, x1, y1, x2, y2):
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False
-        
-        # Crop ONLY to the bottom 45% of the bounding box where the Green LED lives
-        y_mid = y1 + int(box_h * 0.55)
-        crop = frame[y_mid:y2, x1:x2]
-        cv2.imwrite("tl_debug_green_crop.jpg", crop) # HARDCORE DEBUG
-        
-        if crop.size == 0: return False
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        # Strict green bounds, but only in the bottom half
-        mask_green = cv2.inRange(hsv, np.array([35, 30, 150]), np.array([90, 255, 255]))
-        pixel_count = cv2.countNonZero(mask_green)
-        
-        return pixel_count > 6
+    def _is_light_green(self, label):
+        """ Checks if YOLO explicitly classified the traffic light as GREEN """
+        return label == "green"
 
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         # BUG 8: Check if ANY part of bbox overlaps path region instead of just center
@@ -279,17 +269,13 @@ class TrafficDecisionModule:
             cv2.putText(yolo_dbg, f"{label} {conf:.2f} [{box_h}px]", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
             # --- 2. LOGICAL PROXIMITY RULES ---
-            if label == "traffic-light":
-                is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
-                is_green = self._is_light_green(raw_frame, x1, y1, x2, y2)
+            if label in ["traffic red", "green", "yellow"]:
+                # The YOLO Custom Model natively handles color classification now.
+                is_red = self._is_light_red(label)
+                is_green = self._is_light_green(label)
                 
-                # Debug logging
-                crop = raw_frame[y1:y2, x1:x2]
-                if crop.size > 0 and (is_red or (box_h >= 70 and not is_red)):
-                    hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                    mean_hsv = np.mean(hsv_crop, axis=(0,1))
-                    print(f"DEBUG TL: box_h={box_h}, is_red={is_red}, is_green={is_green}, HSV={mean_hsv}")
-                
+                # We still need to calculate distance (bounding box height) to know
+                # if we are far away, approaching, or at the stop line.
                 distance_cat = "UNKNOWN"
                 if box_h < 40: distance_cat = "FAR"
                 elif box_h < 70: distance_cat = "APPROACH"
