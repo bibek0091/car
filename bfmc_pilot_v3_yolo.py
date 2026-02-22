@@ -69,9 +69,10 @@ SRC_PTS = np.float32([[200, 260], [440, 260], [40,  450], [600, 450]])
 DST_PTS = np.float32([[150,   0], [490,   0], [150, 480], [490, 480]])
 
 # ===========================================================================
-# RIGHT-LANE OFFSET
+# RIGHT-LANE OFFSET (Aggressive Hugging)
 # ===========================================================================
-RIGHT_LANE_OFFSET_PX = 70
+# Increased from 70 to 110 to force the car onto the far right edge of the lane
+RIGHT_LANE_OFFSET_PX = 110
 DUAL_OFFSET_PX       = 0
 SINGLE_DIV_OFFSET_PX = 40
 SINGLE_EDGE_OFFSET_PX = -40
@@ -152,8 +153,15 @@ class TrafficDecisionModule:
             cv2.rectangle(yolo_dbg, (x1, y1), (x2, y2), color, 2)
             cv2.putText(yolo_dbg, f"{label} {conf:.2f}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            if label == "traffic-light" and self._is_light_red(raw_frame, x1, y1, x2, y2):
-                self.state, self.reason = "SYS_STOP", "RED LIGHT"
+            if label == "traffic-light":
+                # Only analyze if it passes proximity check (e.g. 15cm)
+                if self._is_light_red(raw_frame, x1, y1, x2, y2):
+                    self.state, self.reason = "SYS_STOP", "RED LIGHT"
+                    light_status = "[RED]"
+                else:
+                    # Seen, but not red. Safe to go.
+                    light_status = "[GREEN/OFF]"
+                    
             elif label == "stop-sign" and now > self.stop_sign_cooldown:
                 if self.stop_sign_timer == 0.0:
                     self.stop_sign_timer = now
@@ -184,7 +192,7 @@ class TrafficDecisionModule:
             self.state, self.reason = "SYS_GO", "CLEAR PATH"
 
         cv2.putText(yolo_dbg, f"TRAFFIC: {self.state} | {self.reason}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255) if self.state == "SYS_STOP" else (0,255,0), 3)
-        return self.state, self.get_speed_multiplier(), yolo_dbg
+        return self.state, self.get_speed_multiplier(), light_status, yolo_dbg
         
     def get_speed_multiplier(self):
         if self.state == "SYS_STOP": return 0.0
@@ -540,11 +548,14 @@ class DividerGuard:
 # ===========================================================================
 class BFMC_Pilot:
 
-    STEER_EMA_SLOW = 0.45   # Faster response on straights
-    STEER_EMA_FAST = 0.70   # Much faster snap on tight corners
-    GUARD_EMA      = 0.70   # Faster safety guard engagement
+    # -------------------------------------------------------------
+    # LUXURY STEERING DYNAMICS (Tesla-Style Smoothness)
+    # -------------------------------------------------------------
+    STEER_EMA_SLOW = 0.85   # VERY slow EMA for hyper-smooth lane following
+    STEER_EMA_FAST = 0.40   # Faster only for extreme emergency corrections
+    GUARD_EMA      = 0.70   
     MAX_STEER      = 30.0
-    MAX_STEER_RATE = 15.0   # Lifted from 5.0 -> 15.0 to allow aggressive evasion
+    MAX_STEER_RATE = 2.0    # Slower max-change rate for luxurious turns
 
     HIGH_CURV_THRESH = 0.0025 # Engage high-curve speed slow down earlier
     MED_CURV_THRESH  = 0.0010
@@ -617,6 +628,79 @@ class BFMC_Pilot:
         pts[:, 0, 0] = np.clip(pts[:, 0, 0], 0, 639)
         cv2.polylines(img, [pts], isClosed=False, color=colour, thickness=3)
 
+    # -------------------------------------------------------------
+    # TESLA-STYLE DASHBOARD RENDERER
+    # -------------------------------------------------------------
+    def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct):
+        # Master Canvas: 1280x720 (HD)
+        canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
+        
+        # 1. Main Background: The raw 720p YOLO feed acts as the reality view
+        canvas[0:720, 0:1280] = yolo_hd
+        
+        # 2. Add a sleek dark overlay block for the UI telemetry (Right Side)
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (950, 0), (1280, 720), (20, 20, 20), -1)
+        # Top-Left Stats overlay
+        cv2.rectangle(overlay, (0, 0), (350, 120), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        
+        # 3. Telemetry: Digital Speedometer
+        cv2.putText(canvas, f"{int(abs(speed))}", (1030, 180), cv2.FONT_HERSHEY_DUPLEX, 5.0, (255, 255, 255), 8)
+        cv2.putText(canvas, "CM/S", (1170, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (150, 150, 150), 2)
+        
+        # 4. Telemetry: Navigation & Autopilot States
+        cv2.putText(canvas, "AUTOPILOT:", (980, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+        nav_col = (0, 255, 0) if nav_state == "NORMAL" else (0, 165, 255)
+        cv2.putText(canvas, nav_state, (1120, 271), cv2.FONT_HERSHEY_SIMPLEX, 0.8, nav_col, 2)
+        
+        cv2.putText(canvas, "LANE ANCHOR:", (980, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+        cv2.putText(canvas, anchor, (1120, 311), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # 5. Traffic AI Decision Block
+        state_col = (0, 255, 0)
+        if traffic_state == "SYS_STOP": state_col = (0, 0, 255)
+        elif traffic_state == "SYS_SLOW": state_col = (0, 165, 255)
+        elif traffic_state == "SYS_LIMIT": state_col = (0, 255, 255)
+        
+        cv2.rectangle(canvas, (980, 350), (1240, 480), (40, 40, 40), -1)
+        cv2.putText(canvas, "YOLO DECISION", (1030, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+        cv2.putText(canvas, traffic_state, (1030, 420), cv2.FONT_HERSHEY_DUPLEX, 1.2, state_col, 3)
+        cv2.putText(canvas, traffic_reason, (1000, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 2)
+        
+        # 5.5. Dedicated Traffic Light Status
+        tl_col = (100, 100, 100)
+        if light_status == "[RED]": tl_col = (0, 0, 255)
+        elif light_status == "[GREEN/OFF]": tl_col = (0, 255, 0)
+        cv2.putText(canvas, f"TRAFFIC LIGHT: {light_status}", (990, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 2)
+        
+        # 6. Simulated Battery Gauge
+        cv2.putText(canvas, "BATTERY", (980, 550), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+        cv2.rectangle(canvas, (980, 565), (1240, 595), (60, 60, 60), 2)
+        fill_w = int((batt_pct / 100.0) * 256)
+        fill_col = (0, 255, 0) if batt_pct > 20 else (0, 0, 255)
+        cv2.rectangle(canvas, (982, 567), (982 + fill_w, 593), fill_col, -1)
+        cv2.putText(canvas, f"{batt_pct:.1f}%", (1170, 587), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # 7. Steering Wheel Visualizer
+        cv2.putText(canvas, "STEERING", (980, 640), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
+        bar_center = 1110
+        cv2.line(canvas, (980, 670), (1240, 670), (100, 100, 100), 2)
+        cv2.circle(canvas, (bar_center, 670), 5, (255, 255, 255), -1)
+        # Assuming MAX_STEER is 30, map to +/- 130 pixels
+        steer_px = int(bar_center + (steer_angle / self.MAX_STEER) * 130)
+        cv2.circle(canvas, (steer_px, 670), 12, (255, 0, 0), -1)
+        cv2.putText(canvas, f"{steer_angle:+.1f} deg", (steer_px - 30, 650), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # 8. Mini-Map / Radar (Bird's Eye View Lane Debug)
+        # Resize the 640x480 lane_dbg down to 320x240 and put it in the top-left
+        radar = cv2.resize(lane_dbg, (320, 240))
+        cv2.rectangle(radar, (0,0), (320,240), (255,255,255), 2)
+        canvas[20:260, 20:340] = radar
+        cv2.putText(canvas, "RADAR", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        return canvas
+
     def _update_fps(self):
         now = time.time()
         dt  = now - self._fps_t
@@ -626,6 +710,7 @@ class BFMC_Pilot:
     def run(self):
         print("BFMC Pilot v2: STARTING MODULAR ORCHESTRATOR")
         startup_time = time.time()
+        sim_batt_pct = 99.9  # Fake battery to look cool
         try:
             while True:
                 t_frame_start = time.time()
@@ -652,9 +737,9 @@ class BFMC_Pilot:
                 # 2. INTELLIGENT TRAFFIC MODULE ON RAW FRAME
                 # -------------------------------------------------------------
                 if self.traffic_module:
-                    traffic_state, traffic_mult, yolo_dbg = self.traffic_module.process_raw_frame(raw_frame)
+                    traffic_state, traffic_mult, light_status, yolo_dbg = self.traffic_module.process_raw_frame(raw_frame)
                 else:
-                    traffic_state, traffic_mult, yolo_dbg = "SYS_GO", 1.0, raw_frame.copy()
+                    traffic_state, traffic_mult, light_status, yolo_dbg = "SYS_GO", 1.0, "NONE", raw_frame.copy()
 
                 # -------------------------------------------------------------
                 # 3. ADVANCED BEV LANE MODULE ON RAW FRAME
@@ -693,9 +778,10 @@ class BFMC_Pilot:
 
                 raw_steer = self._pure_pursuit(target_x, eff_la, lane_width_px)
 
+                # EMA Smoothing handles twitchiness; use SLOW mostly, FAST only on huge swings
                 steer_delta_abs = abs(raw_steer - self.smooth_steer)
-                alpha = (self.STEER_EMA_FAST if steer_delta_abs > 8.0 else self.STEER_EMA_SLOW)
-                self.smooth_steer = alpha * raw_steer + (1.0 - alpha) * self.smooth_steer
+                alpha = (self.STEER_EMA_FAST if steer_delta_abs > 12.0 else self.STEER_EMA_SLOW)
+                self.smooth_steer = alpha * self.smooth_steer + (1.0 - alpha) * raw_steer
                 steer_angle = self.smooth_steer
 
                 rate_delta = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, steer_angle - self.prev_steer))
@@ -771,16 +857,19 @@ class BFMC_Pilot:
                     cv2.putText(lane_dbg, grace_label, (130, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                 self._update_fps()
-                line1 = f"{detect_mode} | {anchor} | {nav_state} | {self._fps:.0f}fps"
-                line2 = f"Steer:{steer_angle:.1f}  Speed:{speed:.0f}  Curv:{curvature:.4f}  Off:{int(total_offset)}"
+                
+                # Drain the fake battery slowly over time
+                sim_batt_pct = max(0.0, sim_batt_pct - 0.005)
 
-                cv2.putText(lane_dbg, line1, (10,  26), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 2)
-                cv2.putText(lane_dbg, line2, (10, 462), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 200), 2)
-
-                # Combine YOLO raw frame on top, Lane tracker on bottom
-                yolo_resized = cv2.resize(yolo_dbg, (640, 480))
-                stacked = np.vstack((yolo_resized, lane_dbg))
-                cv2.imshow("BFMC_MASTER_VIEW", stacked)
+                # Render the luxurious Tesla UI Dashboard
+                dashboard_ui = self._render_dashboard(
+                    yolo_dbg, lane_dbg, speed, steer_angle, 
+                    traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
+                    light_status, nav_state, anchor, sim_batt_pct
+                )
+                
+                cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.imshow("BFMC_MASTER_VIEW", dashboard_ui)
 
                 elapsed = time.time() - t_frame_start
                 wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
