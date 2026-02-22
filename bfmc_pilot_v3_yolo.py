@@ -1305,173 +1305,168 @@ class BFMC_Pilot:
         cv2.polylines(img, [pts], isClosed=False, color=colour, thickness=3)
 
     # -------------------------------------------------------------
-    # TESLA-STYLE DASHBOARD RENDERER (ULTRA REALISTIC OpenCV)
+    # BRAND NEW SLEEK UI RENDERER (OpenCV Only)
     # -------------------------------------------------------------
     def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct, active_labels, topology):
-        # Master Canvas: 1280x720 (HD)
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
-        
-        # BUG 5: Add resize check
         if yolo_hd.shape[:2] != (720, 1280): yolo_hd = cv2.resize(yolo_hd, (1280, 720))
         
-        # 1. Main Background
-        canvas[0:720, 0:1280] = yolo_hd
-        
-        # 2. Sleek Translucent Glassmorphism Overlay
-        # Creating a transparent mask for the UI backgrounds
-        overlay = canvas.copy()
-        
         # Color Palette
-        BG_COLOR  = (15, 15, 18)   # Deep space grey
-        BLUE_NEON = (255, 160, 50) # Vibrant cyber blue
-        GREEN_LUM = (100, 255, 100)
-        RED_LUM   = (100, 50, 255)
-        TEXT_MAIN = (240, 240, 240)
-        TEXT_DIM  = (140, 140, 140)
+        BG_COLOR   = (24, 18, 18)   # (18, 18, 24) in BGR
+        ACCENT_PRI = (0, 180, 255)  # Electric Blue (255, 180, 0) in BGR
+        ACCENT_SEC = (0, 220, 200)  # Teal (200, 220, 0) in BGR
+        SUCCESS_G  = (80, 220, 80)
+        ALERT_R    = (60, 60, 220)
+        WARN_O     = (30, 160, 255)
+        TEXT_PRI   = (245, 245, 245)
+        TEXT_MUT   = (130, 120, 120)
+        DIVIDER    = (55, 45, 45)
         
-        # Right Panel Overlay (Telemetry)
-        cv2.rectangle(overlay, (820, 0), (1280, 720), BG_COLOR, -1)
-        # Gradient shadow bounding the right panel
-        for i in range(30):
-            cv2.line(overlay, (820 - i, 0), (820 - i, 720), BG_COLOR, max(1, int(20 - i*0.6)))
+        # 1. Main Left Camera Feed
+        canvas[0:720, 0:820] = yolo_hd[0:720, 230:1050] # Center crop wide view
+        
+        # 2. Right Telemetry Panel (True Dark Gradient)
+        for y in range(720):
+            # Gradient goes from (30, 25, 25) down to (15, 12, 12)
+            shade = max(10, 30 - int((y / 720.0) * 20))
+            cv2.line(canvas, (820, y), (1280, y), (shade+2, shade, shade), 1)
             
-        # Bottom Control Panel Overlay (Translucent)
-        cv2.rectangle(overlay, (0, 620), (820, 720), (10, 10, 15), -1)
+        # Top 3px Electric Blue accent bar
+        cv2.rectangle(canvas, (820, 0), (1280, 3), ACCENT_PRI, -1)
         
-        # Top-Left Logo Block
-        cv2.rectangle(overlay, (20, 20), (360, 90), BG_COLOR, -1)
+        # Panel Title
+        cv2.putText(canvas, "AUTONOMY CORE", (850, 45), cv2.FONT_HERSHEY_DUPLEX, 0.9, TEXT_PRI, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "BFMC ORCHESTRATOR v3", (850, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.line(canvas, (850, 85), (1250, 85), DIVIDER, 1)
         
-        # Apply the transparent blend (85% opaque UI panels)
-        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        # --- SPEED GAUGE ---
+        cv2.putText(canvas, "CHASSIS SPEED", (850, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
         
-        # --- TOP LEFT LOGO ---
-        cv2.putText(canvas, "BOSCH FUTURE MOBILITY", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_NEON, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "AUTONOMOUS ORCHESTRATOR v3.0", (40, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_DIM, 1, cv2.LINE_AA)
+        center = (1050, 200)
+        radius = 70
+        # Draw unfilled background arc (dark grey)
+        cv2.ellipse(canvas, center, (radius, radius), 135, 0, 270, (40, 40, 40), 8, cv2.LINE_AA)
         
-        # --- RIGHT TELEMETRY PANEL ---
-        base_x = 860
-        cv2.putText(canvas, "SYSTEM TELEMETRY", (base_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_NEON, 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"GPS: 46.7712 N | 23.6236 E", (base_x, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        
-        # Line Seperator
-        cv2.line(canvas, (base_x, 100), (1240, 100), (50, 50, 50), 1)
-        
-        # Drive Metrics (Speed & Steering)
-        cv2.putText(canvas, "CHASSIS SPEED", (base_x, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{int(abs(speed))}", (base_x, 185), cv2.FONT_HERSHEY_DUPLEX, 2.2, TEXT_MAIN, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "cm/s", (base_x + 95, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1, cv2.LINE_AA)
-        
-        cv2.putText(canvas, "STEERING APEX", (1060, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{steer_angle:+.1f}", (1060, 185), cv2.FONT_HERSHEY_DUPLEX, 1.8, TEXT_MAIN, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "deg", (1190, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1, cv2.LINE_AA)
-        
-        # High-End Dynamic Steering Bar (Horizontal Center-Aligned Visualizer)
-        cv2.rectangle(canvas, (base_x, 210), (1240, 216), (40, 40, 40), -1)
-        cv2.circle(canvas, (1050, 213), 3, (150, 150, 150), -1) # Center Deadzone
-        
-        # Map Steering -30 to +30 onto the 380px wide bar (center is 1050)
-        steer_px_offset = int((steer_angle / 30.0) * 190)
-        bar_col = BLUE_NEON if abs(steer_angle) < 15 else RED_LUM
-        if steer_angle > 0:
-            cv2.rectangle(canvas, (1050, 210), (1050 + steer_px_offset, 216), bar_col, -1)
-        else:
-            cv2.rectangle(canvas, (1050 + steer_px_offset, 210), (1050, 216), bar_col, -1)
-        
-        # Battery Health
-        cv2.putText(canvas, "ENERGY RESERVE", (base_x, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        cv2.rectangle(canvas, (base_x, 275), (1240, 290), (40, 40, 40), -1)
-        fill_w = int((batt_pct / 100.0) * (1240 - base_x))
-        b_col = GREEN_LUM if batt_pct > 30 else RED_LUM
-        cv2.rectangle(canvas, (base_x, 275), (base_x + fill_w, 290), b_col, -1)
-        cv2.putText(canvas, f"{batt_pct:.1f}%", (1180, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.5, b_col, 1, cv2.LINE_AA)
-        
-        cv2.line(canvas, (base_x, 320), (1240, 320), (50, 50, 50), 1)
-        
-        # --- AI VISION ENGINE ---
-        cv2.putText(canvas, "NEURAL VISION ENGINE", (base_x, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_NEON, 2, cv2.LINE_AA)
-        
-        state_col = GREEN_LUM
-        if traffic_state == "SYS_STOP": state_col = RED_LUM
-        elif traffic_state == "SYS_SLOW": state_col = (0, 200, 255)
-        elif traffic_state == "SYS_LIMIT": state_col = (0, 255, 255)
-        
-        cv2.putText(canvas, "TRAFFIC COMMAND:", (base_x, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        cv2.putText(canvas, traffic_state, (base_x, 435), cv2.FONT_HERSHEY_DUPLEX, 1.2, state_col, 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"REASON: {traffic_reason}", (base_x, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_col, 1, cv2.LINE_AA)
-        
-        cv2.putText(canvas, "NAVIGATION MODE:", (base_x, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        
-        nav_col = GREEN_LUM
-        if nav_state != "NORMAL": nav_col = (0, 165, 255)
-        if anchor == "OVERTAKING_LEFT": nav_col = RED_LUM
-        
-        cv2.putText(canvas, f"{nav_state} [{anchor}]", (base_x, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.6, nav_col, 2, cv2.LINE_AA)
-        
-        cv2.putText(canvas, "TRAFFIC SIGNAL:", (1080, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        tl_col = TEXT_DIM
-        if "RED" in light_status: tl_col = RED_LUM
-        elif "GREEN" in light_status: tl_col = GREEN_LUM
-        cv2.putText(canvas, light_status, (1080, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 2, cv2.LINE_AA)
-        
-        cv2.putText(canvas, "ROAD TOPOLOGY:", (860, 570), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
-        top_col = GREEN_LUM if "DUAL" in topology else (0, 200, 255) if "BLIND" in topology else BLUE_NEON
-        cv2.putText(canvas, topology, (860, 595), cv2.FONT_HERSHEY_SIMPLEX, 0.6, top_col, 2, cv2.LINE_AA)
-        
-        # LED Status Board (Dynamic Grid)
-        cv2.line(canvas, (base_x, 610), (1240, 610), (50, 50, 50), 1)
-        
-        def draw_led_icon(x, y, label, is_active, active_color, txt_color=TEXT_MAIN):
-            bg = active_color if is_active else (40, 40, 40)
-            cv2.rectangle(canvas, (x, y), (x + 85, y + 30), bg, -1)
-            tx = (0,0,0) if is_active and bg != RED_LUM else txt_color
-            cv2.putText(canvas, label, (x + 5, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, tx, 1, cv2.LINE_AA)
+        # Draw filled speed arc
+        spd_ratio = min(1.0, abs(speed) / 150.0)
+        end_angle = int(270 * spd_ratio)
+        if end_angle > 0:
+            cv2.ellipse(canvas, center, (radius, radius), 135, 0, end_angle, ACCENT_PRI, 8, cv2.LINE_AA)
             
-        draw_led_icon(860,    630, "STOP",       "stop-sign" in active_labels, RED_LUM)
-        draw_led_icon(955,   630, "PEDESTRN",   "pedestrian" in active_labels, (0, 200, 255))
-        draw_led_icon(1050,  630, "X-WALK",     "crosswalk-sign" in active_labels, GREEN_LUM)
-        draw_led_icon(1145,  630, "PARKING",    "parking-sign" in active_labels, BLUE_NEON)
+        # Speed Text inside gauge
+        spd_str = f"{int(abs(speed))}"
+        tsize = cv2.getTextSize(spd_str, cv2.FONT_HERSHEY_DUPLEX, 2.5, 3)[0]
+        cv2.putText(canvas, spd_str, (1050 - tsize[0]//2, 215), cv2.FONT_HERSHEY_DUPLEX, 2.5, TEXT_PRI, 3, cv2.LINE_AA)
+        cv2.putText(canvas, "cm/s", (1030, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
         
-        draw_led_icon(860,    670, "HIGHWAY",    "highway-sign" in active_labels, BLUE_NEON)
-        draw_led_icon(955,   670, "PRIORITY",   "priority-sign" in active_labels, (0, 200, 255))
-        draw_led_icon(1050,  670, "NO ENTRY",   "no-entry-road-sign" in active_labels, RED_LUM)
-        # BUG 17: Case-insensitive check for limit variants
-        draw_led_icon(1145,  670, "LIMIT",      any("limit" in x.lower() for x in active_labels), (0, 255, 255))
+        cv2.line(canvas, (850, 310), (1250, 310), DIVIDER, 1)
 
-        # --- BOTTOM CONTROL BAR ---
-        cv2.putText(canvas, "AUTONOMOUS MODE ACTIVE", (40, 670), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_LUM, 2, cv2.LINE_AA)
+        # --- STEERING BAR ---
+        cv2.putText(canvas, "STEERING APEX", (850, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (1150, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_PRI, 1, cv2.LINE_AA)
         
-        # E-Stop Button Visual
-        cv2.rectangle(canvas, (320, 640), (520, 700), (0, 0, 150), -1)
-        cv2.rectangle(canvas, (320, 640), (520, 700), RED_LUM, 2)
-        cv2.putText(canvas, "E-STOP [SPACE]", (345, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_MAIN, 2, cv2.LINE_AA)
+        bar_y = 370
+        cv2.line(canvas, (850, bar_y), (1250, bar_y), (40, 40, 40), 4) # Base bar
+        cv2.circle(canvas, (1050, bar_y), 5, TEXT_PRI, -1) # Center notch
         
-        # --- INTERACTIVE MANUAL PROMPTS ---
+        s_col = ACCENT_SEC if abs(steer_angle) <= 10 else (WARN_O if abs(steer_angle) <= 25 else ALERT_R)
+        s_px = int((steer_angle / 30.0) * 200)
+        if steer_angle > 0:
+            cv2.line(canvas, (1050, bar_y), (1050 + s_px, bar_y), s_col, 6)
+        else:
+            cv2.line(canvas, (1050 + s_px, bar_y), (1050, bar_y), s_col, 6)
+
+        cv2.line(canvas, (850, 410), (1250, 410), DIVIDER, 1)
+        
+        # --- PILL TAGS FUNCTION ---
+        def draw_pill(img, x, y, text, color, text_color=TEXT_PRI):
+            tsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            w, h = tsize[0] + 30, 28
+            r = h // 2
+            cv2.circle(img, (x + r, y + r), r, color, -1, cv2.LINE_AA)
+            cv2.circle(img, (x + w - r, y + r), r, color, -1, cv2.LINE_AA)
+            cv2.rectangle(img, (x + r, y), (x + w - r, y + h), color, -1)
+            cv2.putText(img, text, (x + 15, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2, cv2.LINE_AA)
+            return w
+            
+        # --- COMMAND STATES ---
+        cv2.putText(canvas, "TRAFFIC COMMAND", (850, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        t_col = SUCCESS_G if traffic_state == "SYS_GO" else (ALERT_R if traffic_state == "SYS_STOP" else WARN_O)
+        draw_pill(canvas, 850, 455, traffic_state.replace("SYS_",""), t_col, BG_COLOR)
+        
+        cv2.putText(canvas, "NAVIGATION MODE", (850, 520), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        nav_icon = "RBT" if nav_state == "ROUNDABOUT" else ("JCT" if "JUNCTION" in nav_state else "FWD")
+        n_col = ACCENT_SEC if nav_state == "NORMAL" else WARN_O
+        n_text = f"{nav_icon} | {nav_state}"
+        draw_pill(canvas, 850, 535, n_text, n_col, BG_COLOR)
+        
+        # --- BATTERY SEGMENTS ---
+        cv2.putText(canvas, "ENERGY RESERVE", (1110, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        bx, by = 1110, 460
+        segments = 10
+        filled = int((batt_pct / 100.0) * segments)
+        b_col = SUCCESS_G if filled > 3 else (WARN_O if filled > 1 else ALERT_R)
+        for i in range(segments):
+            c = b_col if i < filled else (40, 40, 40)
+            cv2.rectangle(canvas, (bx + i*13, by), (bx + i*13 + 10, by + 18), c, -1)
+        cv2.putText(canvas, f"{batt_pct:.1f}%", (1150, 495), cv2.FONT_HERSHEY_SIMPLEX, 0.5, b_col, 1, cv2.LINE_AA)
+
+        # --- ACTIVE DETECTIONS ---
+        cv2.putText(canvas, "DETECTED SIGNALS", (850, 600), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        lx, ly = 850, 615
+        for lbl in active_labels[:4]: # Show max 4 to not bleed off edge
+            lbl_strip = lbl.replace("-sign", "").replace("-road", "").upper()
+            w = draw_pill(canvas, lx, ly, lbl_strip, (60, 60, 60), TEXT_PRI)
+            lx += w + 10
+            
+        # 3. BOTTOM HUD BAR
+        cv2.rectangle(canvas, (0, 640), (1280, 720), BG_COLOR, -1)
+        cv2.line(canvas, (0, 640), (1280, 640), ACCENT_PRI, 2)
+        
+        cv2.putText(canvas, f"FPS: {int(getattr(self, '_fps', 0))}", (30, 680), cv2.FONT_HERSHEY_DUPLEX, 0.7, TEXT_PRI, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "SYSTEM MODE: AUTO", (140, 680), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ACCENT_SEC, 1, cv2.LINE_AA)
+        
+        # E-STOP Button
+        cv2.rectangle(canvas, (540, 655), (740, 705), ALERT_R, -1)
+        cv2.putText(canvas, "E-STOP [SPACE]", (570, 685), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 2, cv2.LINE_AA)
+        
+        cv2.putText(canvas, f"TOPO: {topology}", (850, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"ANCHOR: {anchor}", (850, 695), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+
+        # 4. BEV RADAR WINDOW (Bottom Left)
+        rw, rh = 300, 220
+        rx, ry = 20, 400
+        # Bezel and background
+        cv2.rectangle(canvas, (rx-2, ry-2), (rx+rw+2, ry+rh+2), BG_COLOR, -1)
+        cv2.rectangle(canvas, (rx-2, ry-2), (rx+rw+2, ry+rh+2), ACCENT_PRI, 2)
+        
+        # Tech Label Tab
+        cv2.rectangle(canvas, (rx-2, ry-25), (rx+120, ry-2), ACCENT_PRI, -1)
+        cv2.putText(canvas, "BEV RADAR", (rx+10, ry-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BG_COLOR, 2, cv2.LINE_AA)
+        
+        radar = cv2.resize(lane_dbg, (rw, rh))
+        canvas[ry:ry+rh, rx:rx+rw] = radar
+        
+        # 5. JUNCTION / BLIND MODAL (Center Screen Override)
         if nav_state == "JUNCTION_PROMPT" or anchor == "BLIND_CORNER":
-            # Very aggressive visual takeover for interactive prompts
-            blk = np.zeros_like(canvas)
-            cv2.rectangle(blk, (150, 150), (670, 350), BG_COLOR, -1)
-            cv2.rectangle(blk, (150, 150), (670, 350), BLUE_NEON, 3)
+            # Dark semi-transparent background panel
+            modal_overlay = canvas.copy()
+            cv2.rectangle(modal_overlay, (240, 180), (680, 360), BG_COLOR, -1)
+            cv2.addWeighted(modal_overlay, 0.85, canvas, 0.15, 0, canvas)
             
-            p_title = "JUNCTION APPROACHING" if nav_state == "JUNCTION_PROMPT" else "BLIND CORNER DETECTED"
+            # Electric blue top border bar
+            cv2.rectangle(canvas, (240, 180), (680, 185), ACCENT_PRI, -1)
             
-            cv2.putText(blk, p_title, (230, 200), cv2.FONT_HERSHEY_DUPLEX, 1.2, BLUE_NEON, 3, cv2.LINE_AA)
-            cv2.putText(blk, "AWAITING HUMAN DECISION...", (250, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_MAIN, 2, cv2.LINE_AA)
-            cv2.putText(blk, "PRESS [L] TO FOLLOW LEFT", (250, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
-            cv2.putText(blk, "PRESS [R] TO FOLLOW RIGHT", (250, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2, cv2.LINE_AA)
+            m_title = "JUNCTION DETECTED" if nav_state == "JUNCTION_PROMPT" else "BLIND CORNER"
+            cv2.putText(canvas, m_title, (280, 230), cv2.FONT_HERSHEY_DUPLEX, 1.0, TEXT_PRI, 2, cv2.LINE_AA)
+            cv2.putText(canvas, "AWAITING HUMAN DECISION...", (280, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
             
-            # Blend
-            cv2.addWeighted(blk, 0.9, canvas, 1.0, 0, canvas)
-        
-        # High-Tech Radar Window (Bottom Right of the camera view)
-        radar_h, radar_w = 210, 280
-        radar = cv2.resize(lane_dbg, (radar_w, radar_h))
-        # Draw tech border around radar
-        cv2.rectangle(radar, (0,0), (radar_w-1, radar_h-1), BLUE_NEON, 2)
-        canvas[400:400+radar_h, 40:40+radar_w] = radar
-        
-        # Radar overlay text
-        cv2.rectangle(canvas, (40, 375), (200, 400), BLUE_NEON, -1)
-        cv2.putText(canvas, "RADAR BEV", (50, 393), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
+            # Two option buttons
+            cv2.rectangle(canvas, (280, 290), (440, 330), ACCENT_SEC, 2)
+            cv2.putText(canvas, "[L] LEFT", (315, 316), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ACCENT_SEC, 2, cv2.LINE_AA)
+            
+            cv2.rectangle(canvas, (460, 290), (620, 330), WARN_O, 2)
+            cv2.putText(canvas, "[R] RIGHT", (490, 316), cv2.FONT_HERSHEY_SIMPLEX, 0.7, WARN_O, 2, cv2.LINE_AA)
 
         return canvas
 
