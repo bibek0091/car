@@ -69,10 +69,8 @@ SRC_PTS = np.float32([[200, 260], [440, 260], [40,  450], [600, 450]])
 DST_PTS = np.float32([[150,   0], [490,   0], [150, 480], [490, 480]])
 
 # ===========================================================================
-# RIGHT-LANE OFFSET (Aggressive Hugging)
+# RIGHT-LANE FINE TUNING DEFAULT
 # ===========================================================================
-# Increased to 140 to brutally force the car onto the far right edge of the lane
-RIGHT_LANE_OFFSET_PX = 140
 DUAL_OFFSET_PX       = 0
 SINGLE_DIV_OFFSET_PX = 40
 SINGLE_EDGE_OFFSET_PX = -40
@@ -349,8 +347,8 @@ class HybridLaneTracker:
             return ev(ghost_sr) - offset_px + extra_offset_px, "GHOSTING_RIGHT"
 
         # Complete loss
-        # Default back to far right side of screen
-        return 320.0 + RIGHT_LANE_OFFSET_PX, "LOST"
+        # Default back to far right side of screen based on recent lane width estimates
+        return 320.0 + (lane_width_px * 0.40) + extra_offset_px, "LOST"
 
     def get_curvature(self, y_eval):
         fit = self.sr if self.sr is not None else self.sl
@@ -663,7 +661,7 @@ class BFMC_Pilot:
         self.smooth_steer  = 0.0
         self.smooth_guard  = 0.0
         self.prev_steer    = 0.0
-        self.last_target   = 320.0 + RIGHT_LANE_OFFSET_PX
+        self.last_target   = 320.0 + 100.0  # Safe initial right-bias
         self.lost_frames   = 0
 
         self._fps_t, self._fps = time.time(), 0.0
@@ -870,7 +868,10 @@ class BFMC_Pilot:
                 base_speed    = cv2.getTrackbarPos("Base Speed",    "BFMC_MASTER_VIEW")
 
                 fine_px      = (fine_offset - 50) * 2
-                total_offset = RIGHT_LANE_OFFSET_PX + fine_px
+                
+                # We removed the hardcoded +140 RIGHT_LANE_OFFSET_PX because the Hybrid tracker
+                # now naturally anchors off the right shoulder. We only pass the user's fine_px tweak.
+                total_offset = fine_px
 
                 # -------------------------------------------------------------
                 # 1. CORE CAMERA CAPTURE (RAW FRAME BASE)
@@ -959,7 +960,7 @@ class BFMC_Pilot:
                 elif nav_state.startswith("JUNCTION"): speed = base_speed * 0.55
                 elif curvature > self.HIGH_CURV_THRESH: speed = base_speed * self.HIGH_CURV_SCALE
                 elif curvature > self.MED_CURV_THRESH: speed = base_speed * self.MED_CURV_SCALE
-                elif anchor == "DUAL" and abs(steer_angle) < 10: speed = base_speed * self.DUAL_SPEED_SCALE
+                elif abs(steer_angle) < 8: speed = base_speed * self.DUAL_SPEED_SCALE # Straight-line boost
                 elif abs(steer_angle) > 18: speed = base_speed * 0.60
                 elif abs(steer_angle) > 10: speed = base_speed * 0.80
                 else: speed = float(base_speed)
@@ -998,7 +999,7 @@ class BFMC_Pilot:
                 cv2.line(lane_dbg, (int(target_x), y_eval), (320, 470), (0, 255, 0), 2)
                 cv2.line(lane_dbg, (320, 450), (320, 480), (0, 0, 255), 3)
 
-                ref_x = 320 + RIGHT_LANE_OFFSET_PX
+                ref_x = 320 + 120 # Reference right-lane guide dot
                 for y_tick in range(0, 480, 20): cv2.line(lane_dbg, (ref_x, y_tick), (ref_x, y_tick + 10), (100, 100, 100), 1)
 
                 if guard_on: cv2.putText(lane_dbg, "! GUARD !", (230, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
