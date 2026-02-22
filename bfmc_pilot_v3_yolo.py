@@ -277,9 +277,9 @@ class TrafficDecisionModule:
                 # We still need to calculate distance (bounding box height) to know
                 # if we are far away, approaching, or at the stop line.
                 distance_cat = "UNKNOWN"
-                if box_h < 40: distance_cat = "FAR"
-                elif box_h < 70: distance_cat = "APPROACH"
-                elif box_h >= 70: distance_cat = "HALT"
+                if box_h < 15: distance_cat = "FAR"
+                elif box_h < 25: distance_cat = "APPROACH"
+                elif box_h >= 25: distance_cat = "HALT"
                 
                 current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
                 
@@ -388,36 +388,28 @@ class TrafficLightStateMachine:
         self.last_seen_red = 0.0
         
     def update(self, is_red_detected, is_green_detected, distance_category):
-        # State transitions with hysteresis
-        if self.state == "NO_LIGHT":
-            if is_red_detected:
-                self.state = "LIGHT_DETECTED_FAR"
-                self.frames_in_state = 1
-        elif self.state == "LIGHT_DETECTED_FAR":
-            if is_red_detected and distance_category == "APPROACH":
-                self.frames_in_state += 1
-                if self.frames_in_state >= 3:
-                    self.state = "LIGHT_APPROACHING"
-                    self.frames_in_state = 0
-            elif not is_red_detected:
-                self.state = "NO_LIGHT"
-        elif self.state == "LIGHT_APPROACHING":
-            if is_red_detected and distance_category == "HALT":
-                self.state = "LIGHT_RED_STOPPING"
-                self.frames_stopping = 1
-            elif not is_red_detected:
-                self.state = "NO_LIGHT"
-        elif self.state == "LIGHT_RED_STOPPING":
-            self.frames_stopping += 1
-            if self.frames_stopping >= 2:
-                # Once stopping, wait until green to go (with min stop time)
-                self.last_seen_red = time.time()
+        # Extremely robust and forgiving FSM for small YOLO boxes
+        if is_red_detected:
+            self.last_seen_red = time.time()
+            if distance_category == "HALT":
                 self.state = "LIGHT_RED_STOPPED"
-        elif self.state == "LIGHT_RED_STOPPED":
-            if is_green_detected and (time.time() - self.last_seen_red > 2.0):
+            elif distance_category == "APPROACH" and self.state not in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"]:
+                self.state = "LIGHT_APPROACHING"
+            elif self.state == "NO_LIGHT":
+                self.state = "LIGHT_DETECTED_FAR"
+                
+        elif is_green_detected:
+            if self.state in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"]:
+                if time.time() - self.last_seen_red > 1.0: # 1 sec delay before taking off
+                    self.state = "LIGHT_GREEN_GO"
+            else:
                 self.state = "LIGHT_GREEN_GO"
-        elif self.state == "LIGHT_GREEN_GO":
-            if not is_green_detected:
+                
+        else:
+            # Grace period for dropped YOLO frames (holds the red light if camera blinks)
+            if self.state in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"] and (time.time() - self.last_seen_red > 4.0):
+                self.state = "NO_LIGHT"
+            elif self.state not in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"]:
                 self.state = "NO_LIGHT"
 
         return self.state
