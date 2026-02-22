@@ -178,21 +178,24 @@ class TrafficDecisionModule:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False # BUG 16: Increase minimum dimensions
+        if box_h < 15 or box_w < 10: return False 
         
-        crop = frame[y1:y2, x1:x2]
+        # Crop ONLY to the top 45% of the bounding box where the Red LED lives
+        y_mid = y1 + int(box_h * 0.45)
+        crop = frame[y1:y_mid, x1:x2]
+        cv2.imwrite("tl_debug_red_crop.jpg", crop) # HARDCORE DEBUG
+        
+        if crop.size == 0: return False
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         
-        # Highly relaxed thresholds for overexposed/blooming toy LEDs
-        # Allow Saturation as low as 20 to catch the white hot center
-        # Expand Hue to catch slight orange shifts in bright reds
-        mask1 = cv2.inRange(hsv, np.array([0, 20, 150]), np.array([20, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([160, 20, 150]), np.array([180, 255, 255]))
+        # Strict color bounds, but we only look in the top half
+        mask1 = cv2.inRange(hsv, np.array([0, 30, 150]), np.array([12, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([160, 30, 150]), np.array([180, 255, 255]))
         red_mask = cv2.bitwise_or(mask1, mask2)
         
-        # 1. Color Check Only (Disabled Geometry check due to blooming distortion)
-        red_ratio = cv2.countNonZero(red_mask) / (box_h * box_w)
-        return red_ratio > 0.05 # Forgiving threshold for massive YOLO bounding boxes
+        # Instead of a ratio over the massive stand, we just need a cluster of red pixels
+        pixel_count = cv2.countNonZero(red_mask)
+        return pixel_count > 6
 
     def _is_light_green(self, frame, x1, y1, x2, y2):
         h, w = frame.shape[:2]
@@ -201,14 +204,19 @@ class TrafficDecisionModule:
         box_h, box_w = y2 - y1, x2 - x1
         if box_h < 15 or box_w < 10: return False
         
-        crop = frame[y1:y2, x1:x2]
+        # Crop ONLY to the bottom 45% of the bounding box where the Green LED lives
+        y_mid = y1 + int(box_h * 0.55)
+        crop = frame[y_mid:y2, x1:x2]
+        cv2.imwrite("tl_debug_green_crop.jpg", crop) # HARDCORE DEBUG
+        
+        if crop.size == 0: return False
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         
-        # High intensity green ranges
-        mask_green = cv2.inRange(hsv, np.array([35, 20, 150]), np.array([95, 255, 255]))
-        green_ratio = cv2.countNonZero(mask_green) / (box_h * box_w)
+        # Strict green bounds, but only in the bottom half
+        mask_green = cv2.inRange(hsv, np.array([35, 30, 150]), np.array([90, 255, 255]))
+        pixel_count = cv2.countNonZero(mask_green)
         
-        return green_ratio > 0.05
+        return pixel_count > 6
 
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         # BUG 8: Check if ANY part of bbox overlaps path region instead of just center
