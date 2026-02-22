@@ -149,68 +149,6 @@ class TrafficDecisionModule:
         self.tl_fsm = TrafficLightStateMachine()
         self.collision_predictor = CollisionPredictor()
         self.last_process_time = time.time()
-        
-    def _is_light_glowing(self, frame, x1, y1, x2, y2):
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False
-        
-        crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        # Check for glowing Red, Yellow, or Green. S > 50 avoids white/grey, V > 150 ensures brightness
-        mask_red1 = cv2.inRange(hsv, np.array([0, 50, 150]), np.array([10, 255, 255]))
-        mask_red2 = cv2.inRange(hsv, np.array([170, 50, 150]), np.array([180, 255, 255]))
-        mask_yellow = cv2.inRange(hsv, np.array([15, 50, 150]), np.array([35, 255, 255]))
-        mask_green = cv2.inRange(hsv, np.array([40, 50, 150]), np.array([90, 255, 255]))
-        
-        glow_mask = cv2.bitwise_or(mask_red1, mask_red2)
-        glow_mask = cv2.bitwise_or(glow_mask, mask_yellow)
-        glow_mask = cv2.bitwise_or(glow_mask, mask_green)
-        
-        glow_ratio = cv2.countNonZero(glow_mask) / (box_h * box_w)
-        return glow_ratio > 0.05
-
-    def _is_light_red(self, frame, x1, y1, x2, y2):
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False # BUG 16: Increase minimum dimensions
-        
-        crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        # Relaxed HSV thresholds to allow washed-out reds and dimmer LEDs
-        mask1 = cv2.inRange(hsv, np.array([0, 60, 100]), np.array([10, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([170, 60, 100]), np.array([180, 255, 255]))
-        red_mask = cv2.bitwise_or(mask1, mask2)
-        
-        # BUG 15: Add secondary check for very high V values (>200) with lower S threshold for bright sunlight
-        mask3 = cv2.inRange(hsv, np.array([0, 50, 200]), np.array([10, 255, 255]))
-        mask4 = cv2.inRange(hsv, np.array([170, 50, 200]), np.array([180, 255, 255]))
-        red_sunlight_mask = cv2.bitwise_or(mask3, mask4)
-        red_mask = cv2.bitwise_or(red_mask, red_sunlight_mask)
-        
-        red_ratio = cv2.countNonZero(red_mask) / (box_h * box_w)
-        return red_ratio > 0.08 # Relaxed threshold to reduce false negatives
-
-    def _is_light_green(self, frame, x1, y1, x2, y2):
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 15 or box_w < 10: return False
-        
-        crop = frame[y1:y2, x1:x2]
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        mask_green = cv2.inRange(hsv, np.array([40, 50, 150]), np.array([90, 255, 255]))
-        green_ratio = cv2.countNonZero(mask_green) / (box_h * box_w)
-        return green_ratio > 0.08
-
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         # BUG 8: Check if ANY part of bbox overlaps path region instead of just center
         in_horizontal_path = (x1 < frame_w * 0.80) and (x2 > frame_w * 0.20)
@@ -261,9 +199,16 @@ class TrafficDecisionModule:
             active_labels.append(label)
             
             # --- 1. ALWAYS DRAW DETECTIONS ---
+            # Match the bounding box colors to the native detection output
             color = (0, 255, 0)
             if label in ["stop-sign", "no-entry-road-sign"]: color = (0, 0, 255)
-            elif label == "traffic-light": color = (0, 255, 255)
+            elif label == "traffic-light":
+                # Dynamically color the TL box based on the secondary model
+                tl_color = det.get("color", "off")
+                if tl_color == "red": color = (0, 0, 255)
+                elif tl_color == "green": color = (0, 255, 0)
+                elif tl_color == "yellow": color = (0, 255, 255)
+                else: color = (128, 128, 128)
             elif label in ["car", "pedestrian", "closed-road-stand"]: color = (255, 0, 255)
             elif "speed-limit" in label: color = (255, 255, 0)
             elif label in ["crosswalk-sign", "parking-sign", "highway-sign", "priority-sign"]: color = (255, 128, 0)
@@ -273,15 +218,15 @@ class TrafficDecisionModule:
 
             # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
-                is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
-                is_green = self._is_light_green(raw_frame, x1, y1, x2, y2)
+                # Natively extract the YOLO classification from the secondary model
+                tl_color = det.get("color", "off")
+                is_red = (tl_color == "red")
+                is_green = (tl_color == "green")
+                is_yellow = (tl_color == "yellow")
                 
                 # Debug logging
-                crop = raw_frame[y1:y2, x1:x2]
-                if crop.size > 0 and (is_red or (box_h >= 70 and not is_red)):
-                    hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                    mean_hsv = np.mean(hsv_crop, axis=(0,1))
-                    print(f"DEBUG TL: box_h={box_h}, is_red={is_red}, is_green={is_green}, HSV={mean_hsv}")
+                if is_red or box_h >= 70:
+                    print(f"DEBUG TL: box_h={box_h}, color_label={tl_color}")
                 
                 distance_cat = "UNKNOWN"
                 if box_h < 40: distance_cat = "FAR"

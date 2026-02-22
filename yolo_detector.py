@@ -2,13 +2,18 @@ import cv2
 from ultralytics import YOLO
 
 class PreTrainedYoloDetector:
-    def __init__(self, model_version="best.pt"):
+    def __init__(self, model_version="best.pt", traffic_model="best_traffic_med_yolo_v8.pt"):
         """
-        Initializes the custom BFMC YOLO model.
+        Initializes the custom BFMC YOLO models.
         """
-        print(f"Loading custom BFMC YOLO model '{model_version}'...")
-        # Loads the user-trained BFMC weights
+        print(f"Loading primary BFMC YOLO model '{model_version}'...")
         self.model = YOLO(model_version)
+        print(f"Loading secondary Traffic Color YOLO model '{traffic_model}'...")
+        try:
+            self.traffic_model = YOLO(traffic_model)
+        except Exception as e:
+            print(f"WARNING: traffic model not found: {e}")
+            self.traffic_model = None
 
     def detect_traffic_signals(self, frame_bgr, conf_threshold=0.3):
         """
@@ -23,9 +28,7 @@ class PreTrainedYoloDetector:
            filtered_detections: List of dicts with bounding boxes and labels
         """
         
-        # Run inference using the model. 
-        # By passing no specific 'classes' filter, our custom model 
-        # will automatically return all 15 Bosch Custom Objects.
+        # Run inference using the main model
         results = self.model.predict(
             source=frame_bgr, 
             conf=conf_threshold, 
@@ -33,26 +36,48 @@ class PreTrainedYoloDetector:
         )
         
         filtered_detections = []
-        
-        # Parse the results (there's only 1 frame, so index 0)
         result = results[0]
         
         for box in result.boxes:
-            # Bounding box coordinates (xyxy)
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            
-            # Confidence score and Class ID
             confidence = box.conf[0].item()
             cls_id = int(box.cls[0].item())
-            
-            # Get human readable label
             label = self.model.names[cls_id]
             
+            # Skip the main model's traffic light to let the secondary model handle it
+            if label == "traffic-light":
+                continue
+                
             filtered_detections.append({
                 "label": label,
                 "confidence": confidence,
                 "bbox": (x1, y1, x2, y2)
             })
+            
+        # Run inference using the secondary traffic model
+        if getattr(self, "traffic_model", None):
+            traffic_results = self.traffic_model.predict(
+                source=frame_bgr, 
+                # Lower threshold slightly for the specialized model to mimic the test bench
+                conf=max(0.15, conf_threshold - 0.1), 
+                verbose=False
+            )
+            t_result = traffic_results[0]
+            
+            for box in t_result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                confidence = box.conf[0].item()
+                cls_id = int(box.cls[0].item())
+                color_label = self.traffic_model.names[cls_id] # "red", "green", "yellow", "off"
+                
+                # We inject this dynamically so bfmc_pilot sees it as a traffic light 
+                # but with an explicit color classification attached.
+                filtered_detections.append({
+                    "label": "traffic-light",
+                    "color": color_label,
+                    "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2)
+                })
             
         return filtered_detections
 
