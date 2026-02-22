@@ -64,8 +64,8 @@ LANE_WIDTH_M         = 0.35    # one-lane physical width (m)
 # ===========================================================================
 # CAMERA - Bird's Eye View calibration
 # ===========================================================================
-# SRC: [TL, TR, BL, BR] - Top points raised from 260 to 180 to view further ahead
-SRC_PTS = np.float32([[150, 180], [490, 180], [20, 480], [620, 480]])
+# SRC: [TL, TR, BL, BR] - Reverted to original dimensions
+SRC_PTS = np.float32([[200, 260], [440, 260], [40,  450], [600, 450]])
 DST_PTS = np.float32([[150,   0], [490,   0], [150, 480], [490, 480]])
 
 # ===========================================================================
@@ -386,7 +386,13 @@ class LanePerceptionModule:
         self.tracker = HybridLaneTracker(img_shape=(h, w))
         
     def process_raw_frame(self, raw_frame):
-        warped_colour = cv2.warpPerspective(raw_frame, self.M_forward, (640, 480))
+        # Resize high-res raw frame back to 640x480 for lane processing
+        if raw_frame.shape[:2] != (480, 640):
+            process_frame = cv2.resize(raw_frame, (640, 480))
+        else:
+            process_frame = raw_frame
+            
+        warped_colour = cv2.warpPerspective(process_frame, self.M_forward, (640, 480))
         hls = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2HLS)
         L   = self.clahe.apply(hls[:, :, 1])
 
@@ -542,7 +548,7 @@ class BFMC_Pilot:
         if not sim_mode and _CAM_AVAILABLE:
             try:
                 self.picam2 = Picamera2()
-                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
+                cfg = self.picam2.create_video_configuration(main={"size": (1280, 720), "format": "BGR888"})
                 self.picam2.configure(cfg)
                 self.picam2.start()
                 self.cam_ok = True
@@ -605,6 +611,7 @@ class BFMC_Pilot:
 
     def run(self):
         print("BFMC Pilot v2: STARTING MODULAR ORCHESTRATOR")
+        startup_time = time.time()
         try:
             while True:
                 t_frame_start = time.time()
@@ -625,7 +632,7 @@ class BFMC_Pilot:
                     if raw_frame.ndim == 3 and raw_frame.shape[2] == 3:
                         raw_frame = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
                 else:
-                    raw_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    raw_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
 
                 # -------------------------------------------------------------
                 # 2. INTELLIGENT TRAFFIC MODULE ON RAW FRAME
@@ -712,6 +719,17 @@ class BFMC_Pilot:
 
                 speed = speed * traffic_mult * (guard_spd if guard_on else 1.0)
                 steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_angle))
+
+                # -------------------------------------------------------------
+                # 6.5. STARTUP CALIBRATION PHASE OVERRIDE
+                # -------------------------------------------------------------
+                # Freeze car for the first 5 seconds so camera auto-exposure settles
+                # and user can verify lane alignments on the screen.
+                elapsed_run = time.time() - startup_time
+                if elapsed_run < 5.0:
+                    speed = 0.0
+                    steer_angle = 0.0
+                    cv2.putText(lane_dbg, f"CALIBRATING... {5.0 - elapsed_run:.1f}s", (180, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
                 # -------------------------------------------------------------
                 # 7. CAR CONTROL
