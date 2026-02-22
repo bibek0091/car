@@ -296,24 +296,38 @@ class HybridLaneTracker:
             if sr is not None: return ev(sr) - hw + extra_offset_px, "RBT_OUTER"
             return None, "RBT_LOST"
 
-        if nav_state == "JUNCTION":
-            # BRUTE FORCE RIGHT PRIORITY: Always aim for the far right edge of the screen
-            # Ignore the "ideal" lane center and force a heavy right-side anchor
+        if nav_state.startswith("JUNCTION"):
             
-            # Base target: the center of the screen
+            # Interactive Junction State: Look for user 'L' or 'R' choice
             base_x = 320.0
             
-            if sr is not None:
-                # If we see the right edge, hug it aggressively (closer than normal)
-                base_x = ev(sr) - (hw * 0.5) 
-                anchor_type = "JCT_RIGHT_HUG"
-            elif sl is not None:
-                # If we only see the left divider, project a full lane width + extra padding to the right
-                base_x = ev(sl) + (lane_width_px * 1.5)
-                anchor_type = "JCT_DIVIDER_PUSH"
+            if nav_state == "JUNCTION_RIGHT":
+                # Brute force turn Right
+                if sr is not None:
+                    base_x = ev(sr) - (lane_width_px * 0.40)
+                    anchor_type = "JCT_RIGHT_EDGE"
+                elif sl is not None:
+                    base_x = ev(sl) + (lane_width_px * 1.5)
+                    anchor_type = "JCT_RIGHT_GHOST"
+                else: 
+                    base_x = 320.0 + (lane_width_px * 0.8)
+                    anchor_type = "JCT_RIGHT_BLIND"
+                    
+            elif nav_state == "JUNCTION_LEFT":
+                # Brute force turn Left
+                if sl is not None:
+                    base_x = ev(sl) + (lane_width_px * 0.40)
+                    anchor_type = "JCT_LEFT_EDGE"
+                elif sr is not None:
+                    base_x = ev(sr) - (lane_width_px * 1.5)
+                    anchor_type = "JCT_LEFT_GHOST"
+                else:
+                    base_x = 320.0 - (lane_width_px * 0.8)
+                    anchor_type = "JCT_LEFT_BLIND"
+                    
             else:
-                base_x = 320.0 + (lane_width_px * 0.8)
-                anchor_type = "JCT_BLIND_RIGHT"
+                # Default logic if no exact choice was processed (e.g. JUNCTION_PROMPT state)
+                anchor_type = "JCT_WAITING_CHOICE"
                 
             return base_x + extra_offset_px, anchor_type
 
@@ -323,13 +337,16 @@ class HybridLaneTracker:
         # If the right line is visible AT ALL, lock onto it and hug its edge.
         # Ignore the left line entirely to prevent centering drift.
         if sr is not None:
-            # Anchor strictly off the right line, offset inwards just enough to stay on track (e.g., 20 pixels)
-            return ev(sr) - 20.0 + extra_offset_px, "HUGGING_RIGHT"
+            # Shift heavily left from the right-hand boundary (approx 40% of lane width)
+            # This ensures the car's body fits entirely inside the right lane
+            offset_px = lane_width_px * 0.40
+            return ev(sr) - offset_px + extra_offset_px, "HUGGING_RIGHT"
             
         # If right line is totally lost but left is visible, project a ghost right line
         if sl is not None and sr is None:
             ghost_sr = sl + np.array([0.0, 0.0, float(lane_width_px)])
-            return ev(ghost_sr) - 20.0 + extra_offset_px, "GHOSTING_RIGHT"
+            offset_px = lane_width_px * 0.40
+            return ev(ghost_sr) - offset_px + extra_offset_px, "GHOSTING_RIGHT"
 
         # Complete loss
         # Default back to far right side of screen
@@ -463,6 +480,7 @@ class JunctionDetector:
 
     def __init__(self):
         self.state, self.entry_count, self.exit_count, self.frames_in_jct = "NORMAL", 0, 0, 0
+        self.user_choice = None  # Tracks the user's manual branch decision ("LEFT" / "RIGHT")
 
     def update(self, warped_binary, left_conf, right_conf, left_fit, right_fit, lane_width_px):
         h, w = warped_binary.shape
@@ -485,12 +503,26 @@ class JunctionDetector:
         if self.state == "NORMAL":
             self.entry_count = self.entry_count + 1 if evidence else 0
             if self.entry_count >= self.ENTRY_FRAMES:
-                self.state, self.exit_count, self.frames_in_jct = "JUNCTION", 0, 0
-        elif self.state == "JUNCTION":
+                # We detected a junction geometry! Pause and PROMPT user.
+                self.state, self.exit_count, self.frames_in_jct = "JUNCTION_PROMPT", 0, 0
+                self.user_choice = None
+                
+        elif self.state == "JUNCTION_PROMPT":
+            # Wait endlessly in PROMPT state until the main loop injects user_choice
+            if self.user_choice == "RIGHT":
+                self.state = "JUNCTION_RIGHT"
+            elif self.user_choice == "LEFT":
+                self.state = "JUNCTION_LEFT"
+                
+        elif self.state.startswith("JUNCTION_"):
+            # We are actively executing a branch
             self.frames_in_jct += 1
             self.exit_count = self.exit_count + 1 if not evidence else 0
-            if self.exit_count >= self.EXIT_FRAMES and self.frames_in_jct > 15:
+            
+            # Ensure we've driven a minimum amount through the junction before trusting clear evidence
+            if self.exit_count >= self.EXIT_FRAMES and self.frames_in_jct > 25:
                 self.state, self.entry_count = "NORMAL", 0
+                self.user_choice = None
                 
         return self.state
 
@@ -668,93 +700,153 @@ class BFMC_Pilot:
         # Master Canvas: 1280x720 (HD)
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
         
-        # 1. Main Background: The raw 720p YOLO feed acts as the reality view 
-        # (It takes up the whole screen, UI floats over it)
+        # 1. Main Background
         canvas[0:720, 0:1280] = yolo_hd
         
-        # 2. Sleek Dark Glassmorphism Overlay for the UI telemetry (Right Side)
+        # 2. Sleek Translucent Glassmorphism Overlay
+        # Creating a transparent mask for the UI backgrounds
         overlay = canvas.copy()
         
-        # Black styling
-        BG_COLOR = (25, 25, 30)
-        TEXT_LIGHT = (220, 220, 220)
-        TEXT_DIM   = (120, 120, 120)
-        BLUE_BOSCH = (212, 120, 0) # BGR
+        # Color Palette
+        BG_COLOR  = (15, 15, 18)   # Deep space grey
+        BLUE_NEON = (255, 160, 50) # Vibrant cyber blue
+        GREEN_LUM = (100, 255, 100)
+        RED_LUM   = (100, 50, 255)
+        TEXT_MAIN = (240, 240, 240)
+        TEXT_DIM  = (140, 140, 140)
         
-        # Right Panel Overlay
-        cv2.rectangle(overlay, (800, 0), (1280, 720), BG_COLOR, -1)
-        # Bottom Control Panel Overlay
-        cv2.rectangle(overlay, (0, 600), (800, 720), BG_COLOR, -1)
+        # Right Panel Overlay (Telemetry)
+        cv2.rectangle(overlay, (820, 0), (1280, 720), BG_COLOR, -1)
+        # Gradient shadow bounding the right panel
+        for i in range(30):
+            cv2.line(overlay, (820 - i, 0), (820 - i, 720), BG_COLOR, max(1, int(20 - i*0.6)))
+            
+        # Bottom Control Panel Overlay (Translucent)
+        cv2.rectangle(overlay, (0, 620), (820, 720), (10, 10, 15), -1)
         
-        # Top-Left Stats overlay (compact)
-        cv2.rectangle(overlay, (20, 20), (320, 80), BG_COLOR, -1)
+        # Top-Left Logo Block
+        cv2.rectangle(overlay, (20, 20), (360, 90), BG_COLOR, -1)
         
-        cv2.addWeighted(overlay, 0.95, canvas, 0.05, 0, canvas)
+        # Apply the transparent blend (85% opaque UI panels)
+        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        
+        # --- TOP LEFT LOGO ---
+        cv2.putText(canvas, "BOSCH FUTURE MOBILITY", (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_NEON, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "AUTONOMOUS ORCHESTRATOR v3.0", (40, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_DIM, 1, cv2.LINE_AA)
         
         # --- RIGHT TELEMETRY PANEL ---
-        cv2.putText(canvas, "TELEMETRY SENSORS", (830, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_BOSCH, 2)
-        cv2.putText(canvas, f"GPS: LAT 46.771200 | LON 23.623600", (830, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        base_x = 860
+        cv2.putText(canvas, "SYSTEM TELEMETRY", (base_x, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_NEON, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"GPS: 46.7712 N | 23.6236 E", (base_x, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
         
-        # Speed & Steer Grid
-        cv2.putText(canvas, "SPEED", (830, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
-        cv2.putText(canvas, f"{int(abs(speed))}", (830, 160), cv2.FONT_HERSHEY_DUPLEX, 2.0, TEXT_LIGHT, 2)
-        cv2.putText(canvas, "cm/s", (920, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1)
+        # Line Seperator
+        cv2.line(canvas, (base_x, 100), (1240, 100), (50, 50, 50), 1)
         
-        cv2.putText(canvas, "STEER", (1050, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
-        cv2.putText(canvas, f"{steer_angle:+.1f}", (1050, 160), cv2.FONT_HERSHEY_DUPLEX, 1.5, TEXT_LIGHT, 2)
-        cv2.putText(canvas, "deg", (1170, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1)
+        # Drive Metrics (Speed & Steering)
+        cv2.putText(canvas, "CHASSIS SPEED", (base_x, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{int(abs(speed))}", (base_x, 185), cv2.FONT_HERSHEY_DUPLEX, 2.2, TEXT_MAIN, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "cm/s", (base_x + 95, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1, cv2.LINE_AA)
         
-        # Battery Indicator
-        cv2.putText(canvas, "BATTERY CAPACITY", (830, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
-        cv2.rectangle(canvas, (830, 225), (1200, 245), (60, 60, 60), 1)
-        fill_w = int((batt_pct / 100.0) * 368)
-        cv2.rectangle(canvas, (831, 226), (831 + fill_w, 244), BLUE_BOSCH, -1)
-        cv2.putText(canvas, f"{batt_pct:.1f}%", (1210, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
+        cv2.putText(canvas, "STEERING APEX", (1060, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{steer_angle:+.1f}", (1060, 185), cv2.FONT_HERSHEY_DUPLEX, 1.8, TEXT_MAIN, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "deg", (1190, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_DIM, 1, cv2.LINE_AA)
         
-        # IMU & Sys
-        cv2.putText(canvas, "IMU: PITCH 0.0 | ROLL 0.0 | YAW 0.0", (830, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
-        cv2.putText(canvas, "SYS: CPU 12% | RAM 40% | TEMP 45.0C", (830, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1)
+        # High-End Dynamic Steering Bar (Horizontal Center-Aligned Visualizer)
+        cv2.rectangle(canvas, (base_x, 210), (1240, 216), (40, 40, 40), -1)
+        cv2.circle(canvas, (1050, 213), 3, (150, 150, 150), -1) # Center Deadzone
         
-        # --- VISION ENGINE ---
-        cv2.putText(canvas, "AI VISION ENGINE", (830, 370), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_BOSCH, 2)
+        # Map Steering -30 to +30 onto the 380px wide bar (center is 1050)
+        steer_px_offset = int((steer_angle / 30.0) * 190)
+        bar_col = BLUE_NEON if abs(steer_angle) < 15 else RED_LUM
+        if steer_angle > 0:
+            cv2.rectangle(canvas, (1050, 210), (1050 + steer_px_offset, 216), bar_col, -1)
+        else:
+            cv2.rectangle(canvas, (1050 + steer_px_offset, 210), (1050, 216), bar_col, -1)
         
-        state_col = (0, 255, 0)
-        if traffic_state == "SYS_STOP": state_col = (0, 0, 255)
-        elif traffic_state == "SYS_SLOW": state_col = (0, 165, 255)
+        # Battery Health
+        cv2.putText(canvas, "ENERGY RESERVE", (base_x, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (base_x, 275), (1240, 290), (40, 40, 40), -1)
+        fill_w = int((batt_pct / 100.0) * (1240 - base_x))
+        b_col = GREEN_LUM if batt_pct > 30 else RED_LUM
+        cv2.rectangle(canvas, (base_x, 275), (base_x + fill_w, 290), b_col, -1)
+        cv2.putText(canvas, f"{batt_pct:.1f}%", (1180, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.5, b_col, 1, cv2.LINE_AA)
+        
+        cv2.line(canvas, (base_x, 320), (1240, 320), (50, 50, 50), 1)
+        
+        # --- AI VISION ENGINE ---
+        cv2.putText(canvas, "NEURAL VISION ENGINE", (base_x, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.7, BLUE_NEON, 2, cv2.LINE_AA)
+        
+        state_col = GREEN_LUM
+        if traffic_state == "SYS_STOP": state_col = RED_LUM
+        elif traffic_state == "SYS_SLOW": state_col = (0, 200, 255)
         elif traffic_state == "SYS_LIMIT": state_col = (0, 255, 255)
         
-        cv2.putText(canvas, f"TRAFFIC STATE: {traffic_state}", (830, 420), cv2.FONT_HERSHEY_DUPLEX, 0.8, state_col, 2)
-        cv2.putText(canvas, f"REASON: {traffic_reason}", (830, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 1)
+        cv2.putText(canvas, "TRAFFIC COMMAND:", (base_x, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        cv2.putText(canvas, traffic_state, (base_x, 435), cv2.FONT_HERSHEY_DUPLEX, 1.2, state_col, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"REASON: {traffic_reason}", (base_x, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, state_col, 1, cv2.LINE_AA)
         
-        nav_col = (0, 255, 100) if nav_state == "NORMAL" else (0, 165, 255)
-        cv2.putText(canvas, f"NAV MODE: {nav_state} (Anchor: {anchor})", (830, 490), cv2.FONT_HERSHEY_SIMPLEX, 0.6, nav_col, 1)
+        cv2.putText(canvas, "NAVIGATION MODE:", (base_x, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        nav_col = GREEN_LUM if nav_state == "NORMAL" else (0, 165, 255)
+        cv2.putText(canvas, f"{nav_state} [{anchor}]", (base_x, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.6, nav_col, 2, cv2.LINE_AA)
         
-        tl_col = (100, 100, 100)
-        if light_status == "[RED]": tl_col = (50, 50, 255)
-        elif light_status == "[GREEN/OFF]": tl_col = (50, 255, 50)
-        cv2.putText(canvas, f"SIGNAL INFO: {light_status}", (830, 530), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 1)
+        cv2.putText(canvas, "TRAFFIC SIGNAL:", (1080, 500), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
+        tl_col = TEXT_DIM
+        if light_status == "[RED]": tl_col = RED_LUM
+        elif light_status == "[GREEN/OFF]": tl_col = GREEN_LUM
+        cv2.putText(canvas, light_status, (1080, 525), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 2, cv2.LINE_AA)
         
-        # LED Indicators
-        cv2.rectangle(canvas, (830, 570), (950, 600), (0, 0, 100) if "STOP" in traffic_reason else (30,30,30), -1)
-        cv2.putText(canvas, "STOP SIGN", (840, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
+        # LED Status Board
+        cv2.line(canvas, (base_x, 560), (1240, 560), (50, 50, 50), 1)
+        cv2.putText(canvas, "SYSTEM FLAGS", (base_x, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_DIM, 1, cv2.LINE_AA)
         
-        cv2.rectangle(canvas, (960, 570), (1080, 600), (0, 100, 100) if "PEDESTRIAN" in traffic_reason else (30,30,30), -1)
-        cv2.putText(canvas, "PEDESTRIAN", (970, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
+        # Stop Sign LED
+        c_stop = RED_LUM if "STOP" in traffic_reason else (40, 40, 40)
+        cv2.rectangle(canvas, (base_x, 610), (base_x + 110, 640), c_stop, -1)
+        cv2.putText(canvas, "STOP SIGN", (base_x + 15, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_MAIN, 1, cv2.LINE_AA)
         
-        cv2.rectangle(canvas, (1090, 570), (1220, 600), (0, 100, 0) if anchor != "LOST" else (0, 30, 0), -1)
-        cv2.putText(canvas, "LANE KEEP", (1100, 590), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_LIGHT, 1)
-
-        # --- BOTTOM CONTROL PANEL ---
-        cv2.putText(canvas, "AUTONOMOUS MODE ACTIVE", (40, 650), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.rectangle(canvas, (320, 620), (520, 680), (0, 0, 150), -1)
-        cv2.putText(canvas, "E-STOP [SPACE]", (340, 655), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_LIGHT, 2)
+        # Pedestrian LED
+        c_ped = (0, 200, 255) if "PEDESTRIAN" in traffic_reason else (40, 40, 40)
+        cv2.rectangle(canvas, (base_x + 125, 610), (base_x + 235, 640), c_ped, -1)
+        cv2.putText(canvas, "PEDESTRIAL", (base_x + 135, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0) if c_ped!=(40,40,40) else TEXT_MAIN, 1, cv2.LINE_AA)
         
-        # Radar (Top Left)
-        radar_h, radar_w = 180, 240
+        # Lane Keep LED
+        c_lane = GREEN_LUM if anchor != "LOST" else (40, 40, 40)
+        cv2.rectangle(canvas, (base_x + 250, 610), (base_x + 360, 640), c_lane, -1)
+        cv2.putText(canvas, "LANE KEEP", (base_x + 265, 630), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0) if c_lane!=(40,40,40) else TEXT_MAIN, 1, cv2.LINE_AA)
+        
+        # --- BOTTOM CONTROL BAR ---
+        cv2.putText(canvas, "AUTONOMOUS MODE ACTIVE", (40, 670), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_LUM, 2, cv2.LINE_AA)
+        
+        # E-Stop Button Visual
+        cv2.rectangle(canvas, (320, 640), (520, 700), (0, 0, 150), -1)
+        cv2.rectangle(canvas, (320, 640), (520, 700), RED_LUM, 2)
+        cv2.putText(canvas, "E-STOP [SPACE]", (345, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_MAIN, 2, cv2.LINE_AA)
+        
+        # --- INTERACTIVE MANUAL PROMPTS ---
+        if nav_state == "JUNCTION_PROMPT":
+            # Very aggressive visual takeover for interactive prompts
+            blk = np.zeros_like(canvas)
+            cv2.rectangle(blk, (150, 150), (670, 350), BG_COLOR, -1)
+            cv2.rectangle(blk, (150, 150), (670, 350), BLUE_NEON, 3)
+            
+            cv2.putText(blk, "JUNCTION DETECTED", (230, 200), cv2.FONT_HERSHEY_DUPLEX, 1.2, BLUE_NEON, 3, cv2.LINE_AA)
+            cv2.putText(blk, "AWAITING HUMAN DECISION...", (250, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEXT_MAIN, 2, cv2.LINE_AA)
+            cv2.putText(blk, "PRESS [L] FOR LEFT TURN", (250, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.putText(blk, "PRESS [R] FOR RIGHT TURN", (250, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 200), 2, cv2.LINE_AA)
+            
+            # Blend
+            cv2.addWeighted(blk, 0.9, canvas, 1.0, 0, canvas)
+        
+        # High-Tech Radar Window (Bottom Right of the camera view)
+        radar_h, radar_w = 210, 280
         radar = cv2.resize(lane_dbg, (radar_w, radar_h))
-        cv2.rectangle(radar, (0,0), (radar_w-1, radar_h-1), (255,255,255), 2)
-        canvas[100:100+radar_h, 30:30+radar_w] = radar
-        cv2.putText(canvas, "LANE FINDER", (40, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        # Draw tech border around radar
+        cv2.rectangle(radar, (0,0), (radar_w-1, radar_h-1), BLUE_NEON, 2)
+        canvas[400:400+radar_h, 40:40+radar_w] = radar
+        
+        # Radar overlay text
+        cv2.rectangle(canvas, (40, 375), (200, 400), BLUE_NEON, -1)
+        cv2.putText(canvas, "RADAR BEV", (50, 393), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
 
         return canvas
 
@@ -862,8 +954,9 @@ class BFMC_Pilot:
                 curvature = tracker.get_curvature(y_eval)
                 if self.lost_frames > LOST_GRACE_FRAMES: speed = 0.0
                 elif base_speed == 0: speed = 0.0
+                elif nav_state == "JUNCTION_PROMPT": speed = 0.0 # HALT car to wait for human input
                 elif nav_state == "ROUNDABOUT": speed = base_speed * self.rbt.SPEED_SCALE
-                elif nav_state == "JUNCTION": speed = base_speed * 0.55
+                elif nav_state.startswith("JUNCTION"): speed = base_speed * 0.55
                 elif curvature > self.HIGH_CURV_THRESH: speed = base_speed * self.HIGH_CURV_SCALE
                 elif curvature > self.MED_CURV_THRESH: speed = base_speed * self.MED_CURV_SCALE
                 elif anchor == "DUAL" and abs(steer_angle) < 10: speed = base_speed * self.DUAL_SPEED_SCALE
@@ -938,6 +1031,12 @@ class BFMC_Pilot:
                     print("MANUAL ESTOP TRIGGERED!")
                     speed = 0.0
                     self.handler.set_speed(0.0)
+                elif key == ord("l") and nav_state == "JUNCTION_PROMPT":
+                    print("USER DIRECTED: LEFT TURN")
+                    self.jct.user_choice = "LEFT"
+                elif key == ord("r") and nav_state == "JUNCTION_PROMPT":
+                    print("USER DIRECTED: RIGHT TURN")
+                    self.jct.user_choice = "RIGHT"
 
         except KeyboardInterrupt: pass
         finally: 
