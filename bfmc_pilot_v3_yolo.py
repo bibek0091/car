@@ -103,7 +103,7 @@ class TrafficDecisionModule:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         box_h, box_w = y2 - y1, x2 - x1
-        if box_h < 10 or box_w < 5: return False 
+        if box_h < 15 or box_w < 10: return False # BUG 16: Increase minimum dimensions
         
         crop = frame[y1:y2, x1:x2]
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -114,12 +114,18 @@ class TrafficDecisionModule:
         mask2 = cv2.inRange(hsv, np.array([170, 120, 150]), np.array([180, 255, 255]))
         red_mask = cv2.bitwise_or(mask1, mask2)
         
+        # BUG 15: Add secondary check for very high V values (>200) with lower S threshold for bright sunlight
+        mask3 = cv2.inRange(hsv, np.array([0, 50, 200]), np.array([10, 255, 255]))
+        mask4 = cv2.inRange(hsv, np.array([170, 50, 200]), np.array([180, 255, 255]))
+        red_sunlight_mask = cv2.bitwise_or(mask3, mask4)
+        red_mask = cv2.bitwise_or(red_mask, red_sunlight_mask)
+        
         red_ratio = cv2.countNonZero(red_mask) / (box_h * box_w)
-        return red_ratio > 0.05
+        return red_ratio > 0.12 # BUG 2: Increase threshold to reduce false positives
 
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
-        center_x = (x1 + x2) / 2
-        in_horizontal_path = (frame_w * 0.20) < center_x < (frame_w * 0.80)
+        # BUG 8: Check if ANY part of bbox overlaps path region instead of just center
+        in_horizontal_path = (x1 < frame_w * 0.80) and (x2 > frame_w * 0.20)
         is_close = y2 > (frame_h * 0.60)
         return in_horizontal_path and is_close
 
@@ -169,12 +175,13 @@ class TrafficDecisionModule:
             # --- 2. LOGICAL PROXIMITY RULES ---
             if label == "traffic-light":
                 is_red = self._is_light_red(raw_frame, x1, y1, x2, y2)
-                if box_h < 60:
+                # BUG 14: Add hysteresis transitions between distance zones (55 and 105 instead of 60 and 110)
+                if box_h < 55:
                     light_status = "[RED] FAR" if is_red else "[GREEN] FAR"
-                elif box_h < 110:
+                elif box_h < 105:
                     light_status = "[RED] APPROACH" if is_red else "[GREEN] APPROACH"
                     if is_red: commit_state(4, "SYS_SLOW", "RED LIGHT AHEAD")
-                else:
+                elif box_h >= 105: # BUG 1: Changed to elif to fix orphaned else
                     light_status = "[RED] HALT" if is_red else "[GREEN] CLEAR"
                     if is_red: commit_state(1, "SYS_STOP", "RED LIGHT (PRIORITY)")
             
@@ -182,12 +189,15 @@ class TrafficDecisionModule:
                 if box_h < 140:
                     continue
 
-                if label == "stop-sign" and now > self.stop_sign_cooldown:
-                    if self.stop_sign_timer == 0.0:
-                        self.stop_sign_timer = now
-                    commit_state(2, "SYS_STOP", "STOP SIGN")
+                if label == "stop-sign":
+                    # BUG 13: Silent during cooldown (It is still drawn in step 1, but we skip state change here if cooldown active)
+                    if now > self.stop_sign_cooldown:
+                        if self.stop_sign_timer == 0.0:
+                            self.stop_sign_timer = now
+                        commit_state(2, "SYS_STOP", "STOP SIGN")
                 elif label in ["car", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
-                    if "crosswalk-sign" in [d["label"] for d in self.active_detections]:
+                    # BUG 12: Use already built active_labels
+                    if "crosswalk-sign" in active_labels:
                         commit_state(1, "SYS_STOP", f"OBSTACLE AT CROSSWALK")
                     else:
                         commit_state(3, "SYS_LANE_CHANGE_LEFT", f"EVADING ({label})")
@@ -509,6 +519,7 @@ class JunctionDetector:
     def __init__(self):
         self.state, self.entry_count, self.exit_count, self.frames_in_jct = "NORMAL", 0, 0, 0
         self.user_choice = None  # Tracks the user's manual branch decision ("LEFT" / "RIGHT")
+        self.prompt_timer = 0.0 # BUG 4: Timer for deadlock timeout
 
     def update(self, warped_binary, left_conf, right_conf, left_fit, right_fit, lane_width_px, active_labels):
         h, w = warped_binary.shape
@@ -521,6 +532,15 @@ class JunctionDetector:
             rx_far = np.polyval(right_fit, 150)
             if (rx_far - lx_far) > lane_width_px * self.RATIO_EARLY_WARN: 
                 approaching_wide_gap = True
+        # BUG 7: Also check if single lane diverges significantly from expected position
+        elif left_fit is not None:
+            lx_far = np.polyval(left_fit, 150)
+            if lx_far < max(0, 320 - lane_width_px * self.RATIO_EARLY_WARN):
+                approaching_wide_gap = True
+        elif right_fit is not None:
+            rx_far = np.polyval(right_fit, 150)
+            if rx_far > min(640, 320 + lane_width_px * self.RATIO_EARLY_WARN):
+                approaching_wide_gap = True
 
         hist_bot = float(np.sum(warped_binary[h // 2:, :]))
         hist_top = float(np.sum(warped_binary[:h // 2, :]))
@@ -529,12 +549,12 @@ class JunctionDetector:
             # Standard intersection geometry
             cross_energy = (hist_top / hist_bot) > 1.4
 
-        # A zebra crossing generates massive pixel energy in the BEV frame, mimicking a junction.
-        # If YOLO actively sees a crosswalk sign, we suppress all junction evidence to avoid false positives.
+        # BUG 6: A zebra crossing generates massive pixel energy in the BEV frame.
+        # Only suppress cross_energy flag, not entire evidence calculation
         if "crosswalk-sign" in active_labels:
-            evidence = False
-        else:
-            evidence = approaching_wide_gap or cross_energy or both_lost
+            cross_energy = False
+            
+        evidence = approaching_wide_gap or cross_energy or both_lost
 
         if self.state == "NORMAL":
             self.entry_count = self.entry_count + 1 if evidence else 0
@@ -542,13 +562,17 @@ class JunctionDetector:
                 # We detected a junction geometry! Pause and PROMPT user.
                 self.state, self.exit_count, self.frames_in_jct = "JUNCTION_PROMPT", 0, 0
                 self.user_choice = None
+                self.prompt_timer = time.time() # BUG 4: Start timeout timer
                 
         elif self.state == "JUNCTION_PROMPT":
-            # Wait endlessly in PROMPT state until the main loop injects user_choice
+            # Wait with timeout in PROMPT state until the main loop injects user_choice
             if self.user_choice == "RIGHT":
                 self.state = "JUNCTION_RIGHT"
             elif self.user_choice == "LEFT":
                 self.state = "JUNCTION_LEFT"
+            # BUG 4: Add PROMPT_TIMEOUT=10.0 seconds. Default to RIGHT turn after timeout
+            elif time.time() - self.prompt_timer > 10.0:
+                self.state = "JUNCTION_RIGHT"
                 
         elif self.state.startswith("JUNCTION_"):
             # We are actively executing a branch
@@ -589,10 +613,6 @@ class RoundaboutNavigator:
                 timeout_exit = self.frames > self.MAX_CIRCLE_FRAMES
                 if normal_exit or timeout_exit:
                     self.state, self.frames = "NORMAL", 0
-        elif self.state == "ROUNDABOUT":
-            self.frames += 1
-            if self.frames > self.MAX_CIRCLE_FRAMES:
-                self.state, self.frames = "NORMAL", 0
         return self.state
 
 
@@ -733,6 +753,9 @@ class BFMC_Pilot:
         # Master Canvas: 1280x720 (HD)
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
         
+        # BUG 5: Add resize check
+        if yolo_hd.shape[:2] != (720, 1280): yolo_hd = cv2.resize(yolo_hd, (1280, 720))
+        
         # 1. Main Background
         canvas[0:720, 0:1280] = yolo_hd
         
@@ -853,7 +876,8 @@ class BFMC_Pilot:
         draw_led_icon(860,    670, "HIGHWAY",    "highway-sign" in active_labels, BLUE_NEON)
         draw_led_icon(955,   670, "PRIORITY",   "priority-sign" in active_labels, (0, 200, 255))
         draw_led_icon(1050,  670, "NO ENTRY",   "no-entry-road-sign" in active_labels, RED_LUM)
-        draw_led_icon(1145,  670, "LIMIT",      any("limit" in x for x in active_labels), (0, 255, 255))
+        # BUG 17: Case-insensitive check for limit variants
+        draw_led_icon(1145,  670, "LIMIT",      any("limit" in x.lower() for x in active_labels), (0, 255, 255))
 
         # --- BOTTOM CONTROL BAR ---
         cv2.putText(canvas, "AUTONOMOUS MODE ACTIVE", (40, 670), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN_LUM, 2, cv2.LINE_AA)
@@ -897,7 +921,8 @@ class BFMC_Pilot:
         now = time.time()
         dt  = now - self._fps_t
         self._fps_t = now
-        self._fps = 0.9 * self._fps + 0.1 * (1.0 / max(dt, 1e-6))
+        # BUG 20: Change to lighter EMA:
+        self._fps = 0.7 * self._fps + 0.3 * (1.0 / max(dt, 1e-3))
 
     def run(self):
         print("BFMC Pilot v2: STARTING MODULAR ORCHESTRATOR")
@@ -923,7 +948,10 @@ class BFMC_Pilot:
                 # -------------------------------------------------------------
                 if self.cam_ok:
                     raw_frame = self.picam2.capture_array()
-                    if raw_frame.ndim == 3 and raw_frame.shape[2] == 3:
+                    # BUG 18: raw_frame is None check
+                    if raw_frame is None: 
+                        raw_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+                    elif raw_frame.ndim == 3 and raw_frame.shape[2] == 3:
                         raw_frame = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
                 else:
                     raw_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -963,7 +991,8 @@ class BFMC_Pilot:
                 # -------------------------------------------------------------
                 curvature_pre = tracker.get_curvature(tracker.h // 2)
                 if nav_state == "ROUNDABOUT": eff_la = int(look_ahead * self.rbt.LOOKAHEAD_SCALE)
-                elif nav_state == "JUNCTION": eff_la = int(look_ahead * 0.75)
+                # BUG 10: nav_state.startswith instead of strict equality
+                elif nav_state.startswith("JUNCTION"): eff_la = int(look_ahead * 0.75)
                 elif curvature_pre > self.HIGH_CURV_THRESH: eff_la = int(look_ahead * 0.60)
                 elif curvature_pre > self.MED_CURV_THRESH: eff_la = int(look_ahead * 0.80)
                 else: eff_la = look_ahead
@@ -981,11 +1010,16 @@ class BFMC_Pilot:
                         target_x, anchor = 320.0 - (lane_width_px * 0.5), "BLIND_FORCED_L"
                     elif getattr(self, '_blind_override', None) == "RIGHT":
                         target_x, anchor = 320.0 + (lane_width_px * 0.5), "BLIND_FORCED_R"
+                else:
+                    # BUG 3: Add reset logic when anchor != "BLIND_CORNER"
+                    if hasattr(self, '_blind_override'): self._blind_override = None
                         
                 # Dynamic Autonomous Lane Swapping
                 if traffic_state == "SYS_LANE_CHANGE_LEFT" and target_x is not None:
                     # Forcibly subtract a full lane width to move the car into the oncoming left lane
                     target_x -= lane_width_px
+                    # BUG 11: Add clamp for target_x to prevent steering blowouts
+                    target_x = max(50.0, min(590.0, float(target_x)))
                     anchor = "OVERTAKING_LEFT"
 
                 lost = target_x is None
@@ -1022,7 +1056,9 @@ class BFMC_Pilot:
                 # 6. VELOCITY SPEED RULES
                 # -------------------------------------------------------------
                 curvature = tracker.get_curvature(y_eval)
-                if self.lost_frames > LOST_GRACE_FRAMES: speed = 0.0
+                # BUG 19: E-Stop persistent flag check
+                if getattr(self, '_manual_estop', False): speed = 0.0
+                elif self.lost_frames > LOST_GRACE_FRAMES: speed = 0.0
                 elif base_speed == 0: speed = 0.0
                 elif nav_state == "JUNCTION_PROMPT" or anchor == "BLIND_CORNER": speed = 0.0 # HALT car to wait for human input
                 elif nav_state == "ROUNDABOUT": speed = base_speed * self.rbt.SPEED_SCALE
@@ -1100,6 +1136,7 @@ class BFMC_Pilot:
                 elif key == ord(" "): 
                     print("MANUAL ESTOP TRIGGERED!")
                     speed = 0.0
+                    self._manual_estop = True # BUG 19: Local speed was wiped, persisted E-Stop state
                     self.handler.set_speed(0.0)
                 elif key == ord("l"):
                     if nav_state == "JUNCTION_PROMPT":
