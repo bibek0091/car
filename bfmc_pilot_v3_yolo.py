@@ -103,19 +103,20 @@ class TrafficDecisionModule:
         h, w = frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
-        box_h = y2 - y1
-        if box_h < 10 or (x2 - x1) < 5: return False 
+        box_h, box_w = y2 - y1, x2 - x1
+        if box_h < 10 or box_w < 5: return False 
+        
         crop = frame[y1:y2, x1:x2]
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        third = max(1, box_h // 3)
-        top_mean = np.mean(gray[:third, :])
-        bot_mean = np.mean(gray[-third:, :])
-        if top_mean > bot_mean + 10: return True
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv, np.array([0, 50, 50]), np.array([15, 255, 255]))
-        mask2 = cv2.inRange(hsv, np.array([160, 50, 50]), np.array([180, 255, 255]))
-        red_ratio = cv2.countNonZero(cv2.bitwise_or(mask1, mask2)) / (box_h * (x2 - x1))
-        return red_ratio > 0.02
+        
+        # Strictly look for GLOWING red (High Saturation & High Value/Brightness)
+        # If it's off (dark) or green, it will fail this mask completely.
+        mask1 = cv2.inRange(hsv, np.array([0, 120, 150]), np.array([10, 255, 255]))
+        mask2 = cv2.inRange(hsv, np.array([170, 120, 150]), np.array([180, 255, 255]))
+        red_mask = cv2.bitwise_or(mask1, mask2)
+        
+        red_ratio = cv2.countNonZero(red_mask) / (box_h * box_w)
+        return red_ratio > 0.05
 
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         center_x = (x1 + x2) / 2
@@ -136,6 +137,11 @@ class TrafficDecisionModule:
             label, (x1, y1, x2, y2), conf = det["label"], det["bbox"], det["confidence"]
             box_h = y2 - y1
             
+            # PROXIMITY CHECK: Approx 15cm distance means the sign takes up a
+            # massive portion of the 1280x720 HD frame.
+            if box_h < 140:
+                continue
+            
             color = (0, 255, 0)
             if label == "stop-sign": color = (0, 0, 255)
             elif label == "traffic-light": color = (0, 255, 255)
@@ -144,13 +150,13 @@ class TrafficDecisionModule:
             cv2.rectangle(yolo_dbg, (x1, y1), (x2, y2), color, 2)
             cv2.putText(yolo_dbg, f"{label} {conf:.2f}", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-            if label == "traffic-light" and box_h > 25 and self._is_light_red(raw_frame, x1, y1, x2, y2):
+            if label == "traffic-light" and self._is_light_red(raw_frame, x1, y1, x2, y2):
                 sees_red_light = True
-            elif label == "stop-sign" and box_h > 55 and now > self.stop_sign_cooldown:
+            elif label == "stop-sign" and now > self.stop_sign_cooldown:
                 sees_close_stop_sign = True
-            elif label in ["car", "pedestrian", "closed-road-stand", "no-entry-road-sign"] and box_h > 50 and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
+            elif label in ["car", "pedestrian", "closed-road-stand", "no-entry-road-sign"] and self._is_obstacle_in_path(x1, y1, x2, y2, w, h):
                 obstacle_in_path, self.reason = True, f"OBSTACLE ({label})"
-            elif label == "crosswalk-sign" and box_h > 40:
+            elif label == "crosswalk-sign":
                 sees_crosswalk = True
                 
         if sees_red_light:
