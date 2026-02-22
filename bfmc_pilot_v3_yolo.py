@@ -71,8 +71,8 @@ DST_PTS = np.float32([[150,   0], [490,   0], [150, 480], [490, 480]])
 # ===========================================================================
 # RIGHT-LANE OFFSET (Aggressive Hugging)
 # ===========================================================================
-# Increased from 70 to 110 to force the car onto the far right edge of the lane
-RIGHT_LANE_OFFSET_PX = 110
+# Increased to 140 to brutally force the car onto the far right edge of the lane
+RIGHT_LANE_OFFSET_PX = 140
 DUAL_OFFSET_PX       = 0
 SINGLE_DIV_OFFSET_PX = 40
 SINGLE_EDGE_OFFSET_PX = -40
@@ -317,18 +317,23 @@ class HybridLaneTracker:
                 
             return base_x + extra_offset_px, anchor_type
 
-        if sl is not None and sr is not None:
-            return (ev(sl) + ev(sr)) / 2.0 + DUAL_OFFSET_PX, "DUAL"
-
-        if sr is not None and sl is None:
-            ghost_sl = sr - np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(ghost_sl) + ev(sr)) / 2.0 + SINGLE_EDGE_OFFSET_PX, "GHOST_L"
-
+        # ---------------------------------------------------------
+        # BRUTE FORCE RIGHT PRIORITY (NORMAL DRIVING)
+        # ---------------------------------------------------------
+        # If the right line is visible AT ALL, lock onto it and hug its edge.
+        # Ignore the left line entirely to prevent centering drift.
+        if sr is not None:
+            # Anchor strictly off the right line, offset inwards just enough to stay on track (e.g., 20 pixels)
+            return ev(sr) - 20.0 + extra_offset_px, "HUGGING_RIGHT"
+            
+        # If right line is totally lost but left is visible, project a ghost right line
         if sl is not None and sr is None:
             ghost_sr = sl + np.array([0.0, 0.0, float(lane_width_px)])
-            return (ev(sl) + ev(ghost_sr)) / 2.0 + SINGLE_DIV_OFFSET_PX, "GHOST_R"
+            return ev(ghost_sr) - 20.0 + extra_offset_px, "GHOSTING_RIGHT"
 
-        return None, "LOST"
+        # Complete loss
+        # Default back to far right side of screen
+        return 320.0 + RIGHT_LANE_OFFSET_PX, "LOST"
 
     def get_curvature(self, y_eval):
         fit = self.sr if self.sr is not None else self.sl
@@ -531,24 +536,34 @@ class DividerGuard:
     DEADBAND_PX     = 5
 
     def apply(self, steer_angle, left_fit, right_fit, y_eval=440, car_x=320):
+        # We want the car on the right, so we heavily penalize drifting left
+        # and almost disable penalizing drifting right (unless touching the grass)
         correction, speed_scale, triggered = 0.0, 1.0, False
         div_corr = 0.0
+        
+        # Left Divider (Center line) - Strong repulsion to keep car right
         if left_fit is not None:
             div_x = float(np.polyval(left_fit, y_eval))
-            gap   = car_x - div_x
-            if gap < self.DIVIDER_SAFE_PX - self.DEADBAND_PX:
-                err = float(self.DIVIDER_SAFE_PX - gap)
-                div_corr = min(self.GAIN * err, self.MAX_CORR)
+            # Increased safe distance from center divider to push car further right
+            safe_dist = self.DIVIDER_SAFE_PX + 40 
+            gap = car_x - div_x
+            if gap < safe_dist - self.DEADBAND_PX:
+                err = float(safe_dist - gap)
+                # Double the gain to violently push away from the center
+                div_corr = min((self.GAIN * 2.0) * err, self.MAX_CORR * 1.5)
                 speed_scale = min(speed_scale, max(0.5, 1.0 - err / 120.0))
                 triggered   = True
 
+        # Right Edge - Weak repulsion (we want to hug it)
         edge_corr = 0.0
         if right_fit is not None:
             edge_x = float(np.polyval(right_fit, y_eval))
             gap    = edge_x - car_x
-            if gap < self.EDGE_SAFE_PX - self.DEADBAND_PX:
-                err = float(self.EDGE_SAFE_PX - gap)
-                edge_corr = min(self.GAIN * err, self.MAX_CORR)
+            # Very small safe distance so it can get extremely close to the edge
+            safe_dist = max(10, self.EDGE_SAFE_PX - 30)
+            if gap < safe_dist - self.DEADBAND_PX:
+                err = float(safe_dist - gap)
+                edge_corr = min(self.GAIN * err, self.MAX_CORR * 0.5)
                 speed_scale = min(speed_scale, max(0.5, 1.0 - err / 120.0))
                 triggered   = True
 
@@ -581,8 +596,10 @@ class BFMC_Pilot:
     MED_CURV_SCALE   = 0.80
     DUAL_SPEED_SCALE = 1.15
 
-    def __init__(self, sim_mode=False):
+    def __init__(self, sim_mode=False, dashboard=None):
         self.sim_mode = sim_mode
+        self.dashboard = dashboard
+        self.running = True
         self.handler   = STM32_SerialHandler()
         self.connected = False if sim_mode else self.handler.connect()
 
@@ -738,7 +755,7 @@ class BFMC_Pilot:
         startup_time = time.time()
         sim_batt_pct = 99.9  # Fake battery to look cool
         try:
-            while True:
+            while self.running:
                 t_frame_start = time.time()
 
                 look_ahead    = cv2.getTrackbarPos("Look Ahead",    "BFMC_MASTER_VIEW")
@@ -887,22 +904,46 @@ class BFMC_Pilot:
                 # Drain the fake battery slowly over time
                 sim_batt_pct = max(0.0, sim_batt_pct - 0.005)
 
-                # Render the luxurious Tesla UI Dashboard
-                dashboard_ui = self._render_dashboard(
-                    yolo_dbg, lane_dbg, speed, steer_angle, 
-                    traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
-                    light_status, nav_state, anchor, sim_batt_pct
-                )
-                
-                cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("BFMC_MASTER_VIEW", dashboard_ui)
+                if hasattr(self, 'dashboard') and self.dashboard is not None:
+                    self.dashboard.push_frame(yolo_dbg)
+                    self.dashboard.push_radar(lane_dbg)
+                    self.dashboard.push_telemetry({
+                        'speed': speed,
+                        'steering': steer_angle,
+                        'battery': sim_batt_pct,
+                        'lat': 46.7712 + (time.time() * 0.00001) % 0.001,
+                        'lon': 23.6236 + (time.time() * 0.00001) % 0.001,
+                        'pitch': 0.0,
+                        'roll': 0.0,
+                        'yaw': steer_angle,
+                        'traffic': traffic_state,
+                        'nav': nav_state,
+                        'light': light_status,
+                        'reason': self.traffic_module.reason if self.traffic_module else "CLEAR",
+                        'anchor': anchor
+                    })
+                    elapsed = time.time() - t_frame_start
+                    wait_time = max(0.001, FRAME_PERIOD - elapsed)
+                    time.sleep(wait_time)
+                else:                 
+                    # Render the luxurious Tesla UI Dashboard natively via OpenCV fallback
+                    dashboard_ui = self._render_dashboard(
+                        yolo_dbg, lane_dbg, speed, steer_angle, 
+                        traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
+                        light_status, nav_state, anchor, sim_batt_pct
+                    )
+                    
+                    cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.imshow("BFMC_MASTER_VIEW", dashboard_ui)
 
-                elapsed = time.time() - t_frame_start
-                wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
-                if cv2.waitKey(wait_ms) == ord("q"): break
+                    elapsed = time.time() - t_frame_start
+                    wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
+                    if cv2.waitKey(wait_ms) == ord("q"): break
 
         except KeyboardInterrupt: pass
-        finally: self.stop()
+        finally: 
+            self.running = False
+            self.stop()
 
     def stop(self):
         if self.connected:
@@ -917,5 +958,31 @@ class BFMC_Pilot:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BFMC Modular Traffic & Lane Pilot")
     parser.add_argument("--sim", action="store_true", help="Simulation mode")
+    parser.add_argument("--noui", action="store_true", help="Run without PyQt5 dashboard")
     args = parser.parse_args()
-    BFMC_Pilot(sim_mode=args.sim).run()
+    
+    if args.noui:
+        BFMC_Pilot(sim_mode=args.sim).run()
+    else:
+        try:
+            from bfmc_dashboard import BFMCDashboard
+            from PyQt5.QtWidgets import QApplication
+            import sys
+            import threading
+            
+            app = QApplication(sys.argv)
+            dash = BFMCDashboard()
+            
+            pilot = BFMC_Pilot(sim_mode=args.sim, dashboard=dash)
+            
+            # Start pilot in background thread
+            pilot_thread = threading.Thread(target=pilot.run, daemon=True)
+            pilot_thread.start()
+            
+            # Show dashboard and run Qt event loop
+            dash.show()
+            sys.exit(app.exec_())
+            
+        except ImportError as e:
+            print(f"Warning: PyQt5 or Dashboard not available ({e}). Running in headless/legacy OpenCV UI mode.")
+            BFMC_Pilot(sim_mode=args.sim).run()
