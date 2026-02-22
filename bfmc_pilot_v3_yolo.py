@@ -137,7 +137,8 @@ class ThreadedYOLODetector:
                 # Obstacles are mostly below horizon
                 roi_frame = frame.copy()
                 
-                detections = self.detector.detect_traffic_signals(roi_frame, conf_threshold=0.4)
+                # LOWERED: 0.25 confidence to ensure we never miss faint LEDs
+                detections = self.detector.detect_traffic_signals(roi_frame, conf_threshold=0.25)
                 
                 if not self.result_queue.full():
                     self.result_queue.put(detections)
@@ -274,12 +275,10 @@ class TrafficDecisionModule:
                 is_red = self._is_light_red(label)
                 is_green = self._is_light_green(label)
                 
-                # We still need to calculate distance (bounding box height) to know
-                # if we are far away, approaching, or at the stop line.
-                distance_cat = "UNKNOWN"
-                if box_h < 15: distance_cat = "FAR"
-                elif box_h < 25: distance_cat = "APPROACH"
-                elif box_h >= 25: distance_cat = "HALT"
+                # We bypass height thresholds entirely for the custom YOLO model!
+                # Since the model only draws a box around the tiny LED bulb itself,
+                # the height (box_h) will always be tiny (10-20px). If we see Red anywhere, we MUST HALT.
+                distance_cat = "HALT"
                 
                 current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
                 
