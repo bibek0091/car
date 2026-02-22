@@ -31,6 +31,7 @@ class PreTrainedYoloDetector:
         
         print(f"Loading Specialized LED Classifier '{led_model}'...")
         self.led_model = YOLO(led_model)
+        print(f"LED Model class names: {self.led_model.names}")
 
     def detect_traffic_signals(self, frame_bgr, conf_threshold=0.3):
         # 1. RUN GLOBAL SCAN (Finds signs, cars, and the base structure of the traffic light)
@@ -234,12 +235,16 @@ class TrafficDecisionModule:
         return glow_ratio > 0.05
 
     def _is_light_red(self, label):
-        """ Checks if YOLO explicitly classified the traffic light as RED """
-        return label == "traffic red"
+        l = label.lower()
+        return "red" in l
 
     def _is_light_green(self, label):
-        """ Checks if YOLO explicitly classified the traffic light as GREEN """
-        return label == "green"
+        l = label.lower()
+        return "green" in l
+
+    def _is_light_yellow(self, label):
+        l = label.lower()
+        return "yellow" in l or "orange" in l
 
     def _is_obstacle_in_path(self, x1, y1, x2, y2, frame_w, frame_h):
         # BUG 8: Check if ANY part of bbox overlaps path region instead of just center
@@ -293,7 +298,7 @@ class TrafficDecisionModule:
             # --- 1. ALWAYS DRAW DETECTIONS ---
             color = (0, 255, 0)
             if label in ["stop-sign", "no-entry-road-sign"]: color = (0, 0, 255)
-            elif label in ["traffic red", "green", "yellow"]: color = (0, 255, 255)
+            elif any(c in label.lower() for c in ["red", "green", "yellow", "traffic"]): color = (0, 255, 255)
             elif label in ["car", "pedestrian", "closed-road-stand"]: color = (255, 0, 255)
             elif "speed-limit" in label: color = (255, 255, 0)
             elif label in ["crosswalk-sign", "parking-sign", "highway-sign", "priority-sign"]: color = (255, 128, 0)
@@ -302,7 +307,8 @@ class TrafficDecisionModule:
             cv2.putText(yolo_dbg, f"{label} {conf:.2f} [{box_h}px]", (x1, max(20, y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
 
             # --- 2. LOGICAL PROXIMITY RULES ---
-            if label in ["traffic red", "green", "yellow"]:
+            label_lower = label.lower()
+            if any(c in label_lower for c in ["red", "green", "yellow", "orange", "traffic"]):
                 # The YOLO Custom Model natively handles color classification now.
                 is_red = self._is_light_red(label)
                 is_green = self._is_light_green(label)
@@ -316,6 +322,7 @@ class TrafficDecisionModule:
                 elif box_h >= 70: distance_cat = "HALT"
                 
                 current_tl_state = self.tl_fsm.update(is_red, is_green, distance_cat)
+                print(f"TL DETECTION: label='{label}' is_red={is_red} is_green={is_green} dist={distance_cat} fsm={current_tl_state}")
                 
                 # React based on state machine
                 if current_tl_state == "LIGHT_APPROACHING":
@@ -1328,164 +1335,147 @@ class BFMC_Pilot:
     # -------------------------------------------------------------
     def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct, active_labels, topology):
         canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
-        if yolo_hd.shape[:2] != (720, 1280): yolo_hd = cv2.resize(yolo_hd, (1280, 720))
         
-        # Color Palette
-        BG_COLOR   = (24, 18, 18)   # (18, 18, 24) in BGR
-        ACCENT_PRI = (0, 180, 255)  # Electric Blue (255, 180, 0) in BGR
-        ACCENT_SEC = (0, 220, 200)  # Teal (200, 220, 0) in BGR
-        SUCCESS_G  = (80, 220, 80)
-        ALERT_R    = (60, 60, 220)
-        WARN_O     = (30, 160, 255)
-        TEXT_PRI   = (245, 245, 245)
-        TEXT_MUT   = (130, 120, 120)
-        DIVIDER    = (55, 45, 45)
+        BG_DEEP    = (20, 14, 14)
+        GRAD_TOP   = (32, 22, 22)
+        GRAD_BOT   = (16, 10, 10)
+        ACCENT_PRI = (20, 160, 220)
+        CYAN_TEAL  = (20, 210, 200)
+        SUCCESS_G  = (70, 210, 70)
+        ALERT_R    = (210, 50, 50)
+        WARN_O     = (255, 140, 20)
+        TEXT_PRI   = (245, 240, 240)
+        TEXT_MUT   = (125, 110, 110)
+        DIVIDER    = (55, 40, 40)
+        CARD_BG    = (40, 28, 28)
         
-        # 1. Main Left Camera Feed
-        canvas[0:720, 0:820] = yolo_hd[0:720, 230:1050] # Center crop wide view
+        cam_h, cam_w = yolo_hd.shape[:2]
+        canvas[0:645, 0:800] = cv2.resize(yolo_hd, (800, 645))
         
-        # 2. Right Telemetry Panel (True Dark Gradient)
         for y in range(720):
-            # Gradient goes from (30, 25, 25) down to (15, 12, 12)
-            shade = max(10, 30 - int((y / 720.0) * 20))
-            cv2.line(canvas, (820, y), (1280, y), (shade+2, shade, shade), 1)
-            
-        # Top 3px Electric Blue accent bar
-        cv2.rectangle(canvas, (820, 0), (1280, 3), ACCENT_PRI, -1)
-        
-        # Panel Title
-        cv2.putText(canvas, "AUTONOMY CORE", (850, 45), cv2.FONT_HERSHEY_DUPLEX, 0.9, TEXT_PRI, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "BFMC ORCHESTRATOR v3", (850, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.line(canvas, (850, 85), (1250, 85), DIVIDER, 1)
-        
-        # --- SPEED GAUGE ---
-        cv2.putText(canvas, "CHASSIS SPEED", (850, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        
-        center = (1050, 200)
-        radius = 70
-        # Draw unfilled background arc (dark grey)
-        cv2.ellipse(canvas, center, (radius, radius), 135, 0, 270, (40, 40, 40), 8, cv2.LINE_AA)
-        
-        # Draw filled speed arc
-        spd_ratio = min(1.0, abs(speed) / 150.0)
-        end_angle = int(270 * spd_ratio)
-        if end_angle > 0:
-            cv2.ellipse(canvas, center, (radius, radius), 135, 0, end_angle, ACCENT_PRI, 8, cv2.LINE_AA)
-            
-        # Speed Text inside gauge
-        spd_str = f"{int(abs(speed))}"
-        tsize = cv2.getTextSize(spd_str, cv2.FONT_HERSHEY_DUPLEX, 2.5, 3)[0]
-        cv2.putText(canvas, spd_str, (1050 - tsize[0]//2, 215), cv2.FONT_HERSHEY_DUPLEX, 2.5, TEXT_PRI, 3, cv2.LINE_AA)
-        cv2.putText(canvas, "cm/s", (1030, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        
-        cv2.line(canvas, (850, 310), (1250, 310), DIVIDER, 1)
+            b = int(GRAD_TOP[0] + (GRAD_BOT[0] - GRAD_TOP[0]) * (y / 720.0))
+            g = int(GRAD_TOP[1] + (GRAD_BOT[1] - GRAD_TOP[1]) * (y / 720.0))
+            r = int(GRAD_TOP[2] + (GRAD_BOT[2] - GRAD_TOP[2]) * (y / 720.0))
+            cv2.line(canvas, (800, y), (1280, y), (b, g, r), 1)
 
-        # --- STEERING BAR ---
-        cv2.putText(canvas, "STEERING APEX", (850, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (1150, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_PRI, 1, cv2.LINE_AA)
+        cv2.line(canvas, (798, 0), (798, 645), (60, 45, 45), 2)
         
-        bar_y = 370
-        cv2.line(canvas, (850, bar_y), (1250, bar_y), (40, 40, 40), 4) # Base bar
-        cv2.circle(canvas, (1050, bar_y), 5, TEXT_PRI, -1) # Center notch
-        
-        s_col = ACCENT_SEC if abs(steer_angle) <= 10 else (WARN_O if abs(steer_angle) <= 25 else ALERT_R)
-        s_px = int((steer_angle / 30.0) * 200)
-        if steer_angle > 0:
-            cv2.line(canvas, (1050, bar_y), (1050 + s_px, bar_y), s_col, 6)
-        else:
-            cv2.line(canvas, (1050 + s_px, bar_y), (1050, bar_y), s_col, 6)
+        def draw_card(pt1, pt2, color, thickness=-1):
+            r = 8
+            x1, y1 = pt1
+            x2, y2 = pt2
+            if thickness < 0:
+                cv2.rectangle(canvas, (x1+r, y1), (x2-r, y2), color, -1)
+                cv2.rectangle(canvas, (x1, y1+r), (x2, y2-r), color, -1)
+                cv2.circle(canvas, (x1+r, y1+r), r, color, -1)
+                cv2.circle(canvas, (x2-r, y1+r), r, color, -1)
+                cv2.circle(canvas, (x1+r, y2-r), r, color, -1)
+                cv2.circle(canvas, (x2-r, y2-r), r, color, -1)
+            else:
+                cv2.line(canvas, (x1+r, y1), (x2-r, y1), color, thickness)
+                cv2.line(canvas, (x1+r, y2), (x2-r, y2), color, thickness)
+                cv2.line(canvas, (x1, y1+r), (x1, y2-r), color, thickness)
+                cv2.line(canvas, (x2, y1+r), (x2, y2-r), color, thickness)
 
-        cv2.line(canvas, (850, 410), (1250, 410), DIVIDER, 1)
-        
-        # --- PILL TAGS FUNCTION ---
-        def draw_pill(img, x, y, text, color, text_color=TEXT_PRI):
-            tsize = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            w, h = tsize[0] + 30, 28
-            r = h // 2
-            cv2.circle(img, (x + r, y + r), r, color, -1, cv2.LINE_AA)
-            cv2.circle(img, (x + w - r, y + r), r, color, -1, cv2.LINE_AA)
-            cv2.rectangle(img, (x + r, y), (x + w - r, y + h), color, -1)
-            cv2.putText(img, text, (x + 15, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2, cv2.LINE_AA)
-            return w
-            
-        # --- COMMAND STATES ---
-        cv2.putText(canvas, "TRAFFIC COMMAND", (850, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        t_col = SUCCESS_G if traffic_state == "SYS_GO" else (ALERT_R if traffic_state == "SYS_STOP" else WARN_O)
-        draw_pill(canvas, 850, 455, traffic_state.replace("SYS_",""), t_col, BG_COLOR)
-        
-        cv2.putText(canvas, "NAVIGATION MODE", (850, 520), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        nav_icon = "RBT" if nav_state == "ROUNDABOUT" else ("JCT" if "JUNCTION" in nav_state else "FWD")
-        n_col = ACCENT_SEC if nav_state == "NORMAL" else WARN_O
-        n_text = f"{nav_icon} | {nav_state}"
-        draw_pill(canvas, 850, 535, n_text, n_col, BG_COLOR)
-        
-        # --- BATTERY SEGMENTS ---
-        cv2.putText(canvas, "ENERGY RESERVE", (1110, 440), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        bx, by = 1110, 460
-        segments = 10
-        filled = int((batt_pct / 100.0) * segments)
-        b_col = SUCCESS_G if filled > 3 else (WARN_O if filled > 1 else ALERT_R)
-        for i in range(segments):
-            c = b_col if i < filled else (40, 40, 40)
-            cv2.rectangle(canvas, (bx + i*13, by), (bx + i*13 + 10, by + 18), c, -1)
-        cv2.putText(canvas, f"{batt_pct:.1f}%", (1150, 495), cv2.FONT_HERSHEY_SIMPLEX, 0.5, b_col, 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (800, 0), (1280, 3), ACCENT_PRI, -1)
+        cv2.putText(canvas, "AUTONOMY CORE", (815, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, ACCENT_PRI, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "BFMC ORCHESTRATOR v3.0", (815, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.42, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "LAT 46.7712  LON 23.6236", (815, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.line(canvas, (815, 95), (1265, 95), DIVIDER, 1)
 
-        # --- ACTIVE DETECTIONS ---
-        cv2.putText(canvas, "DETECTED SIGNALS", (850, 600), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        lx, ly = 850, 615
-        for lbl in active_labels[:4]: # Show max 4 to not bleed off edge
-            lbl_strip = lbl.replace("-sign", "").replace("-road", "").upper()
-            w = draw_pill(canvas, lx, ly, lbl_strip, (60, 60, 60), TEXT_PRI)
-            lx += w + 10
-            
-        # 3. BOTTOM HUD BAR
-        cv2.rectangle(canvas, (0, 640), (1280, 720), BG_COLOR, -1)
-        cv2.line(canvas, (0, 640), (1280, 640), ACCENT_PRI, 2)
-        
-        cv2.putText(canvas, f"FPS: {int(getattr(self, '_fps', 0))}", (30, 680), cv2.FONT_HERSHEY_DUPLEX, 0.7, TEXT_PRI, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "SYSTEM MODE: AUTO", (140, 680), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ACCENT_SEC, 1, cv2.LINE_AA)
-        
-        # E-STOP Button
-        cv2.rectangle(canvas, (540, 655), (740, 705), ALERT_R, -1)
-        cv2.putText(canvas, "E-STOP [SPACE]", (570, 685), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 2, cv2.LINE_AA)
-        
-        cv2.putText(canvas, f"TOPO: {topology}", (850, 675), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"ANCHOR: {anchor}", (850, 695), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        cy = 110
+        draw_card((815, cy), (1265, cy+85), CARD_BG, -1)
+        tcol = ALERT_R if traffic_state == "SYS_STOP" else SUCCESS_G if traffic_state == "SYS_GO" else WARN_O if traffic_state == "SYS_SLOW" else CYAN_TEAL
+        cv2.putText(canvas, "TRAFFIC STATE", (830, cy+25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, traffic_state.replace("SYS_", ""), (830, cy+60), cv2.FONT_HERSHEY_SIMPLEX, 1.4, tcol, 2, cv2.LINE_AA)
+        cv2.putText(canvas, traffic_reason, (830, cy+78), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
+        draw_card((815, cy), (1265, cy+85), tcol, 2)
 
-        # 4. BEV RADAR WINDOW (Bottom Left)
-        rw, rh = 300, 220
-        rx, ry = 20, 400
-        # Bezel and background
-        cv2.rectangle(canvas, (rx-2, ry-2), (rx+rw+2, ry+rh+2), BG_COLOR, -1)
-        cv2.rectangle(canvas, (rx-2, ry-2), (rx+rw+2, ry+rh+2), ACCENT_PRI, 2)
+        cv2.putText(canvas, "VELOCITY", (815, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
+        center = (1040, 260)
+        radius = 50
+        cv2.ellipse(canvas, center, (radius, radius), 180, 210, 330, (55, 40, 40), 8, cv2.LINE_AA)
+        spd_r = min(1.0, abs(speed) / 150.0)
+        f_ang = 210 + int((330 - 210) * spd_r)
+        if f_ang > 210:
+            cv2.ellipse(canvas, center, (radius, radius), 180, 210, f_ang, ACCENT_PRI, 8, cv2.LINE_AA)
+        cv2.putText(canvas, f"{int(abs(speed))}", (1015, 275), cv2.FONT_HERSHEY_SIMPLEX, 1.8, TEXT_PRI, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "cm/s", (1022, 295), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
+
+        sty = 325
+        cv2.putText(canvas, "STEERING", (815, sty), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (815, sty+10), (1265, sty+24), CARD_BG, -1)
+        cv2.line(canvas, (1040, sty+10), (1040, sty+24), TEXT_PRI, 2)
+        scol = CYAN_TEAL if abs(steer_angle) <= 10 else WARN_O if abs(steer_angle) <= 25 else ALERT_R
+        spx = int((steer_angle / 45.0) * 225)
+        if steer_angle > 0: cv2.rectangle(canvas, (1040, sty+10), (1040+spx, sty+24), scol, -1)
+        else: cv2.rectangle(canvas, (1040+spx, sty+10), (1040, sty+24), scol, -1)
+        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (1190, sty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_PRI, 1, cv2.LINE_AA)
+
+        ny = 370
+        draw_card((815, ny), (1035, ny+45), CARD_BG, -1)
+        draw_card((1045, ny), (1265, ny+45), CARD_BG, -1)
+        cv2.putText(canvas, "NAV MODE", (825, ny+18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
+        n_icon = "RBT" if nav_state == "ROUNDABOUT" else "JCT" if "JUNCTION" in nav_state else "FWD"
+        cv2.putText(canvas, n_icon, (825, ny+38), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "TOPOLOGY", (1055, ny+18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, topology, (1055, ny+38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, CYAN_TEAL, 1, cv2.LINE_AA)
+
+        dy = 435
+        cv2.putText(canvas, "ACTIVE DETECTIONS", (815, dy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
+        tx, ty = 815, dy + 15
+        for lbl in active_labels:
+            strip = lbl.replace("-sign", "").upper()
+            w = cv2.getTextSize(strip, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] + 20
+            if tx + w > 1265:
+                tx, ty = 815, ty + 28
+                if ty > dy + 65: break
+            draw_card((tx, ty), (tx+w, ty+24), CARD_BG, -1)
+            ecol = ALERT_R if any(x in strip for x in ["STOP","NO-ENTRY","RED"]) else SUCCESS_G if any(x in strip for x in ["CROSSWALK","PRIORITY","GREEN"]) else WARN_O if any(x in strip for x in ["PEDESTRIAN", "YELLOW", "ORANGE"]) else ACCENT_PRI
+            cv2.rectangle(canvas, (tx, ty+4), (tx+3, ty+20), ecol, -1)
+            cv2.putText(canvas, strip, (tx+10, ty+17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_PRI, 1, cv2.LINE_AA)
+            tx += w + 8
+
+        by = 535
+        cv2.putText(canvas, "ENERGY", (815, by), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
+        f = int((batt_pct / 100.0) * 10)
+        bc = SUCCESS_G if batt_pct >= 60 else WARN_O if batt_pct >= 30 else ALERT_R
+        for i in range(10): cv2.rectangle(canvas, (815 + i*16, by+12), (815 + i*16 + 12, by+28), bc if i < f else DIVIDER, -1)
+        cv2.putText(canvas, f"{batt_pct:.1f}%", (990, by+25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, bc, 2, cv2.LINE_AA)
+
+        cv2.rectangle(canvas, (0, 645), (1280, 720), (18, 12, 12), -1)
+        cv2.line(canvas, (0, 645), (1280, 645), ACCENT_PRI, 2)
+        cv2.putText(canvas, "FPS", (30, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{int(getattr(self, '_fps', 0))}", (70, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ACCENT_PRI, 2, cv2.LINE_AA)
+        smod = "E-STOPPED" if getattr(self, '_manual_estop', False) else "AUTO"
+        cv2.putText(canvas, smod, (150, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ALERT_R if smod=="E-STOPPED" else SUCCESS_G, 2, cv2.LINE_AA)
         
-        # Tech Label Tab
-        cv2.rectangle(canvas, (rx-2, ry-25), (rx+120, ry-2), ACCENT_PRI, -1)
-        cv2.putText(canvas, "BEV RADAR", (rx+10, ry-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, BG_COLOR, 2, cv2.LINE_AA)
+        cv2.rectangle(canvas, (560, 660), (720, 705), ALERT_R, -1)
+        cv2.rectangle(canvas, (560, 660), (720, 705), (255, 120, 120), 2)
+        cv2.putText(canvas, "E-STOP [SPACE]", (572, 688), cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_PRI, 2, cv2.LINE_AA)
         
-        radar = cv2.resize(lane_dbg, (rw, rh))
-        canvas[ry:ry+rh, rx:rx+rw] = radar
-        
-        # 5. JUNCTION / BLIND MODAL (Center Screen Override)
-        if nav_state == "JUNCTION_PROMPT" or anchor == "BLIND_CORNER":
-            # Dark semi-transparent background panel
-            modal_overlay = canvas.copy()
-            cv2.rectangle(modal_overlay, (240, 180), (680, 360), BG_COLOR, -1)
-            cv2.addWeighted(modal_overlay, 0.85, canvas, 0.15, 0, canvas)
-            
-            # Electric blue top border bar
-            cv2.rectangle(canvas, (240, 180), (680, 185), ACCENT_PRI, -1)
-            
-            m_title = "JUNCTION DETECTED" if nav_state == "JUNCTION_PROMPT" else "BLIND CORNER"
-            cv2.putText(canvas, m_title, (280, 230), cv2.FONT_HERSHEY_DUPLEX, 1.0, TEXT_PRI, 2, cv2.LINE_AA)
-            cv2.putText(canvas, "AWAITING HUMAN DECISION...", (280, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-            
-            # Two option buttons
-            cv2.rectangle(canvas, (280, 290), (440, 330), ACCENT_SEC, 2)
-            cv2.putText(canvas, "[L] LEFT", (315, 316), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ACCENT_SEC, 2, cv2.LINE_AA)
-            
-            cv2.rectangle(canvas, (460, 290), (620, 330), WARN_O, 2)
-            cv2.putText(canvas, "[R] RIGHT", (490, 316), cv2.FONT_HERSHEY_SIMPLEX, 0.7, WARN_O, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"ANCHOR: {anchor}", (850, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"TOPO: {topology}", (1050, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN_TEAL, 1, cv2.LINE_AA)
+
+        rx, ry = 20, 395
+        cv2.rectangle(canvas, (rx-8, ry-25), (rx+328, ry+238), BG_DEEP, -1)
+        cv2.rectangle(canvas, (rx-2, ry-2), (rx+322, ry+232), ACCENT_PRI, 2)
+        cv2.rectangle(canvas, (rx-2, ry-22), (rx+85, ry-2), ACCENT_PRI, -1)
+        cv2.putText(canvas, "BEV RADAR", (rx+5, ry-7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1, cv2.LINE_AA)
+        canvas[ry:ry+230, rx:rx+320] = cv2.resize(lane_dbg, (320, 230))
+
+        if nav_state == "JUNCTION_PROMPT" or "BLIND" in anchor:
+            mbg = canvas.copy()
+            cv2.rectangle(mbg, (150, 212), (650, 432), BG_DEEP, -1)
+            cv2.addWeighted(mbg, 0.85, canvas, 0.15, 0, canvas)
+            cv2.rectangle(canvas, (150, 212), (650, 215), ACCENT_PRI, -1)
+            tit = "JUNCTION DETECTED" if nav_state == "JUNCTION_PROMPT" else "BLIND CORNER"
+            cv2.putText(canvas, tit, (230, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ACCENT_PRI, 2, cv2.LINE_AA)
+            cv2.putText(canvas, "AWAITING HUMAN DECISION...", (230, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
+            cv2.rectangle(canvas, (230, 330), (380, 380), CYAN_TEAL, -1)
+            cv2.putText(canvas, "[L] LEFT", (270, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 2, cv2.LINE_AA)
+            cv2.rectangle(canvas, (400, 330), (550, 380), WARN_O, -1)
+            cv2.putText(canvas, "[R] RIGHT", (440, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 2, cv2.LINE_AA)
 
         return canvas
 
