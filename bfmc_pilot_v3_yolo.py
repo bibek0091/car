@@ -297,18 +297,25 @@ class HybridLaneTracker:
             return None, "RBT_LOST"
 
         if nav_state == "JUNCTION":
-            # STRICT RIGHT PRIORITY: Always hunt the right edge first.
-            if sr is not None:
-                # Car anchors off the right line, offset inwards by half lane width
-                return ev(sr) - hw + extra_offset_px, "JCT_RIGHT_EDGE"
-            if sl is not None:
-                # If right is lost but left divider exists, project a massive ghost lane
-                # completely across the intersection to force the car to the right lane
-                ghost_right = sl + np.array([0.0, 0.0, float(lane_width_px)])
-                return ev(ghost_right) - hw + extra_offset_px, "JCT_DIV_GHOST_R"
+            # BRUTE FORCE RIGHT PRIORITY: Always aim for the far right edge of the screen
+            # Ignore the "ideal" lane center and force a heavy right-side anchor
             
-            # If both lines are lost in the intersection void, just dead-reckon straight
-            return 320.0 + RIGHT_LANE_OFFSET_PX, "JCT_BLIND"
+            # Base target: the center of the screen
+            base_x = 320.0
+            
+            if sr is not None:
+                # If we see the right edge, hug it aggressively (closer than normal)
+                base_x = ev(sr) - (hw * 0.5) 
+                anchor_type = "JCT_RIGHT_HUG"
+            elif sl is not None:
+                # If we only see the left divider, project a full lane width + extra padding to the right
+                base_x = ev(sl) + (lane_width_px * 1.5)
+                anchor_type = "JCT_DIVIDER_PUSH"
+            else:
+                base_x = 320.0 + (lane_width_px * 0.8)
+                anchor_type = "JCT_BLIND_RIGHT"
+                
+            return base_x + extra_offset_px, anchor_type
 
         if sl is not None and sr is not None:
             return (ev(sl) + ev(sr)) / 2.0 + DUAL_OFFSET_PX, "DUAL"
@@ -639,7 +646,7 @@ class BFMC_Pilot:
         cv2.polylines(img, [pts], isClosed=False, color=colour, thickness=3)
 
     # -------------------------------------------------------------
-    # TESLA-STYLE DASHBOARD RENDERER
+    # TESLA-STYLE DASHBOARD RENDERER (ULTRA REALISTIC)
     # -------------------------------------------------------------
     def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct):
         # Master Canvas: 1280x720 (HD)
@@ -648,66 +655,75 @@ class BFMC_Pilot:
         # 1. Main Background: The raw 720p YOLO feed acts as the reality view
         canvas[0:720, 0:1280] = yolo_hd
         
-        # 2. Add a sleek dark overlay block for the UI telemetry (Right Side)
+        # 2. Sleek Dark Glassmorphism Overlay for the UI telemetry (Right Side)
         overlay = canvas.copy()
-        cv2.rectangle(overlay, (950, 0), (1280, 720), (20, 20, 20), -1)
-        # Top-Left Stats overlay
-        cv2.rectangle(overlay, (0, 0), (350, 120), (20, 20, 20), -1)
-        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        cv2.rectangle(overlay, (880, 0), (1280, 720), (10, 10, 15), -1)
+        # Gradient drop shadow effect on the divider
+        for i in range(20): cv2.line(overlay, (880 - i, 0), (880 - i, 720), (10, 10, 15), max(1, int(15 - i*0.8)))
         
-        # 3. Telemetry: Digital Speedometer
-        cv2.putText(canvas, f"{int(abs(speed))}", (1030, 180), cv2.FONT_HERSHEY_DUPLEX, 5.0, (255, 255, 255), 8)
-        cv2.putText(canvas, "CM/S", (1170, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (150, 150, 150), 2)
+        # Top-Left Stats overlay (compact Glassmorphism)
+        cv2.rectangle(overlay, (20, 20), (320, 80), (15, 15, 20), -1)
+        cv2.addWeighted(overlay, 0.90, canvas, 0.10, 0, canvas)
         
-        # 4. Telemetry: Navigation & Autopilot States
-        cv2.putText(canvas, "AUTOPILOT:", (980, 270), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
-        nav_col = (0, 255, 0) if nav_state == "NORMAL" else (0, 165, 255)
-        cv2.putText(canvas, nav_state, (1120, 271), cv2.FONT_HERSHEY_SIMPLEX, 0.8, nav_col, 2)
-        
-        cv2.putText(canvas, "LANE ANCHOR:", (980, 310), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
-        cv2.putText(canvas, anchor, (1120, 311), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        # 3. Telemetry: Digital Speedometer (Tesla Model 3 style, large top right)
+        cv2.putText(canvas, f"{int(abs(speed))}", (920, 120), cv2.FONT_HERSHEY_DUPLEX, 4.0, (255, 255, 255), 5)
+        cv2.putText(canvas, "CM/S", (1100, 120), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120, 120, 120), 2)
+        cv2.putText(canvas, "MAX", (1100, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        cv2.putText(canvas, str(int(self.MAX_STEER)), (1150, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        cv2.line(canvas, (920, 140), (1240, 140), (40, 40, 45), 2)
 
-        # 5. Traffic AI Decision Block
+        # 4. Telemetry: Navigation & Autopilot States (Clean subtle text)
+        cv2.putText(canvas, "AUTOPILOT", (920, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+        nav_col = (0, 255, 100) if nav_state == "NORMAL" else (0, 165, 255)
+        cv2.putText(canvas, nav_state, (920, 210), cv2.FONT_HERSHEY_DUPLEX, 0.8, nav_col, 1)
+        
+        cv2.putText(canvas, "LANE ANCHOR", (1100, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+        cv2.putText(canvas, anchor, (1100, 210), cv2.FONT_HERSHEY_DUPLEX, 0.6, (200, 200, 200), 1)
+
+        # 5. Traffic AI Decision Block (High contrast, modern bounding box)
         state_col = (0, 255, 0)
         if traffic_state == "SYS_STOP": state_col = (0, 0, 255)
         elif traffic_state == "SYS_SLOW": state_col = (0, 165, 255)
         elif traffic_state == "SYS_LIMIT": state_col = (0, 255, 255)
         
-        cv2.rectangle(canvas, (980, 350), (1240, 480), (40, 40, 40), -1)
-        cv2.putText(canvas, "YOLO DECISION", (1030, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
-        cv2.putText(canvas, traffic_state, (1030, 420), cv2.FONT_HERSHEY_DUPLEX, 1.2, state_col, 3)
-        cv2.putText(canvas, traffic_reason, (1000, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 2)
+        cv2.rectangle(canvas, (920, 240), (1240, 360), (30, 30, 35), -1)
+        cv2.putText(canvas, "VISION INTELLIGENCE", (940, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+        cv2.putText(canvas, traffic_state, (940, 310), cv2.FONT_HERSHEY_DUPLEX, 1.2, state_col, 2)
+        cv2.putText(canvas, traffic_reason, (940, 340), cv2.FONT_HERSHEY_SIMPLEX, 0.6, state_col, 1)
         
         # 5.5. Dedicated Traffic Light Status
-        tl_col = (100, 100, 100)
-        if light_status == "[RED]": tl_col = (0, 0, 255)
-        elif light_status == "[GREEN/OFF]": tl_col = (0, 255, 0)
-        cv2.putText(canvas, f"TRAFFIC LIGHT: {light_status}", (990, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.6, tl_col, 2)
+        tl_col = (70, 70, 70)
+        if light_status == "[RED]": tl_col = (50, 50, 255)
+        elif light_status == "[GREEN/OFF]": tl_col = (50, 255, 50)
+        cv2.putText(canvas, f"SIGNAL: {light_status}", (1100, 265), cv2.FONT_HERSHEY_SIMPLEX, 0.4, tl_col, 1)
         
-        # 6. Simulated Battery Gauge
-        cv2.putText(canvas, "BATTERY", (980, 550), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
-        cv2.rectangle(canvas, (980, 565), (1240, 595), (60, 60, 60), 2)
-        fill_w = int((batt_pct / 100.0) * 256)
+        # 6. Simulated Battery Gauge (Sleek bottom corner)
+        cv2.putText(canvas, "ENERGY", (920, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+        cv2.rectangle(canvas, (920, 435), (1200, 460), (40, 40, 45), 2)
+        fill_w = int((batt_pct / 100.0) * 276)
         fill_col = (0, 255, 0) if batt_pct > 20 else (0, 0, 255)
-        cv2.rectangle(canvas, (982, 567), (982 + fill_w, 593), fill_col, -1)
-        cv2.putText(canvas, f"{batt_pct:.1f}%", (1170, 587), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.rectangle(canvas, (922, 437), (922 + fill_w, 458), fill_col, -1)
+        cv2.putText(canvas, f"{batt_pct:.1f}%", (1210, 452), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
-        # 7. Steering Wheel Visualizer
-        cv2.putText(canvas, "STEERING", (980, 640), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150, 150, 150), 2)
-        bar_center = 1110
-        cv2.line(canvas, (980, 670), (1240, 670), (100, 100, 100), 2)
-        cv2.circle(canvas, (bar_center, 670), 5, (255, 255, 255), -1)
-        # Assuming MAX_STEER is 30, map to +/- 130 pixels
-        steer_px = int(bar_center + (steer_angle / self.MAX_STEER) * 130)
-        cv2.circle(canvas, (steer_px, 670), 12, (255, 0, 0), -1)
-        cv2.putText(canvas, f"{steer_angle:+.1f} deg", (steer_px - 30, 650), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        # 7. Steering Wheel Visualizer (Curved arc for realism)
+        cv2.putText(canvas, "STEERING APEX", (920, 520), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 100, 100), 1)
+        arc_center = (1080, 700)
+        cv2.ellipse(canvas, arc_center, (160, 160), 180, 0, 180, (40, 40, 45), 4)
+        cv2.circle(canvas, (1080, 540), 6, (200, 200, 200), -1) # Dead center
+        
+        # Map +/- 30 degrees to the arc
+        steer_rad = math.radians(steer_angle * 2.5) # Scale for visual arc width
+        sx = int(1080 + 160 * math.sin(steer_rad))
+        sy = int(700 - 160 * math.cos(steer_rad))
+        cv2.circle(canvas, (sx, sy), 12, (255, 100, 50), -1)
+        cv2.line(canvas, arc_center, (sx, sy), (255, 100, 50), 2)
+        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (920, 550), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1)
 
-        # 8. Mini-Map / Radar (Bird's Eye View Lane Debug)
-        # Resize the 640x480 lane_dbg down to 320x240 and put it in the top-left
+        # 8. Mini-Map / Radar (Bird's Eye View Lane Debug - Bottom Left)
         radar = cv2.resize(lane_dbg, (320, 240))
-        cv2.rectangle(radar, (0,0), (320,240), (255,255,255), 2)
-        canvas[20:260, 20:340] = radar
-        cv2.putText(canvas, "RADAR", (30, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.rectangle(radar, (0,0), (320,240), (100,100,250), 2)
+        canvas[460:700, 20:340] = radar
+        cv2.putText(canvas, "RADAR ENV", (25, 480), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         return canvas
 
