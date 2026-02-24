@@ -105,6 +105,9 @@ class ManualSteeringGUI:
         self.btn_capture = ttk.Button(right_frame, text="CAPTURE RGB IMAGE", command=self.capture_image)
         self.btn_capture.pack(fill=tk.X, pady=10)
 
+        self.btn_swap_color = ttk.Button(right_frame, text="TOGGLE COLOR FIX (SWAP R/B)", command=self.toggle_color)
+        self.btn_swap_color.pack(fill=tk.X, pady=5)
+
         # ----------------- KEYBOARD CONTROL -----------------
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
@@ -124,15 +127,16 @@ class ManualSteeringGUI:
         # ----------------- CAMERA INITIALIZATION -----------------
         self.picam2 = None
         self.latest_frame = None
+        self.swap_rb = False
         
         if _CAM_AVAILABLE:
             try:
                 self.picam2 = Picamera2()
                 # Ensure the format is RGB888 for true RGB color vision
-                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
+                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
                 self.picam2.configure(cfg)
                 self.picam2.start()
-                logging.info("Picamera2 started successfully in BGR mode.")
+                logging.info("Picamera2 started successfully in RGB mode.")
             except Exception as e:
                 logging.error(f"Failed to start camera: {e}")
                 self.picam2 = None
@@ -147,11 +151,14 @@ class ManualSteeringGUI:
                 # Capture directly in RGB format as configured
                 frame = self.picam2.capture_array()
                 if frame is not None:
-                    # If it's bluish, the Red and Blue channels are swapped. 
-                    # We will force a physical numpy slice swap to guarantee the flip.
-                    frame_rgb = frame[:, :, ::-1]
+                    # Depending on Pi OS/camera module, R and B might be swapped.
+                    if self.swap_rb:
+                         frame_rgb = frame[:, :, ::-1]
+                    else:
+                         frame_rgb = frame
+                         
                     self.latest_frame = frame_rgb
-                    img = Image.fromarray(frame_rgb)
+                    img = Image.fromarray(frame_rgb, 'RGB')
                     imgtk = ImageTk.PhotoImage(image=img)
                     self.cam_label.imgtk = imgtk
                     self.cam_label.configure(image=imgtk)
@@ -180,6 +187,9 @@ class ManualSteeringGUI:
         else:
             messagebox.showwarning("Warning", "No frame available to capture.")
 
+    def toggle_color(self):
+        self.swap_rb = not self.swap_rb
+        logging.info(f"Swap R/B set to: {self.swap_rb}")
 
     # --- ORIGINAL CONTROL ALGORITHMS ---
     def start_control_loop(self):
