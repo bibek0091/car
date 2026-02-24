@@ -129,10 +129,10 @@ class ManualSteeringGUI:
             try:
                 self.picam2 = Picamera2()
                 # Ensure the format is RGB888 for true RGB color vision
-                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
                 self.picam2.configure(cfg)
                 self.picam2.start()
-                logging.info("Picamera2 started successfully in RGB mode.")
+                logging.info("Picamera2 started successfully in BGR mode.")
             except Exception as e:
                 logging.error(f"Failed to start camera: {e}")
                 self.picam2 = None
