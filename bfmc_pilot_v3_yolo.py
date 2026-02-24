@@ -1264,7 +1264,7 @@ class BFMC_Pilot:
         self.lane_module = LanePerceptionModule(SRC_PTS, DST_PTS)
         
         try:
-            raw_detector = PreTrainedYoloDetector()
+            raw_detector = PreTrainedYoloDetector("best.pt")  # Loading the newly trained YOLO Nano model
             self.threaded_yolo = ThreadedYOLODetector(raw_detector)
             self.traffic_module = TrafficDecisionModule(self.threaded_yolo)
         except Exception:
