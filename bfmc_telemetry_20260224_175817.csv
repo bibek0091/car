@@ -1,0 +1,4 @@
+timestamp,fps,speed,steering,nav_state,traffic_state,curvature,degradation_level,estop
+1771936098.129,0.0,0.0,0.0,NORMAL,FATAL DEGRADATION,0.0,3,0
+1771936101.091,0.9,0.0,0.0,NORMAL,FATAL DEGRADATION,0.0,3,0
+1771936106.837,0.8,0.0,0.0,NORMAL,FATAL DEGRADATION,0.0,3,0

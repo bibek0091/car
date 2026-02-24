@@ -18,6 +18,12 @@ import argparse
 import sys
 
 from ultralytics import YOLO
+from map_parser import GlobalMap
+from localization_engine import LocalizationEngine
+from trajectory_planner import MapTrajectoryPlanner
+import tkinter as tk
+from tkinter_dashboard import BFMCDashboardApp
+import threading
 
 class PreTrainedYoloDetector:
     def __init__(self, global_model="best.pt"):
@@ -1243,8 +1249,9 @@ class BFMC_Pilot:
     MED_CURV_SCALE   = 0.80
     DUAL_SPEED_SCALE = 1.15
 
-    def __init__(self, sim_mode=False):
+    def __init__(self, sim_mode=False, ui=None):
         self.sim_mode = sim_mode
+        self.ui = ui
         self.running = True
         self.handler   = STM32_SerialHandler()
         self.connected = False if sim_mode else self.handler.connect()
@@ -1291,11 +1298,15 @@ class BFMC_Pilot:
 
         self._fps_t, self._fps = time.time(), 0.0
 
-        cv2.namedWindow("BFMC_MASTER_VIEW")
-        cv2.createTrackbar("Look Ahead",    "BFMC_MASTER_VIEW", 150, 300, lambda x: None)
-        cv2.createTrackbar("Lane Width PX", "BFMC_MASTER_VIEW", 280, 400, lambda x: None)
-        cv2.createTrackbar("Fine Offset",   "BFMC_MASTER_VIEW",  50, 100, lambda x: None)
-        cv2.createTrackbar("Base Speed",    "BFMC_MASTER_VIEW",  50, 150, lambda x: None)
+        # MAP AWARENESS INTEGRATION
+        self.gmap = GlobalMap()
+        self.global_pose = None # [x, y, yaw, spline_idx]
+        self.localizer = LocalizationEngine()
+        self.planner = MapTrajectoryPlanner(self.gmap, lookahead_meters=0.6)
+        
+        if self.ui:
+            self.ui.gmap = self.gmap
+            self.ui._draw_static_map_cache()
 
     def _pure_pursuit(self, target_x, look_ahead_px, lane_width_px):
         lane_width_px = max(lane_width_px, 50)
@@ -1319,149 +1330,204 @@ class BFMC_Pilot:
     # -------------------------------------------------------------
     # BRAND NEW SLEEK UI RENDERER (OpenCV Only)
     # -------------------------------------------------------------
+    def _draw_rounded_panel(self, canvas, pt1, pt2, color, radius=15):
+        """Draws a sleek, anti-aliased rounded rectangle for modern UI cards."""
+        x1, y1 = pt1
+        x2, y2 = pt2
+        cv2.rectangle(canvas, (x1 + radius, y1), (x2 - radius, y2), color, -1)
+        cv2.rectangle(canvas, (x1, y1 + radius), (x2, y2 - radius), color, -1)
+        cv2.circle(canvas, (x1 + radius, y1 + radius), radius, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x2 - radius, y1 + radius), radius, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x1 + radius, y2 - radius), radius, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, (x2 - radius, y2 - radius), radius, color, -1, cv2.LINE_AA)
+
+    def _draw_traffic_icon(self, canvas, label, cx, cy, size=22):
+        """Draws modern, geometric traffic signs natively."""
+        r = size
+        lbl = label.lower()
+        cv2.circle(canvas, (cx, cy), r+2, (30, 30, 30), -1, cv2.LINE_AA)
+        
+        if "stop" in lbl:
+            pts = np.array([[cx-r//2, cy-r], [cx+r//2, cy-r], [cx+r, cy-r//2], [cx+r, cy+r//2], 
+                            [cx+r//2, cy+r], [cx-r//2, cy+r], [cx-r, cy+r//2], [cx-r, cy-r//2]], np.int32)
+            cv2.fillPoly(canvas, [pts], (40, 40, 220), cv2.LINE_AA)
+            cv2.putText(canvas, "STOP", (cx-15, cy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        elif "parking" in lbl:
+            self._draw_rounded_panel(canvas, (cx-r, cy-r), (cx+r, cy+r), (220, 100, 30), radius=5)
+            cv2.putText(canvas, "P", (cx-7, cy+7), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 1, cv2.LINE_AA)
+        elif "crosswalk" in lbl:
+            cv2.circle(canvas, (cx, cy), r, (40, 200, 240), -1, cv2.LINE_AA)
+            cv2.line(canvas, (cx-10, cy-4), (cx+10, cy-4), (20, 20, 20), 2, cv2.LINE_AA)
+            cv2.line(canvas, (cx-10, cy+4), (cx+10, cy+4), (20, 20, 20), 2, cv2.LINE_AA)
+        elif "priority" in lbl:
+            pts = np.array([[cx, cy-r], [cx+r, cy], [cx, cy+r], [cx-r, cy]], np.int32)
+            cv2.fillPoly(canvas, [pts], (40, 220, 240), cv2.LINE_AA)
+            pts_inner = np.array([[cx, cy-r+6], [cx+r-6, cy], [cx, cy+r-6], [cx-r+6, cy]], np.int32)
+            cv2.fillPoly(canvas, [pts_inner], (255, 255, 255), cv2.LINE_AA)
+        elif "highway-entry" in lbl:
+            self._draw_rounded_panel(canvas, (cx-r, cy-r), (cx+r, cy+r), (60, 180, 60), radius=5)
+            cv2.putText(canvas, "HWY", (cx-15, cy+4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        elif "highway-exit" in lbl:
+            self._draw_rounded_panel(canvas, (cx-r, cy-r), (cx+r, cy+r), (60, 180, 60), radius=5)
+            cv2.line(canvas, (cx-r+4, cy-r+4), (cx+r-4, cy+r-4), (40, 40, 220), 3, cv2.LINE_AA)
+        elif "one-way" in lbl:
+            self._draw_rounded_panel(canvas, (cx-r, cy-r), (cx+r, cy+r), (220, 100, 30), radius=5)
+            cv2.arrowedLine(canvas, (cx-12, cy), (cx+12, cy), (255, 255, 255), 2, tipLength=0.4, line_type=cv2.LINE_AA)
+        elif "round-about" in lbl:
+            cv2.circle(canvas, (cx, cy), r, (220, 100, 30), -1, cv2.LINE_AA)
+            cv2.ellipse(canvas, (cx, cy), (r-6, r-6), 0, 0, 270, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas, "^", (cx+4, cy-4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        elif "no-entry" in lbl:
+            cv2.circle(canvas, (cx, cy), r, (40, 40, 220), -1, cv2.LINE_AA)
+            cv2.line(canvas, (cx-12, cy), (cx+12, cy), (255, 255, 255), 4, cv2.LINE_AA)
+        else:
+            cv2.circle(canvas, (cx, cy), r, (80, 80, 80), -1, cv2.LINE_AA)
+
+    def _draw_telemetry_graph(self, canvas, x, y, w, h, data, title="LIVE TELEMETRY"):
+        """Draws a real-time, glowing data plot overlay."""
+        # Draw translucent background card
+        overlay = canvas.copy()
+        self._draw_rounded_panel(overlay, (x, y), (x+w, y+h), (16, 16, 18), radius=12)
+        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        
+        # Grid lines
+        mid_y = y + h // 2
+        cv2.line(canvas, (x+15, mid_y), (x+w-15, mid_y), (60, 60, 65), 1, cv2.LINE_AA) # Zero line
+        cv2.line(canvas, (x+15, y+25), (x+w-15, y+25), (35, 35, 40), 1, cv2.LINE_AA)   # Upper bound
+        cv2.line(canvas, (x+15, y+h-25), (x+w-15, y+h-25), (35, 35, 40), 1, cv2.LINE_AA) # Lower bound
+        
+        cv2.putText(canvas, title, (x+20, y+25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (140, 140, 150), 1, cv2.LINE_AA)
+        
+        if not data or len(data) < 2: return
+        
+        # Plot data
+        max_val = 45.0 # Max steering boundary
+        pts = []
+        step_x = (w - 30) / max(1, len(data) - 1)
+        
+        for i, val in enumerate(data):
+            px = int(x + 15 + i * step_x)
+            py = int(mid_y - (val / max_val) * (h//2 - 25)) # Invert Y so right/positive is up
+            pts.append([px, py])
+            
+        pts = np.array(pts, np.int32)
+        
+        # Glowing line effect (Outer thick, inner thin)
+        cv2.polylines(canvas, [pts], False, (10, 80, 200), 4, cv2.LINE_AA)
+        cv2.polylines(canvas, [pts], False, (40, 140, 255), 2, cv2.LINE_AA)
+        
+        # Live tracking dot
+        live_x, live_y = pts[-1][0], pts[-1][1]
+        cv2.circle(canvas, (live_x, live_y), 4, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{data[-1]:+.1f}", (live_x - 15, live_y - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (245, 245, 250), 1, cv2.LINE_AA)
+
     def _render_dashboard(self, yolo_hd, lane_dbg, speed, steer_angle, traffic_state, traffic_reason, light_status, nav_state, anchor, batt_pct, active_labels, topology):
-        canvas = np.zeros((720, 1280, 3), dtype=np.uint8)
+        # Initialize dynamic telemetry buffer if it doesn't exist
+        if not hasattr(self, '_steer_history'): self._steer_history = []
+        self._steer_history.append(steer_angle)
+        if len(self._steer_history) > 120: self._steer_history.pop(0) # Keep last ~4 seconds
+
+        # Base Canvas: Ultra-Deep Obsidian
+        canvas = np.full((720, 1920, 3), (12, 12, 12), dtype=np.uint8)
         
-        BG_DEEP    = (20, 14, 14)
-        GRAD_TOP   = (32, 22, 22)
-        GRAD_BOT   = (16, 10, 10)
-        ACCENT_PRI = (20, 160, 220)
-        CYAN_TEAL  = (20, 210, 200)
-        SUCCESS_G  = (70, 210, 70)
-        ALERT_R    = (210, 50, 50)
-        WARN_O     = (255, 140, 20)
-        TEXT_PRI   = (245, 240, 240)
-        TEXT_MUT   = (125, 110, 110)
-        DIVIDER    = (55, 40, 40)
-        CARD_BG    = (40, 28, 28)
+        CYAN = (255, 200, 0)       
+        ORANGE = (40, 140, 255)    
+        RED = (60, 40, 250)        
+        GREEN = (100, 220, 100)    
+        PANEL_BG = (22, 22, 24)    
+        MUTED = (120, 120, 125)    
+        TEXT_PRIME = (245, 245, 250)
+
+        # ---------------------------------------------------------
+        # PANEL 1: DRIVE KINEMATICS (Left)
+        # ---------------------------------------------------------
+        self._draw_rounded_panel(canvas, (30, 30), (580, 690), PANEL_BG, radius=20)
         
-        cam_h, cam_w = yolo_hd.shape[:2]
-        canvas[0:645, 0:800] = cv2.resize(yolo_hd, (800, 645))
+        cv2.putText(canvas, "SYSTEM STATUS", (60, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
+        t_col = RED if traffic_state == "SYS_STOP" else GREEN if traffic_state == "SYS_GO" else CYAN
+        cv2.putText(canvas, traffic_state.replace("SYS_", ""), (60, 110), cv2.FONT_HERSHEY_DUPLEX, 1.2, t_col, 1, cv2.LINE_AA)
+        cv2.putText(canvas, traffic_reason.upper(), (60, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_PRIME, 1, cv2.LINE_AA)
+
+        # Speedometer
+        spd_center = (305, 330)
+        cv2.ellipse(canvas, spd_center, (130, 130), 135, 0, 270, (40, 40, 42), 3, cv2.LINE_AA)
+        spd_ratio = min(1.0, abs(speed) / 120.0)
+        cv2.ellipse(canvas, spd_center, (130, 130), 135, 0, int(270 * spd_ratio), CYAN, 5, cv2.LINE_AA)
         
-        for y in range(720):
-            b = int(GRAD_TOP[0] + (GRAD_BOT[0] - GRAD_TOP[0]) * (y / 720.0))
-            g = int(GRAD_TOP[1] + (GRAD_BOT[1] - GRAD_TOP[1]) * (y / 720.0))
-            r = int(GRAD_TOP[2] + (GRAD_BOT[2] - GRAD_TOP[2]) * (y / 720.0))
-            cv2.line(canvas, (800, y), (1280, y), (b, g, r), 1)
+        spd_str = f"{int(abs(speed))}"
+        tw, _ = cv2.getTextSize(spd_str, cv2.FONT_HERSHEY_DUPLEX, 3.5, 2)[0]
+        cv2.putText(canvas, spd_str, (spd_center[0] - tw//2, spd_center[1] + 20), cv2.FONT_HERSHEY_DUPLEX, 3.5, TEXT_PRIME, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "cm/s", (spd_center[0] - 25, spd_center[1] + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, MUTED, 1, cv2.LINE_AA)
 
-        cv2.line(canvas, (798, 0), (798, 645), (60, 45, 45), 2)
+        # Steering
+        steer_center = (305, 550)
+        cv2.ellipse(canvas, steer_center, (70, 70), 270, -45, 45, (40, 40, 42), 3, cv2.LINE_AA)
+        cv2.ellipse(canvas, steer_center, (70, 70), 270, 0, int(steer_angle), ORANGE, 5, cv2.LINE_AA)
+        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (255, 555), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRIME, 1, cv2.LINE_AA)
+
+        # ---------------------------------------------------------
+        # PANEL 2: SPATIAL INTELLIGENCE & TELEMETRY (Center)
+        # ---------------------------------------------------------
+        self._draw_rounded_panel(canvas, (610, 30), (1340, 690), PANEL_BG, radius=20)
         
-        def draw_card(pt1, pt2, color, thickness=-1):
-            r = 8
-            x1, y1 = pt1
-            x2, y2 = pt2
-            if thickness < 0:
-                cv2.rectangle(canvas, (x1+r, y1), (x2-r, y2), color, -1)
-                cv2.rectangle(canvas, (x1, y1+r), (x2, y2-r), color, -1)
-                cv2.circle(canvas, (x1+r, y1+r), r, color, -1)
-                cv2.circle(canvas, (x2-r, y1+r), r, color, -1)
-                cv2.circle(canvas, (x1+r, y2-r), r, color, -1)
-                cv2.circle(canvas, (x2-r, y2-r), r, color, -1)
-            else:
-                cv2.line(canvas, (x1+r, y1), (x2-r, y1), color, thickness)
-                cv2.line(canvas, (x1+r, y2), (x2-r, y2), color, thickness)
-                cv2.line(canvas, (x1, y1+r), (x1, y2-r), color, thickness)
-                cv2.line(canvas, (x2, y1+r), (x2, y2-r), color, thickness)
+        if hasattr(self, 'map_layer_base'):
+            map_mask = np.zeros((640, 710), dtype=np.uint8)
+            cv2.circle(map_mask, (355, 320), 300, 255, -1, cv2.LINE_AA)
+            
+            map_render = self.map_layer_base.copy()
+            if self.global_pose is not None:
+                px = int(self.global_pose[0] * self.map_scale + self.map_offset[0])
+                py = int(self.global_pose[1] * self.map_scale + self.map_offset[1])
+                cv2.circle(map_render, (px, py), 8, CYAN, -1, cv2.LINE_AA)
+                cv2.circle(map_render, (px, py), 16, (255, 200, 0, 50), -1, cv2.LINE_AA) 
+                hx, hy = int(px + math.cos(self.global_pose[2]) * 20), int(py + math.sin(self.global_pose[2]) * 20)
+                cv2.arrowedLine(map_render, (px, py), (hx, hy), TEXT_PRIME, 3, tipLength=0.3, line_type=cv2.LINE_AA)
 
-        cv2.rectangle(canvas, (800, 0), (1280, 3), ACCENT_PRI, -1)
-        cv2.putText(canvas, "AUTONOMY CORE", (815, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, ACCENT_PRI, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "BFMC ORCHESTRATOR v3.0", (815, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.42, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "LAT 46.7712  LON 23.6236", (815, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.line(canvas, (815, 95), (1265, 95), DIVIDER, 1)
+            map_resized = cv2.resize(map_render, (710, 640))
+            map_blended = cv2.bitwise_and(map_resized, map_resized, mask=map_mask)
+            
+            roi = canvas[40:680, 620:1330]
+            canvas[40:680, 620:1330] = cv2.addWeighted(roi, 0.1, map_blended, 0.9, 0)
+            
+        cv2.putText(canvas, "ENVIRONMENT TOPOLOGY", (640, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
+        cv2.putText(canvas, nav_state.replace("_", " "), (640, 105), cv2.FONT_HERSHEY_DUPLEX, 0.8, CYAN, 1, cv2.LINE_AA)
 
-        cy = 110
-        draw_card((815, cy), (1265, cy+85), CARD_BG, -1)
-        tcol = ALERT_R if traffic_state == "SYS_STOP" else SUCCESS_G if traffic_state == "SYS_GO" else WARN_O if traffic_state == "SYS_SLOW" else CYAN_TEAL
-        cv2.putText(canvas, "TRAFFIC STATE", (830, cy+25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, traffic_state.replace("SYS_", ""), (830, cy+60), cv2.FONT_HERSHEY_SIMPLEX, 1.4, tcol, 2, cv2.LINE_AA)
-        cv2.putText(canvas, traffic_reason, (830, cy+78), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
-        draw_card((815, cy), (1265, cy+85), tcol, 2)
+        # Overlay Live Graph inside Map Panel
+        self._draw_telemetry_graph(canvas, 640, 520, 670, 140, self._steer_history, title="STEERING ERROR KINEMATICS")
 
-        cv2.putText(canvas, "VELOCITY", (815, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
-        center = (1040, 260)
-        radius = 50
-        cv2.ellipse(canvas, center, (radius, radius), 180, 210, 330, (55, 40, 40), 8, cv2.LINE_AA)
-        spd_r = min(1.0, abs(speed) / 150.0)
-        f_ang = 210 + int((330 - 210) * spd_r)
-        if f_ang > 210:
-            cv2.ellipse(canvas, center, (radius, radius), 180, 210, f_ang, ACCENT_PRI, 8, cv2.LINE_AA)
-        cv2.putText(canvas, f"{int(abs(speed))}", (1015, 275), cv2.FONT_HERSHEY_SIMPLEX, 1.8, TEXT_PRI, 2, cv2.LINE_AA)
-        cv2.putText(canvas, "cm/s", (1022, 295), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
-
-        sty = 325
-        cv2.putText(canvas, "STEERING", (815, sty), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.rectangle(canvas, (815, sty+10), (1265, sty+24), CARD_BG, -1)
-        cv2.line(canvas, (1040, sty+10), (1040, sty+24), TEXT_PRI, 2)
-        scol = CYAN_TEAL if abs(steer_angle) <= 10 else WARN_O if abs(steer_angle) <= 25 else ALERT_R
-        spx = int((steer_angle / 45.0) * 225)
-        if steer_angle > 0: cv2.rectangle(canvas, (1040, sty+10), (1040+spx, sty+24), scol, -1)
-        else: cv2.rectangle(canvas, (1040+spx, sty+10), (1040, sty+24), scol, -1)
-        cv2.putText(canvas, f"{steer_angle:+.1f} DEG", (1190, sty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_PRI, 1, cv2.LINE_AA)
-
-        ny = 370
-        draw_card((815, ny), (1035, ny+45), CARD_BG, -1)
-        draw_card((1045, ny), (1265, ny+45), CARD_BG, -1)
-        cv2.putText(canvas, "NAV MODE", (825, ny+18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
-        n_icon = "RBT" if nav_state == "ROUNDABOUT" else "JCT" if "JUNCTION" in nav_state else "FWD"
-        cv2.putText(canvas, n_icon, (825, ny+38), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 1, cv2.LINE_AA)
-        cv2.putText(canvas, "TOPOLOGY", (1055, ny+18), cv2.FONT_HERSHEY_SIMPLEX, 0.35, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, topology, (1055, ny+38), cv2.FONT_HERSHEY_SIMPLEX, 0.55, CYAN_TEAL, 1, cv2.LINE_AA)
-
-        dy = 435
-        cv2.putText(canvas, "ACTIVE DETECTIONS", (815, dy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
-        tx, ty = 815, dy + 15
-        for lbl in active_labels:
-            strip = lbl.replace("-sign", "").upper()
-            w = cv2.getTextSize(strip, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] + 20
-            if tx + w > 1265:
-                tx, ty = 815, ty + 28
-                if ty > dy + 65: break
-            draw_card((tx, ty), (tx+w, ty+24), CARD_BG, -1)
-            ecol = ALERT_R if any(x in strip for x in ["STOP","NO-ENTRY","RED"]) else SUCCESS_G if any(x in strip for x in ["CROSSWALK","PRIORITY","GREEN"]) else WARN_O if any(x in strip for x in ["PEDESTRIAN", "YELLOW", "ORANGE"]) else ACCENT_PRI
-            cv2.rectangle(canvas, (tx, ty+4), (tx+3, ty+20), ecol, -1)
-            cv2.putText(canvas, strip, (tx+10, ty+17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT_PRI, 1, cv2.LINE_AA)
-            tx += w + 8
-
-        by = 535
-        cv2.putText(canvas, "ENERGY", (815, by), cv2.FONT_HERSHEY_SIMPLEX, 0.4, TEXT_MUT, 1, cv2.LINE_AA)
-        f = int((batt_pct / 100.0) * 10)
-        bc = SUCCESS_G if batt_pct >= 60 else WARN_O if batt_pct >= 30 else ALERT_R
-        for i in range(10): cv2.rectangle(canvas, (815 + i*16, by+12), (815 + i*16 + 12, by+28), bc if i < f else DIVIDER, -1)
-        cv2.putText(canvas, f"{batt_pct:.1f}%", (990, by+25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, bc, 2, cv2.LINE_AA)
-
-        cv2.rectangle(canvas, (0, 645), (1280, 720), (18, 12, 12), -1)
-        cv2.line(canvas, (0, 645), (1280, 645), ACCENT_PRI, 2)
-        cv2.putText(canvas, "FPS", (30, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"{int(getattr(self, '_fps', 0))}", (70, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.7, ACCENT_PRI, 2, cv2.LINE_AA)
-        smod = "E-STOPPED" if getattr(self, '_manual_estop', False) else "AUTO"
-        cv2.putText(canvas, smod, (150, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ALERT_R if smod=="E-STOPPED" else SUCCESS_G, 2, cv2.LINE_AA)
+        # ---------------------------------------------------------
+        # PANEL 3: PERCEPTION SENSORS (Right)
+        # ---------------------------------------------------------
+        self._draw_rounded_panel(canvas, (1370, 30), (1890, 690), PANEL_BG, radius=20)
         
-        cv2.rectangle(canvas, (560, 660), (720, 705), ALERT_R, -1)
-        cv2.rectangle(canvas, (560, 660), (720, 705), (255, 120, 120), 2)
-        cv2.putText(canvas, "E-STOP [SPACE]", (572, 688), cv2.FONT_HERSHEY_SIMPLEX, 0.55, TEXT_PRI, 2, cv2.LINE_AA)
+        # Camera Feed
+        cam_h, cam_w = 281, 460
+        cam_y, cam_x = 60, 1400
+        canvas[cam_y:cam_y+cam_h, cam_x:cam_x+cam_w] = cv2.resize(yolo_hd, (cam_w, cam_h))
+        cv2.rectangle(canvas, (cam_x-1, cam_y-1), (cam_x+cam_w+1, cam_y+cam_h+1), (60, 60, 65), 1, cv2.LINE_AA)
+
+        # Active Signals
+        cv2.putText(canvas, "ACTIVE SIGNALS", (1400, 380), cv2.FONT_HERSHEY_SIMPLEX, 0.45, MUTED, 1, cv2.LINE_AA)
+        icon_start_x = 1430
+        icon_start_y = 430
+        for idx, lbl in enumerate(active_labels):
+            if idx > 7: break 
+            row, col = idx // 4, idx % 4
+            self._draw_traffic_icon(canvas, lbl, icon_start_x + (col * 65), icon_start_y + (row * 65), size=24)
+
+        # BEV Radar
+        bev_h, bev_w = 160, 200
+        bev_y, bev_x = 510, 1400
+        bev_color = cv2.cvtColor(cv2.resize(lane_dbg, (bev_w, bev_h)), cv2.COLOR_BGR2GRAY)
+        bev_color = cv2.cvtColor(bev_color, cv2.COLOR_GRAY2BGR)
+        canvas[bev_y:bev_y+bev_h, bev_x:bev_x+bev_w] = bev_color
+        cv2.rectangle(canvas, (bev_x-1, bev_y-1), (bev_x+bev_w+1, bev_y+bev_h+1), (60, 60, 65), 1, cv2.LINE_AA)
         
-        cv2.putText(canvas, f"ANCHOR: {anchor}", (850, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"TOPO: {topology}", (1050, 690), cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN_TEAL, 1, cv2.LINE_AA)
-
-        rx, ry = 20, 395
-        cv2.rectangle(canvas, (rx-8, ry-25), (rx+328, ry+238), BG_DEEP, -1)
-        cv2.rectangle(canvas, (rx-2, ry-2), (rx+322, ry+232), ACCENT_PRI, 2)
-        cv2.rectangle(canvas, (rx-2, ry-22), (rx+85, ry-2), ACCENT_PRI, -1)
-        cv2.putText(canvas, "BEV RADAR", (rx+5, ry-7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1, cv2.LINE_AA)
-        canvas[ry:ry+230, rx:rx+320] = cv2.resize(lane_dbg, (320, 230))
-
-        if nav_state == "JUNCTION_PROMPT" or "BLIND" in anchor:
-            mbg = canvas.copy()
-            cv2.rectangle(mbg, (150, 212), (650, 432), BG_DEEP, -1)
-            cv2.addWeighted(mbg, 0.85, canvas, 0.15, 0, canvas)
-            cv2.rectangle(canvas, (150, 212), (650, 215), ACCENT_PRI, -1)
-            tit = "JUNCTION DETECTED" if nav_state == "JUNCTION_PROMPT" else "BLIND CORNER"
-            cv2.putText(canvas, tit, (230, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ACCENT_PRI, 2, cv2.LINE_AA)
-            cv2.putText(canvas, "AWAITING HUMAN DECISION...", (230, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_MUT, 1, cv2.LINE_AA)
-            cv2.rectangle(canvas, (230, 330), (380, 380), CYAN_TEAL, -1)
-            cv2.putText(canvas, "[L] LEFT", (270, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 2, cv2.LINE_AA)
-            cv2.rectangle(canvas, (400, 330), (550, 380), WARN_O, -1)
-            cv2.putText(canvas, "[R] RIGHT", (440, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.6, TEXT_PRI, 2, cv2.LINE_AA)
+        # Diagnostics
+        cv2.putText(canvas, "TRACKING ANCHOR", (1630, 530), cv2.FONT_HERSHEY_SIMPLEX, 0.4, MUTED, 1, cv2.LINE_AA)
+        cv2.putText(canvas, anchor, (1630, 555), cv2.FONT_HERSHEY_SIMPLEX, 0.5, CYAN, 1, cv2.LINE_AA)
+        cv2.putText(canvas, "LANE TOPOLOGY", (1630, 610), cv2.FONT_HERSHEY_SIMPLEX, 0.4, MUTED, 1, cv2.LINE_AA)
+        cv2.putText(canvas, topology, (1630, 635), cv2.FONT_HERSHEY_SIMPLEX, 0.5, ORANGE, 1, cv2.LINE_AA)
 
         return canvas
 
@@ -1484,16 +1550,16 @@ class BFMC_Pilot:
                     self._manual_estop = False
                     print("E-STOP AUTO-RECOVERY: Resuming autonomous operation")
 
-                look_ahead    = cv2.getTrackbarPos("Look Ahead",    "BFMC_MASTER_VIEW")
-                lane_width_px = cv2.getTrackbarPos("Lane Width PX", "BFMC_MASTER_VIEW")
+                look_ahead    = 150
+                lane_width_px = 280
                 
                 # BUG 8: Override manual trackbar width ONLY if estimated EMA width is reasonable
                 tracker = self.lane_module.tracker
                 if 150 < tracker.estimated_lane_width < 400:
                     lane_width_px = int(tracker.estimated_lane_width)
                     
-                fine_offset   = cv2.getTrackbarPos("Fine Offset",   "BFMC_MASTER_VIEW")
-                base_speed    = cv2.getTrackbarPos("Base Speed",    "BFMC_MASTER_VIEW")
+                fine_offset   = 50
+                base_speed    = 50
 
                 fine_px      = (fine_offset - 50) * 2
                 
@@ -1568,6 +1634,36 @@ class BFMC_Pilot:
 
                 target_x, anchor = tracker.get_target_x(y_eval, lane_width_px, total_offset, nav_state, self.lost_frames, getattr(self, '_last_speed', 0.0), getattr(self, 'prev_steer', 0.0))
                 
+                # -------------------------------------------------------------
+                # GLOBAL PREDICTIVE LOCALIZATION & MAP FUSION
+                # -------------------------------------------------------------
+                dt = time.time() - getattr(self, '_last_update_t', time.time() - 0.033)
+                self._last_update_t = time.time()
+                
+                # Forward simulation using kinematic bicycle model
+                gx, gy, gyaw = self.localizer.update_dead_reckoning(getattr(self, '_last_speed', 0.0), getattr(self, 'prev_steer', 0.0), dt)
+                
+                if self.global_pose is not None:
+                    # Query trajectory planner for the predictive waypoint target
+                    map_target = self.planner.get_local_target(gx, gy, gyaw)
+                    
+                    if map_target is not None:
+                        map_x_bev = map_target[0]
+                        # Update global pose UI anchor
+                        idx, _ = self.gmap.get_nearest_spline_index(gx, gy)
+                        self.global_pose = [gx, gy, gyaw, idx]
+                        
+                        if target_x is not None and not anchor.startswith("DEAD") and nav_state != "ROUNDABOUT":
+                            # VISION IS ACTIVE: We fuse it into the Map Model to correct Odometry Drift
+                            lane_error_px = map_x_bev - target_x
+                            lane_error_cm = lane_error_px * (35.0 / max(50.0, lane_width_px))
+                            # Gently pull the car's virtual global pose towards the true detected lane
+                            self.localizer.fuse_lane_correction(lane_error_cm * 0.05, 0.0)
+                        else:
+                            # VISION IS LOST: The global map predictive model takes absolute control!
+                            target_x = map_x_bev
+                            anchor = "MAP_PREDICT_OVERRIDE"
+
                 # Lane Position Feedback Control
                 # BUG 6: We keep this PID controller as the core centering mechanism 
                 # instead of fighting against track curvature translation offsets.
@@ -1751,28 +1847,25 @@ class BFMC_Pilot:
                 # Drain the fake battery slowly over time
                 sim_batt_pct = max(0.0, sim_batt_pct - 0.005)
 
-                # Render the luxurious Professional UI natively via OpenCV
-                dashboard_ui = self._render_dashboard(
-                    yolo_dbg, lane_dbg, speed, steer_angle, 
-                    traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
-                    light_status, nav_state, anchor, sim_batt_pct, active_labels, topology
-                )
-                
-                cv2.putText(dashboard_ui, f"Sys FPS: {self._fps:.0f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow("BFMC_MASTER_VIEW", dashboard_ui)
+                # Render the luxurious Professional UI natively via Tkinter
+                if getattr(self, "ui", None):
+                    self.ui.update_state(
+                        yolo_dbg, lane_dbg, speed, steer_angle, 
+                        traffic_state, self.traffic_module.reason if self.traffic_module else "CLEAR", 
+                        light_status, nav_state, anchor, sim_batt_pct, active_labels, topology,
+                        global_pose=self.global_pose
+                    )
+                    # Sync any UI teleport overrides back to the control loop
+                    if getattr(self.ui, "global_pose", None) is not None:
+                        self.global_pose = self.ui.global_pose
+                    if getattr(self.ui, "target_pose", None) is not None:
+                        self.target_pose = self.ui.target_pose
 
                 elapsed = time.time() - t_frame_start
-                wait_ms = max(1, int((FRAME_PERIOD - elapsed) * 1000))
+                wait_sec = max(0.001, FRAME_PERIOD - elapsed)
+                time.sleep(wait_sec)
                 
-                key = cv2.waitKey(wait_ms)
-                if key == ord("q"): 
-                    break
-                elif key == ord(" "): 
-                    print("MANUAL ESTOP TRIGGERED!")
-                    speed = 0.0
-                    self._manual_estop = True # BUG 19: Local speed was wiped, persisted E-Stop state
-                    self._estop_timestamp = time.time()
-                    self.handler.set_speed(0.0)
+                # Optional: Read key events from Tkinter if needed, but for now we loop smoothly.
 
         except KeyboardInterrupt: pass
         finally: 
@@ -1786,7 +1879,7 @@ class BFMC_Pilot:
             self.handler.set_steering(0)
             self.handler.disconnect()
         if self.cam_ok: self.picam2.stop()
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
         print("BFMC Modular Pilot: STOPPED")
 
 
@@ -1795,4 +1888,13 @@ if __name__ == "__main__":
     parser.add_argument("--sim", action="store_true", help="Simulation mode")
     args = parser.parse_args()
     
-    BFMC_Pilot(sim_mode=args.sim).run()
+    root = tk.Tk()
+    dashboard = BFMCDashboardApp(root)
+    pilot = BFMC_Pilot(sim_mode=args.sim, ui=dashboard)
+    
+    # Run pilot loop in background
+    t = threading.Thread(target=pilot.run, daemon=True)
+    t.start()
+    
+    # Run Tkinter in main thread
+    root.mainloop()
