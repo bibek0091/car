@@ -103,6 +103,17 @@ class ManualSteeringGUI:
 
         self.btn_capture = ttk.Button(right_frame, text="CAPTURE RGB IMAGE", command=self.capture_image)
         self.btn_capture.pack(fill=tk.X, pady=5)
+        
+        # Video Recording Controls
+        video_frame = ttk.Frame(right_frame)
+        video_frame.pack(fill=tk.X, pady=5)
+        
+        self.btn_rec_start = ttk.Button(video_frame, text="START RECORD", command=self.start_recording)
+        self.btn_rec_start.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        
+        self.btn_rec_stop = ttk.Button(video_frame, text="STOP RECORD", command=self.stop_recording)
+        self.btn_rec_stop.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
+        self.btn_rec_stop.configure(state="disabled")
 
         self.btn_swap_color = ttk.Button(right_frame, text="TOGGLE COLOR FIX (SWAP R/B)", command=self.toggle_color)
         self.btn_swap_color.pack(fill=tk.X, pady=5)
@@ -136,6 +147,10 @@ class ManualSteeringGUI:
 
         # apply_wb: enables LAB-space white balance correction to remove bluish tint
         self.apply_wb = True
+        
+        # Video Recording State
+        self.video_writer = None
+        self.is_recording = False
         
         if _CAM_AVAILABLE:
             try:
@@ -187,6 +202,13 @@ class ManualSteeringGUI:
                         frame_rgb = self.fix_white_balance(frame_rgb)
 
                     self.latest_frame = frame_rgb
+                    
+                    # Record frame if active
+                    if self.is_recording and self.video_writer is not None:
+                        # OpenCV VideoWriter expects BGR format (this is just the disk writing pipe)
+                        bgr_frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        self.video_writer.write(bgr_frame)
+                        
                     img = Image.fromarray(frame_rgb, 'RGB')
                     imgtk = ImageTk.PhotoImage(image=img)
                     self.cam_label.imgtk = imgtk
@@ -215,6 +237,38 @@ class ManualSteeringGUI:
             messagebox.showinfo("Capture Saved", f"Image saved locally to:\n{filename}")
         else:
             messagebox.showwarning("Warning", "No frame available to capture.")
+
+    def start_recording(self):
+        if not self.picam2:
+            messagebox.showerror("Error", "Camera is not available.")
+            return
+            
+        if self.is_recording:
+            return
+            
+        filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.avi"
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        # Using 640x480 resolution as configured in picamera, 20 fps matching UI loop roughly
+        self.video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (640, 480))
+        
+        if self.video_writer.isOpened():
+            self.is_recording = True
+            self.btn_rec_start.configure(state="disabled")
+            self.btn_rec_stop.configure(state="normal")
+            logging.info(f"Started recording video to: {filename}")
+        else:
+            messagebox.showerror("Error", "Failed to initialize video writer.")
+
+    def stop_recording(self):
+        if self.is_recording and self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            self.is_recording = False
+            
+            self.btn_rec_start.configure(state="normal")
+            self.btn_rec_stop.configure(state="disabled")
+            logging.info("Video recording stopped and saved.")
+            messagebox.showinfo("Recording Saved", "Video file has been saved successfully.")
 
     def toggle_color(self):
         self.swap_rb = not self.swap_rb
@@ -343,6 +397,8 @@ class ManualSteeringGUI:
         self.root.after(1000, self.check_status)
 
     def on_close(self):
+        if self.is_recording:
+            self.stop_recording()
         if self.is_connected:
             self.handler.disconnect()
         if self.picam2:
