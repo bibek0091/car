@@ -37,8 +37,7 @@ class ManualSteeringGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("BFMC Manual Steering Control & RGB Camera Capture")
-        # Expanded geometry to fit the camera cleanly
-        self.root.geometry("1000x600")
+        self.root.geometry("1000x640")
         
         self.handler = STM32_SerialHandler()
         self.is_connected = False
@@ -83,7 +82,7 @@ class ManualSteeringGUI:
             orient=tk.HORIZONTAL, 
             command=self.on_slider_change
         )
-        self.slider.set(0) # Center default
+        self.slider.set(0)
         self.slider.pack(fill=tk.X, pady=5)
         
         # Center Button
@@ -93,7 +92,7 @@ class ManualSteeringGUI:
         # ----------------- EMERGENCY SECTION -----------------
         self.btn_stop = ttk.Button(left_frame, text="EMERGENCY STOP", command=self.emergency_stop)
         self.btn_stop.pack(fill=tk.X, pady=20)
-        self.btn_stop.configure(state="disabled") # Disabled until connected
+        self.btn_stop.configure(state="disabled")
 
         # ----------------- CAMERA SECTION -----------------
         cam_frame = ttk.LabelFrame(right_frame, text="Live RPi Camera (RGB)", padding="10")
@@ -103,10 +102,14 @@ class ManualSteeringGUI:
         self.cam_label.pack(fill=tk.BOTH, expand=True)
 
         self.btn_capture = ttk.Button(right_frame, text="CAPTURE RGB IMAGE", command=self.capture_image)
-        self.btn_capture.pack(fill=tk.X, pady=10)
+        self.btn_capture.pack(fill=tk.X, pady=5)
 
         self.btn_swap_color = ttk.Button(right_frame, text="TOGGLE COLOR FIX (SWAP R/B)", command=self.toggle_color)
         self.btn_swap_color.pack(fill=tk.X, pady=5)
+
+        # White Balance toggle button
+        self.btn_wb = ttk.Button(right_frame, text="TOGGLE WHITE BALANCE FIX (ON)", command=self.toggle_wb)
+        self.btn_wb.pack(fill=tk.X, pady=5)
 
         # ----------------- KEYBOARD CONTROL -----------------
         self.root.bind("<KeyPress>", self.on_key_press)
@@ -119,24 +122,32 @@ class ManualSteeringGUI:
         self.target_steer = 0.0
         
         # Control Loop Constants
-        self.SPEED_STEP = 30.0   # How much speed changes per tick (acceleration)
-        self.STEER_STEP = 3.0    # How much angle changes per tick (turning speed)
-        self.MAX_SPEED = 200.0   # Max speed mm/s
-        self.MAX_STEER = 20.0    # Max steer angle (matches slider)
+        self.SPEED_STEP = 30.0
+        self.STEER_STEP = 3.0
+        self.MAX_SPEED = 200.0
+        self.MAX_STEER = 20.0
         
         # ----------------- CAMERA INITIALIZATION -----------------
         self.picam2 = None
         self.latest_frame = None
-        self.swap_rb = False
+
+        # swap_rb: set True when using BGR888 format so Pillow gets proper RGB
+        self.swap_rb = True
+
+        # apply_wb: enables LAB-space white balance correction to remove bluish tint
+        self.apply_wb = True
         
         if _CAM_AVAILABLE:
             try:
                 self.picam2 = Picamera2()
-                # Ensure the format is RGB888 for true RGB color vision
-                cfg = self.picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+                # Use BGR888 — more reliable on RPi 5 with newer libcamera.
+                # swap_rb=True above will convert BGR -> RGB for display.
+                cfg = self.picam2.create_video_configuration(
+                    main={"size": (640, 480), "format": "BGR888"}
+                )
                 self.picam2.configure(cfg)
                 self.picam2.start()
-                logging.info("Picamera2 started successfully in RGB mode.")
+                logging.info("Picamera2 started successfully in BGR888 mode (will be converted to RGB).")
             except Exception as e:
                 logging.error(f"Failed to start camera: {e}")
                 self.picam2 = None
@@ -144,19 +155,37 @@ class ManualSteeringGUI:
         self.start_control_loop()
         self.update_camera_feed()
 
+    # --- WHITE BALANCE FIX ---
+    def fix_white_balance(self, frame):
+        """
+        Correct bluish tint using LAB color space gray-world assumption.
+        Works on RGB uint8 numpy arrays. Returns corrected RGB array.
+        """
+        lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB).astype(np.float32)
+        avg_a = np.average(lab[:, :, 1])
+        avg_b = np.average(lab[:, :, 2])
+        # Shift A and B channels toward neutral gray (128)
+        lab[:, :, 1] = lab[:, :, 1] - ((avg_a - 128) * (lab[:, :, 0] / 255.0) * 1.1)
+        lab[:, :, 2] = lab[:, :, 2] - ((avg_b - 128) * (lab[:, :, 0] / 255.0) * 1.1)
+        lab = np.clip(lab, 0, 255).astype(np.uint8)
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
     # --- CAMERA METHODS ---
     def update_camera_feed(self):
         if self.picam2:
             try:
-                # Capture directly in RGB format as configured
                 frame = self.picam2.capture_array()
                 if frame is not None:
-                    # Depending on Pi OS/camera module, R and B might be swapped.
+                    # Convert BGR -> RGB if needed (required when using BGR888 format)
                     if self.swap_rb:
-                         frame_rgb = frame[:, :, ::-1]
+                        frame_rgb = frame[:, :, ::-1]
                     else:
-                         frame_rgb = frame
-                         
+                        frame_rgb = frame
+
+                    # Apply white balance correction to remove bluish tint
+                    if self.apply_wb:
+                        frame_rgb = self.fix_white_balance(frame_rgb)
+
                     self.latest_frame = frame_rgb
                     img = Image.fromarray(frame_rgb, 'RGB')
                     imgtk = ImageTk.PhotoImage(image=img)
@@ -167,7 +196,8 @@ class ManualSteeringGUI:
         else:
             # Render a dummy frame if running offline
             mock = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(mock, "NO CAMERA (MOCK RUN)", (120, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(mock, "NO CAMERA (MOCK RUN)", (120, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             self.latest_frame = mock
             img = Image.fromarray(mock)
             imgtk = ImageTk.PhotoImage(image=img)
@@ -179,7 +209,6 @@ class ManualSteeringGUI:
     def capture_image(self):
         if self.latest_frame is not None:
             filename = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            # PIL Image strictly handles RGB data smoothly
             img = Image.fromarray(self.latest_frame)
             img.save(filename)
             logging.info(f"Image successfully saved: {filename}")
@@ -191,16 +220,21 @@ class ManualSteeringGUI:
         self.swap_rb = not self.swap_rb
         logging.info(f"Swap R/B set to: {self.swap_rb}")
 
-    # --- ORIGINAL CONTROL ALGORITHMS ---
+    def toggle_wb(self):
+        self.apply_wb = not self.apply_wb
+        state_str = "ON" if self.apply_wb else "OFF"
+        self.btn_wb.config(text=f"TOGGLE WHITE BALANCE FIX ({state_str})")
+        logging.info(f"White balance fix set to: {self.apply_wb}")
+
+    # --- CONTROL LOOP ---
     def start_control_loop(self):
         self.update_control()
-        self.root.after(50, self.start_control_loop) # 20Hz loop
+        self.root.after(50, self.start_control_loop)
 
     def update_control(self):
         if not self.is_connected:
             return
 
-        # 1. Determine Target from Keys
         if self.keys['Up']:
             self.target_speed = self.MAX_SPEED
         elif self.keys['Down']:
@@ -215,23 +249,19 @@ class ManualSteeringGUI:
         else:
             self.target_steer = 0.0
 
-        # 2. Smoothly Move Current -> Target (Ramping)
         self.current_speed = self.smooth_move(self.current_speed, self.target_speed, self.SPEED_STEP)
         self.current_steer = self.smooth_move(self.current_steer, self.target_steer, self.STEER_STEP)
 
-        # 3. Send to Car (only if changed significantly)
         if abs(self.current_speed) > 1 or abs(self.target_speed) > 1:
-             self.handler.set_speed(int(self.current_speed))
+            self.handler.set_speed(int(self.current_speed))
         else:
-             # Ensure we hit true 0 cleanly
-             if self.current_speed != 0:
-                 self.handler.set_speed(0)
-                 self.current_speed = 0
+            if self.current_speed != 0:
+                self.handler.set_speed(0)
+                self.current_speed = 0
 
         if abs(self.current_steer) > 0.5 or abs(self.target_steer) > 0.5:
             self.handler.set_steering(self.current_steer)
-            # Update slider specifically to match keyboard
-            self.slider.set(self.current_steer) 
+            self.slider.set(self.current_steer)
         else:
             if self.current_steer != 0:
                 self.handler.set_steering(0)
@@ -253,17 +283,14 @@ class ManualSteeringGUI:
         if event.keysym in self.keys:
             self.keys[event.keysym] = False
 
+    # --- CONNECTION ---
     def toggle_connection(self):
         if not self.is_connected:
-            # Connect
             self.lbl_status.config(text="Status: Connecting...", foreground="orange")
             self.root.update()
-            
-            # Run in thread to avoid freezing GUI
             t = threading.Thread(target=self._connect_thread)
             t.start()
         else:
-            # Disconnect
             self.handler.disconnect()
             self.is_connected = False
             self.update_ui_state(False)
@@ -289,14 +316,12 @@ class ManualSteeringGUI:
                 messagebox.showerror("Error", "Could not connect to STM32 board.")
             else:
                 self.lbl_status.config(text="Status: Disconnected", foreground="red")
-            
             self.btn_connect.config(text="Connect to Car")
             self.btn_stop.config(state="disabled")
 
     def on_slider_change(self, val):
         angle = float(val)
         self.lbl_steer_val.config(text=f"Angle: {angle:.1f}°")
-        
         if self.is_connected:
             self.handler.set_steering(angle)
 
@@ -313,9 +338,8 @@ class ManualSteeringGUI:
     def check_status(self):
         if self.is_connected:
             if not getattr(self.handler, "running", True):
-                 self.is_connected = False
-                 self.update_ui_state(False, error=True)
-        
+                self.is_connected = False
+                self.update_ui_state(False, error=True)
         self.root.after(1000, self.check_status)
 
     def on_close(self):
