@@ -7,6 +7,7 @@ from datetime import datetime
 from PIL import Image, ImageTk
 
 import cv2
+
 try:
     from picamera2 import Picamera2
     _CAM_AVAILABLE = True
@@ -33,7 +34,7 @@ class ManualSteeringGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("BFMC Manual Steering Control & RGB Camera Capture")
-        self.root.geometry("1000x660")
+        self.root.geometry("1000x700")
 
         self.handler = STM32_SerialHandler()
         self.is_connected = False
@@ -44,200 +45,213 @@ class ManualSteeringGUI:
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ----------------- LAYOUT SPLIT -----------------
-        left_frame = ttk.Frame(main_frame, width=300)
+        left_frame = ttk.Frame(main_frame, width=320)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
         right_frame = ttk.Frame(main_frame)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # ----------------- CONNECTION SECTION -----------------
+        # --- CONNECTION ---
         conn_frame = ttk.LabelFrame(left_frame, text="Connection", padding="10")
         conn_frame.pack(fill=tk.X, pady=5)
-
         self.btn_connect = ttk.Button(conn_frame, text="Connect to Car", command=self.toggle_connection)
         self.btn_connect.pack(fill=tk.X)
-
         self.lbl_status = ttk.Label(conn_frame, text="Status: Disconnected", foreground="red")
         self.lbl_status.pack(pady=5)
 
-        # ----------------- STEERING SECTION -----------------
+        # --- STEERING ---
         steer_frame = ttk.LabelFrame(left_frame, text="Steering Control", padding="10")
-        steer_frame.pack(fill=tk.X, pady=10)
-
+        steer_frame.pack(fill=tk.X, pady=5)
         self.lbl_steer_val = ttk.Label(steer_frame, text="Angle: 0°")
         self.lbl_steer_val.pack()
-
-        self.slider = ttk.Scale(
-            steer_frame,
-            from_=-20,
-            to=20,
-            orient=tk.HORIZONTAL,
-            command=self.on_slider_change
-        )
+        self.slider = ttk.Scale(steer_frame, from_=-20, to=20, orient=tk.HORIZONTAL, command=self.on_slider_change)
         self.slider.set(0)
         self.slider.pack(fill=tk.X, pady=5)
-
         self.btn_center = ttk.Button(steer_frame, text="Check Center (0°)", command=self.center_steering)
-        self.btn_center.pack(pady=5)
+        self.btn_center.pack(pady=3)
 
-        # ----------------- EMERGENCY SECTION -----------------
+        # --- COLOR CORRECTION ---
+        color_frame = ttk.LabelFrame(left_frame, text="Color Correction (Hardware)", padding="10")
+        color_frame.pack(fill=tk.X, pady=5)
+
+        # Info label
+        ttk.Label(color_frame, text="Increase Red / decrease Blue\nto fix bluish tint:",
+                  foreground="gray").pack(anchor=tk.W)
+
+        # Red gain
+        ttk.Label(color_frame, text="Red Gain (1.0 – 8.0):").pack(anchor=tk.W, pady=(5, 0))
+        self.red_gain_var = tk.DoubleVar(value=3.5)
+        self.slider_red = ttk.Scale(color_frame, from_=1.0, to=8.0, orient=tk.HORIZONTAL,
+                                    variable=self.red_gain_var, command=self.on_gain_change)
+        self.slider_red.pack(fill=tk.X)
+        self.lbl_red = ttk.Label(color_frame, text="Red: 3.50")
+        self.lbl_red.pack(anchor=tk.E)
+
+        # Blue gain
+        ttk.Label(color_frame, text="Blue Gain (1.0 – 8.0):").pack(anchor=tk.W, pady=(5, 0))
+        self.blue_gain_var = tk.DoubleVar(value=1.2)
+        self.slider_blue = ttk.Scale(color_frame, from_=1.0, to=8.0, orient=tk.HORIZONTAL,
+                                     variable=self.blue_gain_var, command=self.on_gain_change)
+        self.slider_blue.pack(fill=tk.X)
+        self.lbl_blue = ttk.Label(color_frame, text="Blue: 1.20")
+        self.lbl_blue.pack(anchor=tk.E)
+
+        btn_row = ttk.Frame(color_frame)
+        btn_row.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_row, text="Reset Gains", command=self.reset_gains).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(btn_row, text="Apply Now", command=self.on_gain_change).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        # Software WB toggle (extra fallback layer)
+        self.apply_wb = True
+        self.btn_wb = ttk.Button(color_frame, text="SW White Balance: ON", command=self.toggle_wb)
+        self.btn_wb.pack(fill=tk.X, pady=2)
+
+        # --- EMERGENCY ---
         self.btn_stop = ttk.Button(left_frame, text="EMERGENCY STOP", command=self.emergency_stop)
-        self.btn_stop.pack(fill=tk.X, pady=20)
+        self.btn_stop.pack(fill=tk.X, pady=15)
         self.btn_stop.configure(state="disabled")
 
-        # ----------------- CAMERA SECTION -----------------
+        # --- CAMERA DISPLAY ---
         cam_frame = ttk.LabelFrame(right_frame, text="Live RPi Camera (RGB)", padding="10")
         cam_frame.pack(fill=tk.BOTH, expand=True)
-
         self.cam_label = tk.Label(cam_frame, bg="black")
         self.cam_label.pack(fill=tk.BOTH, expand=True)
 
         self.btn_capture = ttk.Button(right_frame, text="CAPTURE RGB IMAGE", command=self.capture_image)
         self.btn_capture.pack(fill=tk.X, pady=5)
 
-        # Video Recording Controls
-        video_frame = ttk.Frame(right_frame)
-        video_frame.pack(fill=tk.X, pady=5)
-
-        self.btn_rec_start = ttk.Button(video_frame, text="START RECORD", command=self.start_recording)
-        self.btn_rec_start.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-
-        self.btn_rec_stop = ttk.Button(video_frame, text="STOP RECORD", command=self.stop_recording)
-        self.btn_rec_stop.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
-        self.btn_rec_stop.configure(state="disabled")
-
-        # White Balance toggle
-        self.btn_wb = ttk.Button(right_frame, text="TOGGLE WHITE BALANCE FIX (ON)", command=self.toggle_wb)
-        self.btn_wb.pack(fill=tk.X, pady=5)
-
-        # Debug label — shows detected frame shape so you can confirm channel count live
-        self.lbl_frame_info = ttk.Label(right_frame, text="Frame info: N/A", foreground="gray")
-        self.lbl_frame_info.pack(pady=2)
-
-        # ----------------- KEYBOARD CONTROL -----------------
+        # --- KEYBOARD ---
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
-
         self.keys = {'Up': False, 'Down': False, 'Left': False, 'Right': False}
         self.current_speed = 0.0
         self.target_speed = 0.0
         self.current_steer = 0.0
         self.target_steer = 0.0
-
         self.SPEED_STEP = 30.0
         self.STEER_STEP = 3.0
         self.MAX_SPEED = 200.0
         self.MAX_STEER = 20.0
 
-        # ----------------- CAMERA STATE -----------------
         self.picam2 = None
         self.latest_frame = None
-        self.apply_wb = True
-        self.video_writer = None
-        self.is_recording = False
 
+        # --- CAMERA INIT ---
         if _CAM_AVAILABLE:
-            try:
-                self.picam2 = Picamera2()
-                # RGB888 — correct 3-channel RGB format.
-                # Avoids the 4-channel XBGR output that BGR888 can produce on RPi 5
-                # with newer libcamera, which is the primary cause of colour corruption.
-                cfg = self.picam2.create_video_configuration(
-                    main={"size": (640, 480), "format": "RGB888"}
-                )
-                self.picam2.configure(cfg)
-                self.picam2.start()
-                logging.info("Picamera2 started in RGB888 mode.")
-            except Exception as e:
-                logging.error(f"Failed to start camera: {e}")
-                self.picam2 = None
+            self._init_camera()
 
         self.start_control_loop()
         self.update_camera_feed()
 
-    # ------------------------------------------------------------------ #
-    #  FRAME NORMALISATION — the core RGB fix                             #
-    #                                                                      #
-    #  Picamera2 on RPi 5 / newer libcamera can silently return:          #
-    #    • (H, W, 3)  uint8  RGB  — correct, use directly                 #
-    #    • (H, W, 3)  uint8  BGR  — flip channels                         #
-    #    • (H, W, 4)  uint8  XBGR / BGRA — strip alpha, convert           #
-    #                                                                      #
-    #  We detect the channel count and normalise everything to RGB.       #
-    # ------------------------------------------------------------------ #
-    def to_rgb(self, frame):
-        if frame is None:
-            return None
+    # -------------------------------------------------------------------------
+    # CAMERA INITIALISATION
+    # -------------------------------------------------------------------------
+    def _init_camera(self):
+        try:
+            self.picam2 = Picamera2()
 
-        # 4-channel frame (XBGR or BGRA) — common bug on RPi 5 with BGR888
-        if frame.ndim == 3 and frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-            logging.debug("4-channel frame detected — converted BGRA→RGB")
-            return frame
+            # XRGB8888 is the most stable 4-channel format on RPi 5
+            cfg = self.picam2.create_video_configuration(
+                main={"size": (640, 480), "format": "XRGB8888"},
+                controls={
+                    # ---- KEY FIX: disable auto white balance ----
+                    "AwbEnable": False,
+                    # Manual colour gains: (red_gain, blue_gain)
+                    # High red, low blue removes the typical blue cast.
+                    # Use the sliders in the GUI to fine-tune live.
+                    "ColourGains": (3.5, 1.2),
+                    # Keep auto-exposure on for correct brightness
+                    "AeEnable": True,
+                    # Slight saturation boost so colours look vivid after WB fix
+                    "Saturation": 1.4,
+                    "Sharpness": 1.2,
+                }
+            )
+            self.picam2.configure(cfg)
+            self.picam2.start()
+            logging.info("Picamera2 started: XRGB8888, AWB OFF, ColourGains=(3.5, 1.2)")
+        except Exception as e:
+            logging.error(f"Failed to start camera: {e}")
+            self.picam2 = None
 
-        # 3-channel frame from RGB888 — already correct RGB, return directly
-        if frame.ndim == 3 and frame.shape[2] == 3:
-            # Uncomment the line below ONLY if colours still look wrong (BGR output):
-            # return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            return frame
+    # -------------------------------------------------------------------------
+    # COLOUR GAIN CONTROLS
+    # -------------------------------------------------------------------------
+    def on_gain_change(self, _=None):
+        r = round(self.red_gain_var.get(), 2)
+        b = round(self.blue_gain_var.get(), 2)
+        self.lbl_red.config(text=f"Red: {r:.2f}")
+        self.lbl_blue.config(text=f"Blue: {b:.2f}")
+        if self.picam2:
+            try:
+                self.picam2.set_controls({
+                    "AwbEnable": False,
+                    "ColourGains": (r, b)
+                })
+                logging.info(f"Hardware ColourGains set to Red={r}, Blue={b}")
+            except Exception as e:
+                logging.warning(f"Could not set ColourGains: {e}")
 
-        logging.warning(f"Unexpected frame shape: {frame.shape} — returning as-is")
-        return frame
+    def reset_gains(self):
+        self.red_gain_var.set(3.5)
+        self.blue_gain_var.set(1.2)
+        self.on_gain_change()
 
-    # ------------------------------------------------------------------ #
-    #  WHITE BALANCE — LAB gray-world correction                          #
-    #  Removes bluish / colour casts from camera sensor defaults.         #
-    # ------------------------------------------------------------------ #
-    def fix_white_balance(self, frame):
-        lab = cv2.cvtColor(frame, cv2.COLOR_RGB2LAB).astype(np.float32)
-        avg_a = np.average(lab[:, :, 1])
-        avg_b = np.average(lab[:, :, 2])
-        lab[:, :, 1] -= (avg_a - 128) * (lab[:, :, 0] / 255.0) * 1.1
-        lab[:, :, 2] -= (avg_b - 128) * (lab[:, :, 0] / 255.0) * 1.1
-        lab = np.clip(lab, 0, 255).astype(np.uint8)
+    def toggle_wb(self):
+        self.apply_wb = not self.apply_wb
+        state = "ON" if self.apply_wb else "OFF"
+        self.btn_wb.config(text=f"SW White Balance: {state}")
+
+    # -------------------------------------------------------------------------
+    # SOFTWARE WHITE BALANCE (LAB gray-world fallback)
+    # -------------------------------------------------------------------------
+    def fix_white_balance_lab(self, frame_rgb):
+        """
+        Removes remaining color cast using LAB color space.
+        Shifts A and B channels toward neutral 128.
+        """
+        lab = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        avg_a = np.mean(a_ch)
+        avg_b = np.mean(b_ch)
+        a_ch -= (avg_a - 128) * (l_ch / 255.0) * 1.2
+        b_ch -= (avg_b - 128) * (l_ch / 255.0) * 1.2
+        lab = cv2.merge([
+            np.clip(l_ch, 0, 255),
+            np.clip(a_ch, 0, 255),
+            np.clip(b_ch, 0, 255)
+        ]).astype(np.uint8)
         return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    # ------------------------------------------------------------------ #
-    #  CAMERA FEED                                                         #
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------------------
+    # CAMERA FEED
+    # -------------------------------------------------------------------------
     def update_camera_feed(self):
         if self.picam2:
             try:
-                raw = self.picam2.capture_array()
+                frame = self.picam2.capture_array()
+                if frame is not None:
+                    # XRGB8888 = 4 channels (BGRA order from libcamera on RPi)
+                    if frame.ndim == 3 and frame.shape[2] == 4:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+                    else:
+                        # Fallback: treat as BGR
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Step 1 — normalise to clean 3-ch RGB regardless of driver quirks
-                frame_rgb = self.to_rgb(raw)
-
-                if frame_rgb is not None:
-                    # Step 2 — optional white balance correction
+                    # Software WB as secondary correction layer
                     if self.apply_wb:
-                        frame_rgb = self.fix_white_balance(frame_rgb)
+                        frame_rgb = self.fix_white_balance_lab(frame_rgb)
 
                     self.latest_frame = frame_rgb
-
-                    # Update debug info label
-                    self.lbl_frame_info.config(
-                        text=f"Raw: {raw.shape} → Output: {frame_rgb.shape} | dtype: {frame_rgb.dtype}"
-                    )
-
-                    # Step 3 — write to video if recording (VideoWriter needs BGR)
-                    if self.is_recording and self.video_writer is not None:
-                        bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-                        self.video_writer.write(bgr)
-
-                    # Step 4 — display
                     img = Image.fromarray(frame_rgb, 'RGB')
                     imgtk = ImageTk.PhotoImage(image=img)
                     self.cam_label.imgtk = imgtk
                     self.cam_label.configure(image=imgtk)
-
             except Exception as e:
                 logging.debug(f"Frame drop: {e}")
         else:
-            # Mock frame when no camera is available
             mock = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(mock, "NO CAMERA (MOCK RUN)", (100, 240),
+            cv2.putText(mock, "NO CAMERA (MOCK RUN)", (90, 240),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             self.latest_frame = mock
             img = Image.fromarray(mock)
@@ -247,56 +261,19 @@ class ManualSteeringGUI:
 
         self.root.after(30, self.update_camera_feed)
 
-    # ------------------------------------------------------------------ #
-    #  CAPTURE / RECORDING                                                 #
-    # ------------------------------------------------------------------ #
     def capture_image(self):
         if self.latest_frame is not None:
             filename = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            Image.fromarray(self.latest_frame).save(filename)
+            img = Image.fromarray(self.latest_frame)
+            img.save(filename)
             logging.info(f"Image saved: {filename}")
             messagebox.showinfo("Capture Saved", f"Image saved to:\n{filename}")
         else:
             messagebox.showwarning("Warning", "No frame available to capture.")
 
-    def start_recording(self):
-        if not self.picam2:
-            messagebox.showerror("Error", "Camera is not available.")
-            return
-        if self.is_recording:
-            return
-
-        filename = f"video_{datetime.now().strftime('%Y%m%d_%H%M%S')}.avi"
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        self.video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (640, 480))
-
-        if self.video_writer.isOpened():
-            self.is_recording = True
-            self.btn_rec_start.configure(state="disabled")
-            self.btn_rec_stop.configure(state="normal")
-            logging.info(f"Recording started: {filename}")
-        else:
-            messagebox.showerror("Error", "Failed to initialise video writer.")
-
-    def stop_recording(self):
-        if self.is_recording and self.video_writer is not None:
-            self.video_writer.release()
-            self.video_writer = None
-            self.is_recording = False
-            self.btn_rec_start.configure(state="normal")
-            self.btn_rec_stop.configure(state="disabled")
-            logging.info("Recording stopped and saved.")
-            messagebox.showinfo("Recording Saved", "Video file saved successfully.")
-
-    def toggle_wb(self):
-        self.apply_wb = not self.apply_wb
-        state_str = "ON" if self.apply_wb else "OFF"
-        self.btn_wb.config(text=f"TOGGLE WHITE BALANCE FIX ({state_str})")
-        logging.info(f"White balance fix: {self.apply_wb}")
-
-    # ------------------------------------------------------------------ #
-    #  CONTROL LOOP                                                        #
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------------------
+    # CONTROL LOOP
+    # -------------------------------------------------------------------------
     def start_control_loop(self):
         self.update_control()
         self.root.after(50, self.start_control_loop)
@@ -353,14 +330,15 @@ class ManualSteeringGUI:
         if event.keysym in self.keys:
             self.keys[event.keysym] = False
 
-    # ------------------------------------------------------------------ #
-    #  CONNECTION                                                          #
-    # ------------------------------------------------------------------ #
+    # -------------------------------------------------------------------------
+    # CONNECTION
+    # -------------------------------------------------------------------------
     def toggle_connection(self):
         if not self.is_connected:
             self.lbl_status.config(text="Status: Connecting...", foreground="orange")
             self.root.update()
-            threading.Thread(target=self._connect_thread).start()
+            t = threading.Thread(target=self._connect_thread)
+            t.start()
         else:
             self.handler.disconnect()
             self.is_connected = False
@@ -414,8 +392,6 @@ class ManualSteeringGUI:
         self.root.after(1000, self.check_status)
 
     def on_close(self):
-        if self.is_recording:
-            self.stop_recording()
         if self.is_connected:
             self.handler.disconnect()
         if self.picam2:
