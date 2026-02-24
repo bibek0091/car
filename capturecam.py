@@ -147,8 +147,10 @@ class ManualSteeringGUI:
                 # Capture directly in RGB format as configured
                 frame = self.picam2.capture_array()
                 if frame is not None:
-                    self.latest_frame = frame
-                    img = Image.fromarray(frame)
+                    # Picamera2 often defaults to BGR arrays depending on OS bindings
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    self.latest_frame = frame_rgb
+                    img = Image.fromarray(frame_rgb)
                     imgtk = ImageTk.PhotoImage(image=img)
                     self.cam_label.imgtk = imgtk
                     self.cam_label.configure(image=imgtk)
