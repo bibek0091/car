@@ -255,3 +255,23 @@ class VisionPipeline:
             l_conf=self.tracker.l_conf,
             r_conf=self.tracker.r_conf
         )
+
+def estimate_heading_from_lanes(sl, sr, h=480):
+    """
+    Returns heading_correction_rad relative to current heading.
+    Positive = road curves right.
+    Uses derivative of lane polynomial at bottom of image.
+    """
+    tangents = []
+    for fit in [sl, sr]:
+        if fit is None:
+            continue
+        # dx/dy = 2a*y + b  (derivative of x=ay^2+by+c w.r.t. y)
+        dxdy = 2 * fit[0] * h + fit[1]
+        # Road heading offset from image center axis (forward = 0)
+        # Small dxdy = road going straight, large = road curving
+        angle_rad = math.atan2(dxdy, 1.0)  # angle of road tangent
+        tangents.append(angle_rad)
+    if not tangents:
+        return 0.0
+    return -float(np.mean(tangents))   # negate: right lean = left correction

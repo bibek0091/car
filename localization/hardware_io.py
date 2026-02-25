@@ -174,19 +174,23 @@ class HardwareIO:
         self.serial.set_steering(steer_angle_deg)
 
     def set_speed(self, speed_pwm):
-        """speed_pwm: 0-100."""
+        """speed_pwm: 0-100. STM32 expects mm/s (0-500)."""
         speed_pwm = max(0.0, min(100.0, speed_pwm))
         if self.sim_mode:
             self._sim_speed_pwm = speed_pwm
             self._last_cmd_speed = speed_pwm
             return
-        self.serial.set_speed(speed_pwm)
+        # Convert PWM to mm/s using calibrated mapping
+        # Deadband below ~12 PWM; map 12-100 -> 0-500 mm/s
+        speed_mms = max(0.0, (speed_pwm - 12.0) * (500.0 / 88.0))
+        self.serial.set_speed(speed_mms)
 
     def get_velocity_ms(self):
         if self.sim_mode:
             cmd = getattr(self, "_last_cmd_speed", 0.0)
             return max(0.0, (cmd - 12.0) * self.SPEED_CALIB)
-        return self.serial.get_feedback()[0]
+        raw_mms = self.serial.get_feedback()[0]
+        return raw_mms / 1000.0  # Convert mm/s -> m/s
 
     def get_encoder_steer_deg(self):
         if self.sim_mode:

@@ -220,7 +220,9 @@ class TrafficDecisionEngine:
                 else: dist = "HALT"
                 
                 fsm_st = self.tl_fsm.update(clr=="RED", clr=="GREEN", dist)
-                if fsm_st == "LIGHT_APPROACHING":
+                
+                # BUG 6: FSM has wrong state name here. Should be LIGHT_DETECTED_FAR
+                if fsm_st == "LIGHT_DETECTED_FAR":
                     light_st = "[RED] APPROACH"
                     commit(4, "SYS_SLOW", "RED LIGHT AHEAD")
                 elif fsm_st in ["LIGHT_RED_STOPPING", "LIGHT_RED_STOPPED"]:

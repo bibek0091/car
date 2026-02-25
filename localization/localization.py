@@ -31,34 +31,42 @@ class LocalizationEngine:
         with self.pose_lock:
             return self.x, self.y, self.yaw
         
-    def update(self, velocity_ms, steer_angle_deg, imu_yaw_deg, lane_error_px, lane_width_px, conf, dt):
+    def update(self, velocity_ms, steer_angle_deg, imu_yaw_deg, lane_error_px, lane_width_px, conf, dt,
+               imu_available=True, camera_yaw_correction=0.0):
         """
-        Layer 1: IMU yaw
-        Layer 2: Dead Reckoning translation
+        Layer 1: IMU yaw (or camera tangent if IMU dead)
+        Layer 2: Bicycle-model dead reckoning
         Layer 3a: Camera lateral snap
         """
-        # 1. Yaw priority from IMU (smoothing the discontinuity wrap)
-        new_yaw = math.radians(imu_yaw_deg)
-        
         with self.pose_lock:
-            delta = new_yaw - self.yaw
-            delta = (delta + math.pi) % (2 * math.pi) - math.pi  # clamp to (-pi, pi)
-            self.yaw = self.yaw + delta  # smooth update, no discontinuity
+            # ── Layer 1: Heading update ────────────────────────────────────────
+            if imu_available:
+                new_yaw = math.radians(imu_yaw_deg)
+                delta = (new_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                self.yaw += delta
+            else:
+                # Kinematic yaw from steering + camera correction blend
+                steer_rad = math.radians(max(-45.0, min(45.0, steer_angle_deg)))
+                yaw_rate_km = 0.0
+                if velocity_ms > 0.05:
+                    yaw_rate_km = (velocity_ms / self.wheelbase) * math.tan(steer_rad)
+                alpha = min(0.8, conf)   # camera weight: 0->pure kinematic, 0.8->mostly vision
+                yaw_rate = yaw_rate_km * (1 - alpha) + (camera_yaw_correction / max(dt, 0.01)) * alpha
+                self.yaw += yaw_rate * dt
             
-            # 2. Dead-reckoning for translation
+            # ── Layer 2: Dead reckoning ────────────────────────────────────────
             self.x += velocity_ms * dt * math.cos(self.yaw)
             self.y += velocity_ms * dt * math.sin(self.yaw)
             
-            # 3a. Vision Correction
-            if conf > 0.5 and lane_width_px > 0:
+            # ── Layer 3a: Visual lateral correction ───────────────────────────
+            if conf > 0.4 and lane_width_px > 50:
                 lane_error_m = lane_error_px * (0.35 / lane_width_px)
-                # Perpendicular-right unit vector = (sin(yaw), -cos(yaw))
-                # Positive lane_error_m means car is left of center -> push pose rightward
                 perp_x = math.sin(self.yaw)
                 perp_y = -math.cos(self.yaw)
-                self.x += 0.08 * lane_error_m * perp_x
-                self.y += 0.08 * lane_error_m * perp_y
-                
+                gain = 0.12 * min(conf, 1.0)   # scale gain by confidence
+                self.x += gain * lane_error_m * perp_x
+                self.y += gain * lane_error_m * perp_y
+
             return self.x, self.y, self.yaw
 
     def _nearest_point_on_segment(self, p, a, b):

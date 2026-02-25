@@ -100,7 +100,9 @@ class PathPlanner:
             if accumulated_dist >= lookahead_m and len(waypoints) >= 2:
                 break
                 
-        return waypoints, closest_idx
+        # BUG 4: Enforce forward-only cursor, never go backward
+        new_cursor = max(cursor, closest_idx)
+        return waypoints, new_cursor
 
     def get_path_curvature(self, current_x, current_y, path, cursor=0, window_m=1.2):
         """Compute average angular change per meter ahead in path."""

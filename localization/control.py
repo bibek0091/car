@@ -36,7 +36,7 @@ class Controller:
         t_map = 320.0
         ppm = perc_res.lane_width_px / 0.35
         
-        la_px = max(150.0, min(500.0, velocity_ms * ppm * 1.5))
+        la_px = 320.0 if velocity_ms < 0.15 else max(150.0, min(500.0, velocity_ms * ppm * 1.5))
         if map_curvature > 0.002:
             la_px *= 0.8  # Look closer to react tighter on known curves
 
@@ -78,12 +78,12 @@ class Controller:
         # DividerGuard (Emergency boundary check)
         if perc_res.sl is not None:
             lx = np.polyval(perc_res.sl, 400)
-            if (t_vis - lx) < 110: # Too close to left
+            if (t_vis - lx) < 90: # Too close to left
                 target_x += 40
                 
         if perc_res.sr is not None:
             rx = np.polyval(perc_res.sr, 400)
-            if (rx - t_vis) < 70: # Too close to right
+            if (rx - t_vis) < 90: # Too close to right
                 target_x -= 40
 
         # 2. Steering Computation & Smoothing

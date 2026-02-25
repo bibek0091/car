@@ -1264,6 +1264,14 @@ class Orchestrator:
                     log.warning("Slip detected! Encoder velocity discarded.")
                     velocity_ms = 0.0
 
+                imu_available = (self.hw.imu is not None) or self.hw.sim_mode
+
+                # Camera yaw from lane tangents
+                cam_yaw_corr = 0.0
+                if not imu_available and (v_res.sl is not None or v_res.sr is not None):
+                    from localization.perception import estimate_heading_from_lanes
+                    cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
+
                 pose = self.localizer.update(
                     velocity_ms     = velocity_ms,
                     steer_angle_deg = steer,
@@ -1271,7 +1279,9 @@ class Orchestrator:
                     lane_error_px   = v_res.lateral_error_px,
                     lane_width_px   = v_res.lane_width_px,
                     conf            = v_res.confidence,
-                    dt              = self._dt
+                    dt              = self._dt,
+                    imu_available   = imu_available,
+                    camera_yaw_correction = cam_yaw_corr
                 )
 
                 # 7. Lookahead waypoints from A* path
@@ -1285,7 +1295,9 @@ class Orchestrator:
                 # 8.1 Node Reset
                 if nearest_node != self._last_nearest_node and nearest_node in self.planner.node_positions:
                     node_pos = self.planner.node_positions[nearest_node]
-                    self.localizer.node_reset(node_pos[0], node_pos[1])
+                    # Soft snap: blend toward node, don't teleport (BUG 2)
+                    self.localizer.x = 0.85 * self.localizer.x + 0.15 * node_pos[0]
+                    self.localizer.y = 0.85 * self.localizer.y + 0.15 * node_pos[1]
                     self._last_nearest_node = nearest_node
                 
                 # 8a. Lap completion check
@@ -1457,8 +1469,16 @@ if __name__ == "__main__":
             log.info(f"A* path: {len(orch.planned_path)} nodes  ({start_node} → {target_node})")
 
         sp = orch.planner.node_positions.get(start_node, (0.0, 0.0))
-        orch.localizer.set_pose(sp[0], sp[1], 0.0)
-        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f})")
+        
+        # User requested to init yaw from first A* edge direction
+        init_yaw = 0.0
+        if orch.planned_path and len(orch.planned_path) >= 2:
+            p1 = orch.planner.node_positions[orch.planned_path[0]]
+            p2 = orch.planner.node_positions[orch.planned_path[1]]
+            init_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+
+        orch.localizer.set_pose(sp[0], sp[1], init_yaw)
+        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f}, ψ={math.degrees(init_yaw):.1f}°)")
         
         dash.draw_route_on_map(orch.planned_path, start_node, target_node)
         
