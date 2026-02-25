@@ -1,0 +1,1 @@
+schema_ver,timestamp,fps,yolo_ms,vis_ms,speed_pwm,velocity_ms,steer_angle,nav_state,traffic_state,x_est,y_est,yaw_est,imu_yaw_raw,nearest_node,curvature,lane_l_conf,lane_r_conf,estop

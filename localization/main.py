@@ -966,19 +966,55 @@ class DashboardApp:
         self.canvas_map.draw_idle()
 
         # ── Camera feeds ────────────────────────────────────────────────────────
-        if yolo_frame is not None:
-            self._yolo_img = self._cv2tk(yolo_frame, 460, 280)
-            self.lbl_yolo.config(image=self._yolo_img)
+        # Always render — _cv2tk shows "NO FEED" placeholder when frame is None
+        self._yolo_img = self._cv2tk(yolo_frame, 460, 280)
+        self.lbl_yolo.config(image=self._yolo_img)
 
-        if bev_frame is not None:
-            self._bev_img = self._cv2tk(bev_frame, 460, 240)
-            self.lbl_bev.config(image=self._bev_img)
+        self._bev_img = self._cv2tk(bev_frame, 460, 240)
+        self.lbl_bev.config(image=self._bev_img)
 
-    def _cv2tk(self, cv_img: np.ndarray, w: int, h: int):
-        from PIL import Image, ImageTk
-        cv_img = cv2.resize(cv_img, (w, h))
-        cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        return ImageTk.PhotoImage(Image.fromarray(cv_img))
+    def _cv2tk(self, cv_img, w: int, h: int):
+        """Convert a cv2 BGR/BGRA frame to a Tkinter PhotoImage safely."""
+        from PIL import Image, ImageTk, ImageDraw, ImageFont
+        try:
+            if cv_img is None:
+                raise ValueError("None frame")
+
+            # Ensure we have a proper uint8 numpy array
+            if not isinstance(cv_img, np.ndarray):
+                raise ValueError("Not ndarray")
+
+            # Normalise channel count → BGR
+            if cv_img.ndim == 2:
+                cv_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+            elif cv_img.shape[2] == 4:
+                cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGRA2BGR)
+            elif cv_img.shape[2] != 3:
+                raise ValueError(f"Unexpected channels: {cv_img.shape[2]}")
+
+            cv_img = cv2.resize(cv_img, (w, h))
+            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+
+            # If the frame is near-black (sim / no-video mode), draw a label so it
+            # doesn't look like "nothing is there"
+            mean_brightness = cv_img.mean()
+            if mean_brightness < 5.0:
+                pil_img = Image.fromarray(cv_img)
+                draw = ImageDraw.Draw(pil_img)
+                draw.rectangle([0, 0, w - 1, h - 1], outline=(50, 50, 60), width=2)
+                draw.text((w // 2, h // 2), "NO SIGNAL", fill=(80, 80, 90), anchor="mm")
+                return ImageTk.PhotoImage(pil_img)
+
+            return ImageTk.PhotoImage(Image.fromarray(cv_img))
+
+        except Exception as e:
+            # Render a visible placeholder so the panel is never invisibly blank
+            img = Image.new("RGB", (w, h), (18, 18, 22))
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([2, 2, w - 3, h - 3], outline=(60, 60, 75), width=1)
+            draw.text((w // 2, h // 2 - 10), "NO FEED", fill=(100, 100, 120), anchor="mm")
+            draw.text((w // 2, h // 2 + 10), str(e)[:40], fill=(60, 60, 70), anchor="mm")
+            return ImageTk.PhotoImage(img)
 
     # ── Map click → re-localize ────────────────────────────────────────────────
     def _on_map_click(self, event):
@@ -1107,6 +1143,14 @@ class Orchestrator:
             r_conf = 0.0
             anchor = "HOLD"
             waypoints = []
+            # ── CRITICAL: must be initialized every frame or telem dict crashes ──
+            yolo_frame  = None
+            bev_frame   = None
+            nav_state   = "INIT"
+            traffic_str = "SYS_GO"
+            reason      = "—"
+            light_st    = "NONE"
+            act_lbl     = []
 
             # ── E-STOP check ────────────────────────────────────────────────────
             if estop_event.is_set():
@@ -1145,14 +1189,19 @@ class Orchestrator:
                 # Try to pull one frame to warm up camera and YOLO
                 try:
                     frame = self.hw.capture_frame()
-                    if frame is not None:
+                    if frame is not None and frame.any():
                         # Feed the pipeline once to compile/warmup allocators
-                        _ = self.traffic.process(frame)
-                        _ = self.vision.process(frame)
-                        yolo_frame = frame  # show raw frame in GUI during calib
-                        bev_frame = None
-                except Exception:
-                    pass
+                        t_warm = self.traffic.process(frame)
+                        v_warm = self.vision.process(frame)
+                        yolo_frame = t_warm.yolo_debug_frame if t_warm.yolo_debug_frame is not None else frame
+                        bev_frame  = v_warm.lane_dbg          # Show BEV during calibration too
+                    else:
+                        yolo_frame = None
+                        bev_frame  = None
+                except Exception as e:
+                    log.warning(f"Calibration warmup frame error: {e}")
+                    yolo_frame = None
+                    bev_frame  = None
                 
                 reason = f"{calib_remain:.1f} s remaining"
                 speed, steer = 0.0, 0.0
@@ -1264,14 +1313,6 @@ class Orchestrator:
                     log.warning("Slip detected! Encoder velocity discarded.")
                     velocity_ms = 0.0
 
-                imu_available = (self.hw.imu is not None) or self.hw.sim_mode
-
-                # Camera yaw from lane tangents
-                cam_yaw_corr = 0.0
-                if not imu_available and (v_res.sl is not None or v_res.sr is not None):
-                    from localization.perception import estimate_heading_from_lanes
-                    cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
-
                 pose = self.localizer.update(
                     velocity_ms     = velocity_ms,
                     steer_angle_deg = steer,
@@ -1279,9 +1320,7 @@ class Orchestrator:
                     lane_error_px   = v_res.lateral_error_px,
                     lane_width_px   = v_res.lane_width_px,
                     conf            = v_res.confidence,
-                    dt              = self._dt,
-                    imu_available   = imu_available,
-                    camera_yaw_correction = cam_yaw_corr
+                    dt              = self._dt
                 )
 
                 # 7. Lookahead waypoints from A* path
@@ -1295,9 +1334,7 @@ class Orchestrator:
                 # 8.1 Node Reset
                 if nearest_node != self._last_nearest_node and nearest_node in self.planner.node_positions:
                     node_pos = self.planner.node_positions[nearest_node]
-                    # Soft snap: blend toward node, don't teleport (BUG 2)
-                    self.localizer.x = 0.85 * self.localizer.x + 0.15 * node_pos[0]
-                    self.localizer.y = 0.85 * self.localizer.y + 0.15 * node_pos[1]
+                    self.localizer.node_reset(node_pos[0], node_pos[1])
                     self._last_nearest_node = nearest_node
                 
                 # 8a. Lap completion check
@@ -1469,16 +1506,8 @@ if __name__ == "__main__":
             log.info(f"A* path: {len(orch.planned_path)} nodes  ({start_node} → {target_node})")
 
         sp = orch.planner.node_positions.get(start_node, (0.0, 0.0))
-        
-        # User requested to init yaw from first A* edge direction
-        init_yaw = 0.0
-        if orch.planned_path and len(orch.planned_path) >= 2:
-            p1 = orch.planner.node_positions[orch.planned_path[0]]
-            p2 = orch.planner.node_positions[orch.planned_path[1]]
-            init_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
-
-        orch.localizer.set_pose(sp[0], sp[1], init_yaw)
-        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f}, ψ={math.degrees(init_yaw):.1f}°)")
+        orch.localizer.set_pose(sp[0], sp[1], 0.0)
+        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f})")
         
         dash.draw_route_on_map(orch.planned_path, start_node, target_node)
         

@@ -18,10 +18,12 @@ except ImportError:
     log.warning("serial_handler not found. Using simulation mode for STM32.")
 
     class STM32_SerialHandler:
+        """Full stub — every method hardware_io.py can call must exist here."""
         def connect(self): return False
         def set_speed(self, s): pass
         def set_steering(self, s): pass
         def disconnect(self): pass
+        def get_feedback(self): return (0.0, 0.0)   # (speed_mms, steer_deg)
 
 # ===========================================================================
 # IMU (BNO055) Interface
@@ -59,6 +61,13 @@ except ImportError:
 
 class HardwareIO:
     def __init__(self, sim_mode=False, sim_video=None):
+        # Auto-enable sim mode if no hardware drivers are installed at all.
+        # This lets the system run on a dev/Windows machine without --sim flag.
+        _no_hw = (not _SERIAL_AVAILABLE and not _BNO_AVAILABLE and not _CAM_AVAILABLE)
+        if _no_hw and not sim_mode:
+            log.warning("No hardware drivers found — automatically entering simulation mode.")
+            sim_mode = True
+
         self.sim_mode = sim_mode
         self.sim_video = sim_video
         self.camera = None
@@ -174,28 +183,31 @@ class HardwareIO:
         self.serial.set_steering(steer_angle_deg)
 
     def set_speed(self, speed_pwm):
-        """speed_pwm: 0-100. STM32 expects mm/s (0-500)."""
+        """speed_pwm: 0-100."""
         speed_pwm = max(0.0, min(100.0, speed_pwm))
         if self.sim_mode:
             self._sim_speed_pwm = speed_pwm
             self._last_cmd_speed = speed_pwm
             return
-        # Convert PWM to mm/s using calibrated mapping
-        # Deadband below ~12 PWM; map 12-100 -> 0-500 mm/s
-        speed_mms = max(0.0, (speed_pwm - 12.0) * (500.0 / 88.0))
-        self.serial.set_speed(speed_mms)
+        self.serial.set_speed(speed_pwm)
 
     def get_velocity_ms(self):
         if self.sim_mode:
             cmd = getattr(self, "_last_cmd_speed", 0.0)
             return max(0.0, (cmd - 12.0) * self.SPEED_CALIB)
-        raw_mms = self.serial.get_feedback()[0]
-        return raw_mms / 1000.0  # Convert mm/s -> m/s
+        try:
+            raw_mms = self.serial.get_feedback()[0]
+            return raw_mms / 1000.0   # mm/s → m/s
+        except Exception:
+            return 0.0
 
     def get_encoder_steer_deg(self):
         if self.sim_mode:
             return getattr(self, "_last_cmd_steer", 0.0)
-        return self.serial.get_feedback()[1]
+        try:
+            return self.serial.get_feedback()[1]
+        except Exception:
+            return 0.0
 
     def get_imu_accel(self):
         if self.imu and not self.sim_mode:
