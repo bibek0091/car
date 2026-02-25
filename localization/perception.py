@@ -17,14 +17,20 @@ class PerceptionResult:
     r_conf: float
 
 class HybridLaneTracker:
-    NWINDOWS = 9
-    SW_MARGIN = 60
-    MINPIX = 50
+    NWINDOWS         = 9
+    SW_MARGIN        = 60
+    MINPIX           = 50
+    POLY_MARGIN_BASE = 60
+    POLY_MARGIN_CURV = 120
+    MIN_PIX_OK       = 200
+    EMA_ALPHA        = 0.50
     STALE_FIT_FRAMES = 5
 
     def __init__(self, h=480, w=640):
         self.h, self.w = h, w
         self.mode = "SEARCH"
+        self.left_fit = None
+        self.right_fit = None
         self.sl, self.sr = None, None
         self.l_stale, self.r_stale = 0, 0
         self.l_conf, self.r_conf = 0.0, 0.0
@@ -36,96 +42,144 @@ class HybridLaneTracker:
         denom = (1.0 + (2.0 * a * y_eval + b)**2)**1.5
         return abs(2.0 * a) / max(denom, 1e-6)
 
-    def _sliding_window(self, warped):
-        nz = warped.nonzero()
-        nzy, nzx = np.array(nz[0]), np.array(nz[1])
-        hist = np.sum(warped[self.h//2:, :], axis=0)
-        mid = int(self.w * 0.40)  # 256 instead of 320 to handle right driving lanes
-        
-        lb = int(np.argmax(hist[:mid]))
-        rb = int(np.argmax(hist[mid:])) + mid
-        
+    def _ema(self, prev, new):
+        if prev is None: return new.copy()
+        return self.EMA_ALPHA * new + (1.0 - self.EMA_ALPHA) * prev
+
+    def _sliding_window(self, warped, nzx, nzy):
+        dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+        hist = np.sum(warped[self.h // 2:, :], axis=0)
+
+        mid    = int(self.w * 0.40)
+        margin = self.SW_MARGIN
+
+        lb = int(np.argmax(hist[margin : mid - margin])) + margin
+        rb = int(np.argmax(hist[mid + margin : self.w - margin])) + mid + margin
+
+        if abs(rb - lb) < 100:
+            smoothed = np.convolve(hist.astype(float), np.ones(20) / 20, mode='same')
+            p1 = int(np.argmax(smoothed))
+            tmp = smoothed.copy()
+            tmp[max(0, p1-40):min(self.w, p1+40)] = 0
+            p2 = int(np.argmax(tmp))
+            lb, rb = (min(p1, p2), max(p1, p2))
+
         wh = self.h // self.NWINDOWS
         lx, rx = lb, rb
         li, ri = [], []
-        
-        for w in range(self.NWINDOWS):
-            y_lo, y_hi = self.h - (w+1)*wh, self.h - w*wh
-            xl0, xl1 = lx - self.SW_MARGIN, lx + self.SW_MARGIN
-            xr0, xr1 = rx - self.SW_MARGIN, rx + self.SW_MARGIN
-            
-            gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0) & (nzx < xl1)).nonzero()[0]
-            gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0) & (nzx < xr1)).nonzero()[0]
-            
+
+        for win in range(self.NWINDOWS):
+            y_lo, y_hi = self.h - (win + 1) * wh, self.h - win * wh
+            xl0, xl1 = max(0, lx - self.SW_MARGIN), min(self.w, lx + self.SW_MARGIN)
+            xr0, xr1 = max(0, rx - self.SW_MARGIN), min(self.w, rx + self.SW_MARGIN)
+
+            cv2.rectangle(dbg, (xl0, y_lo), (xl1, y_hi), (0, 255, 0), 2)
+            cv2.rectangle(dbg, (xr0, y_lo), (xr1, y_hi), (0, 255, 0), 2)
+
+            gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0)  & (nzx < xl1)).nonzero()[0]
+            gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0)  & (nzx < xr1)).nonzero()[0]
+
             li.append(gl); ri.append(gr)
+
             if len(gl) > self.MINPIX: lx = int(np.mean(nzx[gl]))
             if len(gr) > self.MINPIX: rx = int(np.mean(nzx[gr]))
-            
-        return np.concatenate(li), np.concatenate(ri), nzx, nzy
 
-    def _poly_search(self, warped):
-        nz = warped.nonzero()
-        nzy, nzx = np.array(nz[0]), np.array(nz[1])
-        m = 60
-        
+        li, ri = np.concatenate(li), np.concatenate(ri)
+        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
+        if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
+        return li, ri, dbg
+
+    def _poly_search(self, warped, nzx, nzy, curvature=0.0):
+        dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+        m = (self.POLY_MARGIN_CURV if curvature > 0.0015 else self.POLY_MARGIN_BASE)
+
         def band(fit):
-            if fit is None: return np.array([], dtype=int)
             cx = np.polyval(fit, nzy)
             return ((nzx > cx - m) & (nzx < cx + m)).nonzero()[0]
-            
-        li = band(self.sl)
-        ri = band(self.sr)
-        
-        if len(li) < 200 and len(ri) < 200:
-            return self._sliding_window(warped)
-        return li, ri, nzx, nzy
+
+        li = band(self.sl) if self.sl is not None else np.array([], dtype=int)
+        ri = band(self.sr) if self.sr is not None else np.array([], dtype=int)
+
+        if len(li) < self.MIN_PIX_OK and len(ri) < self.MIN_PIX_OK:
+            self.mode = "SEARCH"
+            return self._sliding_window(warped, nzx, nzy)
+
+        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
+        if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
+        return li, ri, dbg
+
+    def _width_sane(self, lf, rf, y=400):
+        w = np.polyval(rf, y) - np.polyval(lf, y)
+        return 80 < w < 560
 
     def update(self, warped):
+        nz  = warped.nonzero()
+        nzy = np.array(nz[0])
+        nzx = np.array(nz[1])
+
         if self.mode == "TRACKING" and (self.sl is not None or self.sr is not None):
-            li, ri, nzx, nzy = self._poly_search(warped)
+            curv = self.get_curvature(self.sl if self.sl is not None else self.sr, self.h // 2)
+            li, ri, dbg = self._poly_search(warped, nzx, nzy, curvature=curv)
+            mode_label  = "POLY"
         else:
-            li, ri, nzx, nzy = self._sliding_window(warped)
-            
-        has_l = len(li) > 200
-        has_r = len(ri) > 200
-        
-        # Extract points for polyfit
-        ly, lx = nzy[li], nzx[li]
-        ry, rx = nzy[ri], nzx[ri]
+            li, ri, dbg = self._sliding_window(warped, nzx, nzy)
+            mode_label  = "SLIDE"
+
+        self.l_conf = len(li) / 1000.0
+        self.r_conf = len(ri) / 1000.0
+        has_l = len(li) >= self.MIN_PIX_OK
+        has_r = len(ri) >= self.MIN_PIX_OK
 
         if has_l:
-            self.sl = np.polyfit(ly, lx, 2)
+            fl = np.polyfit(nzy[li], nzx[li], 2)
+            self.left_fit = fl
+            self.sl = self._ema(self.sl, fl)
             self.l_stale = 0
             self.l_conf = min(1.0, len(li) / 1000)
         else:
             self.l_stale += 1
-            if self.l_stale > self.STALE_FIT_FRAMES: self.sl = None
+            if self.l_stale > self.STALE_FIT_FRAMES:
+                self.left_fit = None
+                self.sl = None
             self.l_conf = 0.0
-            
+
         if has_r:
-            self.sr = np.polyfit(ry, rx, 2)
+            fr = np.polyfit(nzy[ri], nzx[ri], 2)
+            self.right_fit = fr
+            self.sr = self._ema(self.sr, fr)
             self.r_stale = 0
             self.r_conf = min(1.0, len(ri) / 1000)
         else:
             self.r_stale += 1
-            if self.r_stale > self.STALE_FIT_FRAMES: self.sr = None
+            if self.r_stale > self.STALE_FIT_FRAMES:
+                self.right_fit = None
+                self.sr = None
             self.r_conf = 0.0
-            
-        # Decision
-        self.mode = "TRACKING" if (self.sl is not None or self.sr is not None) else "SEARCH"
-        dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
-        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
-        if len(ri): dbg[nzy[ri], nzx[ri]] = [80, 80, 255]
-        
+
         if has_l and has_r:
-            lx = np.polyval(self.sl, self.h//2)
-            rx = np.polyval(self.sr, self.h//2)
-            w = rx - lx
-            if 150 < w < 400:
-                self.lane_width_px = 0.9 * self.lane_width_px + 0.1 * w
-        
-        self.lane_width_px = max(150, min(self.lane_width_px, 400))
-        self.mode = "TRACKING" if (has_l or has_r) else "SEARCH"
+            if not self._width_sane(self.left_fit, self.right_fit):
+                if len(li) < len(ri):
+                    self.left_fit = None
+                    self.sl = None
+                    self.l_stale = self.STALE_FIT_FRAMES
+                    has_l = False
+                else:
+                    self.right_fit = None
+                    self.sr = None
+                    self.r_stale = self.STALE_FIT_FRAMES
+                    has_r = False
+            else:
+                y_pos = [100, 200, 300, 400]
+                widths = []
+                for y in y_pos:
+                    lx = np.polyval(self.sl, y)
+                    rx = np.polyval(self.sr, y)
+                    widths.append(rx - lx)
+                w = np.average(widths, weights=[4, 3, 2, 1])
+                self.lane_width_px = 0.8 * self.lane_width_px + 0.2 * w
+
+        self.lane_width_px = max(150.0, min(self.lane_width_px, 400.0))
+        self.mode = "TRACKING" if (has_l or has_r or self.sl is not None or self.sr is not None) else "SEARCH"
         
         return dbg
 
@@ -141,18 +195,27 @@ class VisionPipeline:
         warped = cv2.warpPerspective(frame_bgr, self.M, (640, 480))
         
         lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
-        L = lab[:,:,0]
-        L_clahe = self.clahe.apply(L)
-        mean_L = np.mean(L_clahe)
+        L = self.clahe.apply(lab[:, :, 0])
         
-        if mean_L < 100: alpha = 1.2
-        elif mean_L > 180: alpha = 0.8
-        else: alpha = 1.0
-        
-        L_adj = cv2.convertScaleAbs(L_clahe, alpha=alpha, beta=0)
-        binary = cv2.adaptiveThreshold(L_adj, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                       cv2.THRESH_BINARY_INV, 31, 15)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8))
+        # Adaptive Lighting Compensation
+        # BUG 11: Gradual interpolation prevents harsh contrast snapping (from bfmc_pilot_v3_yolo)
+        mean_l = np.mean(L)
+        if mean_l < 100:
+            a = 1.0 + (100 - mean_l) / 200
+            b = (100 - mean_l) * 0.6
+            L = cv2.convertScaleAbs(L, alpha=a, beta=int(b))
+        elif mean_l > 180:
+            a = 1.0 - (mean_l - 180) / 350
+            b = -(mean_l - 180) * 0.4
+            L = cv2.convertScaleAbs(L, alpha=a, beta=int(b))
+
+        # Track is WHITE, lines are BLACK (dark spots). Filtering out shadows with a +15 constant adjustment.
+        binary = cv2.adaptiveThreshold(
+            L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 31, 15)
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         
         dbg = self.tracker.update(binary)
         

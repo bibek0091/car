@@ -38,7 +38,12 @@ except ImportError:
 # ===========================================================================
 # Camera Interface
 # ===========================================================================
-# We will use OpenCV with a GStreamer pipeline for the Raspberry Pi camera.
+try:
+    from picamera2 import Picamera2
+    _CAM_AVAILABLE = True
+except ImportError:
+    _CAM_AVAILABLE = False
+    log.warning("picamera2 not found. Using simulation mode for Camera.")
 
 
 # ===========================================================================
@@ -89,17 +94,24 @@ class HardwareIO:
         if self.sim_video and _CV2_AVAILABLE:
             self.video_cap = cv2.VideoCapture(self.sim_video)
             log.info(f"Loaded simulation video: {self.sim_video}")
-        elif not self.sim_mode and _CV2_AVAILABLE:
+        elif not self.sim_mode and _CAM_AVAILABLE:
             try:
-                pipeline = "libcamerasrc ! video/x-raw, width=1280, height=720, framerate=30/1 ! videoconvert ! appsink drop=true max-buffers=1"
-                self.camera = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
-                if self.camera.isOpened():
-                    log.info("GStreamer PiCamera initialized successfully.")
-                else:
-                    log.error("Failed to open GStreamer camera pipeline.")
-                    self.camera = None
+                self.camera = Picamera2()
+                cfg = self.camera.create_video_configuration(
+                    main={"size": (1280, 720), "format": "XRGB8888"},
+                    controls={
+                        "AwbEnable":   False,
+                        "ColourGains": (3.5, 1.2),
+                        "AeEnable":    True,
+                        "Saturation":  1.4,
+                        "Sharpness":   1.2,
+                    }
+                )
+                self.camera.configure(cfg)
+                self.camera.start()
+                log.info("PiCamera2 initialized successfully with manual ColourGains.")
             except Exception as e:
-                log.error(f"Error initializing GStreamer camera: {e}")
+                log.error(f"Error initializing PiCamera2: {e}")
                 self.camera = None
 
     def capture_frame(self):
@@ -113,8 +125,13 @@ class HardwareIO:
                 return cv2.resize(frame, (640, 480))
             
         if self.camera and _CV2_AVAILABLE:
-            ret, frame = self.camera.read()
-            if ret:
+            frame = self.camera.capture_array()
+            if frame is not None:
+                if frame.ndim == 3 and frame.shape[2] == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                else:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # XRGB8888 can be RGB depending on version
+                
                 # Resize from 1280x720 to 640x480
                 return cv2.resize(frame, (640, 480))
             
@@ -191,6 +208,6 @@ class HardwareIO:
         time.sleep(0.1)
         self.serial.disconnect()
         if self.camera:
-            self.camera.release()
+            self.camera.stop()
         if self.video_cap:
             self.video_cap.release()
