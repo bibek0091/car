@@ -29,6 +29,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
+from mpl_toolkits.mplot3d import Axes3D                        # noqa: F401 — registers 3d projection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 # ── Custom Modules ─────────────────────────────────────────────────────────────
 from map_planner import PathPlanner
@@ -918,23 +920,153 @@ class DashboardApp:
         self.lbl_bev = tk.Label(pnl_cam, bg="black")
         self.lbl_bev.pack(pady=2)
 
-        tk.Label(pnl_cam, text="TRAFFIC / NAV STATE",
-                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(8, 2))
-        self.lbl_nav = tk.Label(pnl_cam, text="NAV: —",
-                                font=("Courier", 11, "bold"),
-                                fg=self.CYAN, bg=self.PANEL_BG)
-        self.lbl_nav.pack(pady=2)
+        # ── 3-D Dead-Reckoning Visualiser ─────────────────────────────────────
+        # Shows car body (Poly3DCollection), fading yellow trajectory trail,
+        # floor grid, and live data overlays — all from fused IMU + encoder data.
+        tk.Label(pnl_cam, text="DEAD-RECKONING  (IMU + ENCODER)",
+                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(6, 0))
 
-        self.lbl_light = tk.Label(pnl_cam, text="LIGHT: NONE",
-                                  font=("Courier", 11),
+        self._dr_fig = plt.figure(figsize=(4.5, 2.6), facecolor=self.PANEL_BG)
+        self._ax3d = self._dr_fig.add_subplot(111, projection="3d")
+        ax3 = self._ax3d
+
+        # ── Floor grid (static — drawn once) ─────────────────────────────────
+        GRID_R  = 2.0          # metres around car
+        GRID_N  = 9            # number of lines each direction
+        _gc     = "#1C1C28"    # grid line colour
+        _ticks  = np.linspace(-GRID_R, GRID_R, GRID_N)
+        for v in _ticks:
+            ax3.plot([v, v],  [-GRID_R, GRID_R], [0, 0], color=_gc, lw=0.5, zorder=1)
+            ax3.plot([-GRID_R, GRID_R], [v, v],  [0, 0], color=_gc, lw=0.5, zorder=1)
+
+        # Floor fill (very dark rectangle so grid pops)
+        _fr = GRID_R
+        _floor_verts = [[ (-_fr,-_fr,0), (_fr,-_fr,0),
+                           (_fr, _fr,0), (-_fr, _fr,0) ]]
+        floor_col = Poly3DCollection(_floor_verts, facecolors=["#0A0A14"],
+                                      edgecolors="none", zorder=0, alpha=1.0)
+        ax3.add_collection3d(floor_col)
+
+        # ── Car body (Poly3DCollection — set_verts each frame) ───────────────
+        # Local frame vertices:  +X=right, +Y=forward, +Z=up.  Dimensions in metres.
+        _CL, _CW, _CH = 0.23, 0.135, 0.07   # length (front to rear), width, height
+        _CF = _CL * 0.55                     # forward half (nose heavier)
+        _CR = _CL * 0.45                     # rear half
+        # 8 corners of the car box in local frame
+        self._car3d_local = np.array([
+            [-_CW/2, -_CR, 0.0],  # 0 rear-left  bottom
+            [ _CW/2, -_CR, 0.0],  # 1 rear-right bottom
+            [ _CW/2,  _CF, 0.0],  # 2 front-right bottom
+            [-_CW/2,  _CF, 0.0],  # 3 front-left  bottom
+            [-_CW/2, -_CR, _CH],  # 4 rear-left  top
+            [ _CW/2, -_CR, _CH],  # 5 rear-right top
+            [ _CW/2,  _CF, _CH],  # 6 front-right top
+            [-_CW/2,  _CF, _CH],  # 7 front-left  top
+        ])
+        # 6 faces: bottom, top, front, rear, left, right
+        _car_faces_idx = [
+            [0,1,2,3],   # bottom
+            [4,5,6,7],   # top  (roof)
+            [3,2,6,7],   # front (nose)
+            [0,1,5,4],   # rear
+            [0,3,7,4],   # left
+            [1,2,6,5],   # right
+        ]
+        _car_face_cols = [
+            "#0A2040",   # bottom     — dark
+            "#1E5090",   # roof       — bright blue
+            "#2878C8",   # nose       — brightest (facing viewer)
+            "#0D3060",   # rear       — medium
+            "#1050A0",   # left side  — medium
+            "#1050A0",   # right side — medium
+        ]
+        # Wind-shield tint on top face
+        _wind_face_cols = list(_car_face_cols)
+
+        # Build initial faces (all at origin, updated per frame)
+        _dummy_verts = [np.zeros((4, 3)) for _ in _car_faces_idx]
+        self._car3d_col = Poly3DCollection(
+            _dummy_verts,
+            facecolors=_car_face_cols,
+            edgecolors="#3AAFFF",
+            linewidths=0.6,
+            zorder=5,
+            zsort="average",
+        )
+        ax3.add_collection3d(self._car3d_col)
+
+        # Windshield overlay (front top edge — separate semi-transparent quad)
+        _ws_dummy = [np.zeros((4, 3))]
+        self._car3d_ws = Poly3DCollection(_ws_dummy,
+                                           facecolors=["#00CCDD"],
+                                           edgecolors="#00FFFF",
+                                           linewidths=0.5,
+                                           alpha=0.55, zorder=6)
+        ax3.add_collection3d(self._car3d_ws)
+
+        # Heading arrow (nose direction)
+        self._dr_arrow, = ax3.plot([], [], [], color=self.CYAN,
+                                    lw=2.0, solid_capstyle="round", zorder=7)
+
+        # ── Trail (fading yellow line — last 400 world positions) ─────────────
+        from collections import deque
+        self._dr_trail_x = deque(maxlen=400)
+        self._dr_trail_y = deque(maxlen=400)
+        self._dr_trail_line, = ax3.plot([], [], [], color=self.AMBER,
+                                         lw=1.8, alpha=0.85, zorder=4)
+
+        # ── Data overlay text (top-left of axes) ─────────────────────────────
+        _tof = dict(fontfamily="monospace", fontsize=6.5, color=self.CYAN,
+                    transform=ax3.transAxes, zorder=10)
+        self._dr_txt_yaw = ax3.text2D(0.02, 0.95, "YAW   0.0°", **_tof)
+        self._dr_txt_x   = ax3.text2D(0.02, 0.85, "X   0.000 m", **_tof)
+        self._dr_txt_y   = ax3.text2D(0.02, 0.75, "Y   0.000 m", **_tof)
+        self._dr_txt_spd = ax3.text2D(0.02, 0.65, "V   0.000 m/s",
+                                       color=self.AMBER, fontfamily="monospace",
+                                       fontsize=6.5, transform=ax3.transAxes, zorder=10)
+        self._dr_txt_nav = ax3.text2D(0.50, 0.95, "NAV  —",
+                                       color=self.YELLOW, fontfamily="monospace",
+                                       fontsize=6.5, transform=ax3.transAxes,
+                                       ha="center", zorder=10)
+
+        # ── Axes cosmetics ────────────────────────────────────────────────────
+        ax3.set_facecolor("#080810")
+        self._dr_fig.patch.set_facecolor(self.PANEL_BG)
+        ax3.xaxis.pane.fill = False;  ax3.yaxis.pane.fill = False;  ax3.zaxis.pane.fill = False
+        ax3.xaxis.pane.set_edgecolor("#1A1A28")
+        ax3.yaxis.pane.set_edgecolor("#1A1A28")
+        ax3.zaxis.pane.set_edgecolor("#1A1A28")
+        ax3.tick_params(colors=self.MUTED, labelsize=5.5)
+        ax3.set_xlabel("X (m)", color=self.MUTED, fontsize=5.5, labelpad=1)
+        ax3.set_ylabel("Y (m)", color=self.MUTED, fontsize=5.5, labelpad=1)
+        ax3.set_zlabel("Z",     color=self.MUTED, fontsize=5.5, labelpad=1)
+        ax3.set_zlim(0, 0.25)
+        ax3.view_init(elev=28, azim=-55)  # slight isometric elevation
+
+        self._dr_canvas = FigureCanvasTkAgg(self._dr_fig, master=pnl_cam)
+        self._dr_canvas.get_tk_widget().pack(pady=2, padx=4)
+
+        # ── Traffic / NAV compact labels below the 3D view ───────────────────
+        frm_nav = tk.Frame(pnl_cam, bg=self.PANEL_BG)
+        frm_nav.pack(fill=tk.X, padx=8, pady=1)
+        self.lbl_nav = tk.Label(frm_nav, text="NAV: —",
+                                font=("Courier", 10, "bold"),
+                                fg=self.CYAN, bg=self.PANEL_BG)
+        self.lbl_nav.pack(side=tk.LEFT, padx=6)
+        self.lbl_light = tk.Label(frm_nav, text="LIGHT: NONE",
+                                  font=("Courier", 10),
                                   fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_light.pack(pady=2)
+        self.lbl_light.pack(side=tk.LEFT, padx=6)
 
         self.lbl_labels = tk.Label(pnl_cam, text="Detections: —",
-                                   font=("Courier", 9),
+                                   font=("Courier", 8),
                                    fg=self.MUTED, bg=self.PANEL_BG,
                                    wraplength=440, justify=tk.LEFT)
-        self.lbl_labels.pack(pady=2, padx=8)
+        self.lbl_labels.pack(pady=1, padx=8)
+
+        # Store face indices and car geometry for the update method
+        self._car3d_faces_idx = _car_faces_idx
+        self._GRID_R = GRID_R
 
         # ── Schedule GUI update loop ───────────────────────────────────────────
         self.root.after(33, self._update_gui)
@@ -1073,6 +1205,9 @@ class DashboardApp:
         # ── IMU instruments (car model + speedometer + calib LEDs) ──────────
         self._update_imu_instruments(imu_yaw_deg, velocity_ms, imu_calib, steer)
 
+        # ── 3D Dead-Reckoning visualiser ──────────────────────────────────────
+        self._update_dr_view(x, y, imu_yaw_deg, velocity_ms, nav_st)
+
         # Calibration overlay
         if calib_remain > 0:
             self.lbl_calib.config(
@@ -1156,6 +1291,94 @@ class DashboardApp:
 
         self._bev_img = self._cv2tk(bev_frame, 460, 240)
         self.lbl_bev.config(image=self._bev_img)
+
+    def _update_dr_view(self, x, y, yaw_deg, velocity_ms, nav_state):
+        """
+        Updates the 3D dead-reckoning visualiser each frame.
+
+        The scene is WORLD-CENTRED on the car's current position — the car body
+        stays centred, the grid and trail scroll behind it.  This way you always
+        see the immediate surroundings regardless of total displacement.
+
+        Car local frame:
+            +Y = forward (nose)   +X = right   +Z = up
+        World rotation: yaw_deg (CCW from East, standard math convention).
+        """
+        ax3 = self._ax3d
+
+        # ── Trail: append world position ──────────────────────────────────────
+        self._dr_trail_x.append(x)
+        self._dr_trail_y.append(y)
+
+        # Convert trail to car-relative coordinates (scroll the world)
+        tx = np.array(self._dr_trail_x) - x
+        ty = np.array(self._dr_trail_y) - y
+        tz = np.zeros(len(tx))
+        self._dr_trail_line.set_data_3d(tx, ty, tz)
+
+        # Fade alpha: oldest point transparent, newest opaque
+        # (matplotlib Line3D doesn't support per-vertex alpha, so we control
+        #  global alpha and colour only — gradient is handled by trail length)
+        n = len(tx)
+        self._dr_trail_line.set_alpha(0.9 if n > 5 else 0.3)
+
+        # ── Car body: rotate local vertices by yaw, translate to (0,0,0) ─────
+        def _Rz(deg):
+            r = math.radians(deg)
+            c, s = math.cos(r), math.sin(r)
+            return np.array([[c, -s, 0],
+                             [s,  c, 0],
+                             [0,  0, 1]])
+
+        R      = _Rz(yaw_deg)
+        verts  = self._car3d_local @ R.T   # rotate all 8 corners
+        # Build face vertex arrays
+        faces  = [verts[idx] for idx in self._car3d_faces_idx]
+        self._car3d_col.set_verts(faces)
+
+        # Windshield: top-front edge quad (slightly inset)
+        _CW = self._car3d_local[1, 0] * 2  # width from stored verts
+        ws_local = np.array([
+            [-_CW*0.38,  self._car3d_local[2, 1], self._car3d_local[6, 2]],
+            [ _CW*0.38,  self._car3d_local[2, 1], self._car3d_local[6, 2]],
+            [ _CW*0.38,  self._car3d_local[2, 1] * 0.55, self._car3d_local[6, 2]],
+            [-_CW*0.38,  self._car3d_local[2, 1] * 0.55, self._car3d_local[6, 2]],
+        ])
+        ws_world = ws_local @ R.T
+        self._car3d_ws.set_verts([ws_world])
+
+        # ── Heading arrow (nose direction, length ∝ speed) ───────────────────
+        arrow_len = max(0.05, min(velocity_ms * 0.5, 0.5))
+        nose_local = np.array([[0, self._car3d_local[2, 1], self._car3d_local[6, 2] * 0.5]])
+        tip_local  = np.array([[0, self._car3d_local[2, 1] + arrow_len, self._car3d_local[6, 2] * 0.5]])
+        nose_w = (nose_local @ R.T)[0]
+        tip_w  = (tip_local  @ R.T)[0]
+        self._dr_arrow.set_data_3d([nose_w[0], tip_w[0]],
+                                    [nose_w[1], tip_w[1]],
+                                    [nose_w[2], tip_w[2]])
+
+        # ── Axis limits (car-centred, fixed window) ───────────────────────────
+        gr = self._GRID_R
+        ax3.set_xlim(-gr, gr)
+        ax3.set_ylim(-gr, gr)
+
+        # ── Data overlays ─────────────────────────────────────────────────────
+        card = ["E","NE","N","NW","W","SW","S","SE"][
+            int(((90 - yaw_deg) % 360 + 22.5) / 45) % 8]
+        self._dr_txt_yaw.set_text(f"YAW  {yaw_deg % 360:6.1f}°  {card}")
+        self._dr_txt_x.set_text(  f"X    {x:+8.3f} m")
+        self._dr_txt_y.set_text(  f"Y    {y:+8.3f} m")
+        self._dr_txt_spd.set_text(f"V    {velocity_ms:.3f} m/s")
+        self._dr_txt_nav.set_text(nav_state)
+
+        # Nav state colour
+        _nav_col = (self.GREEN_C if nav_state == "DRIVING"
+                    else self.RED_C if "STOP" in nav_state or "ESTOP" in nav_state
+                    else self.AMBER if "SLOW" in nav_state or "CALIB" in nav_state
+                    else self.CYAN)
+        self._dr_txt_nav.set_color(_nav_col)
+
+        self._dr_canvas.draw_idle()
 
     def _update_imu_instruments(self, yaw_deg, velocity_ms, imu_calib, steer_deg=0.0):
         """

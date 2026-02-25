@@ -37,6 +37,20 @@ class ThreadedYOLODetector:
             resolved = self._resolve_model_path(model_path)
             if resolved:
                 try:
+                    # PyTorch 2.6+ changed torch.load default to weights_only=True.
+                    # Custom YOLO models contain DetectionModel which is blocked by default.
+                    # Allowlist it so the model loads without needing weights_only=False
+                    # (which would allow arbitrary code execution).
+                    try:
+                        import torch
+                        from ultralytics.nn.tasks import DetectionModel
+                        if hasattr(torch.serialization, 'add_safe_globals'):
+                            torch.serialization.add_safe_globals([DetectionModel])
+                            print("[YOLO] Allowlisted DetectionModel for PyTorch 2.6+ safe load")
+                    except Exception as sg_err:
+                        # Older PyTorch or ultralytics version — no action needed
+                        print(f"[YOLO] Safe-globals patch skipped ({sg_err}) — likely PyTorch < 2.6")
+
                     self.model = YOLO(resolved)
                     self.yolo_ok = True
                     self.model_path_used = resolved

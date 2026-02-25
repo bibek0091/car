@@ -288,15 +288,38 @@ class HardwareIO:
         self.serial.set_speed(speed_pwm)
 
     def get_velocity_ms(self):
+        """Return encoder speed in m/s.
+        Compatible with both old STM32_SerialHandler (uses _feedback_speed directly)
+        and new versions that have get_feedback(). Falls back to 0 on any error.
+        """
         if self.sim_mode:
             cmd = getattr(self, "_last_cmd_speed", 0.0)
             return max(0.0, (cmd - 12.0) * self.SPEED_CALIB)
-        return self.serial.get_feedback()[0]
+        try:
+            # Try new API first (get_feedback returns (speed_mms, steer_deg))
+            if hasattr(self.serial, 'get_feedback'):
+                raw_mms = self.serial.get_feedback()[0]
+            else:
+                # Old STM32_SerialHandler: access _feedback_speed directly
+                with getattr(self.serial, 'feedback_lock', __import__('contextlib').nullcontext()):
+                    raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
+            return raw_mms / 1000.0   # mm/s → m/s
+        except Exception as e:
+            log.warning(f"get_velocity_ms error: {e}")
+            return 0.0
 
     def get_encoder_steer_deg(self):
+        """Return encoder steering angle in degrees."""
         if self.sim_mode:
             return getattr(self, "_last_cmd_steer", 0.0)
-        return self.serial.get_feedback()[1]
+        try:
+            if hasattr(self.serial, 'get_feedback'):
+                return self.serial.get_feedback()[1]
+            else:
+                return getattr(self.serial, '_feedback_steer', 0.0)
+        except Exception as e:
+            log.warning(f"get_encoder_steer_deg error: {e}")
+            return 0.0
 
     def get_imu_accel(self):
         if self.imu and not self.sim_mode:
