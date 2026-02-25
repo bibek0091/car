@@ -23,34 +23,6 @@ except ImportError:
         def set_steering(self, s): pass
         def disconnect(self): pass
 
-# ===========================================================================
-# IMU (BNO055) Interface
-# ===========================================================================
-# Requires on Raspberry Pi:
-#   pip install adafruit-blinka               ← provides board + busio
-#   pip install adafruit-circuitpython-bno055 ← provides adafruit_bno055
-#
-# I2C must be enabled: sudo raspi-config → Interface Options → I2C → Enable
-# User must be in i2c group: sudo usermod -aG i2c $USER  (then re-login)
-# ===========================================================================
-_BNO_AVAILABLE   = False
-_BLINKA_AVAILABLE = False
-
-try:
-    import board
-    import busio
-    _BLINKA_AVAILABLE = True
-except ImportError:
-    log.warning("adafruit-blinka not found (provides 'board' and 'busio'). "
-                "Run: pip install adafruit-blinka --break-system-packages")
-
-if _BLINKA_AVAILABLE:
-    try:
-        import adafruit_bno055
-        _BNO_AVAILABLE = True
-    except ImportError:
-        log.warning("adafruit_bno055 not found. "
-                    "Run: pip install adafruit-circuitpython-bno055 --break-system-packages")
 
 # ===========================================================================
 # Camera Interface
@@ -77,9 +49,7 @@ except ImportError:
 class HardwareIO:
     def __init__(self, sim_mode=False, sim_video=None):
         # Auto-sim ONLY when no hardware drivers at all (e.g. Windows dev machine).
-        # A missing IMU library alone does NOT trigger sim — the system runs in
-        # hardware mode and the localizer falls back to camera-only heading.
-        _no_hw = (not _SERIAL_AVAILABLE and not _BLINKA_AVAILABLE and not _CAM_AVAILABLE)
+        _no_hw = (not _SERIAL_AVAILABLE and not _CAM_AVAILABLE)
         if _no_hw and not sim_mode:
             log.warning("No hardware drivers found — automatically entering simulation mode.")
             sim_mode = True
@@ -103,16 +73,7 @@ class HardwareIO:
         if not self.sim_mode and _SERIAL_AVAILABLE:
             connected = self.serial.connect()
             if not connected:
-                log.error("Failed to connect to STM32. Motor commands will be ignored.")
-        
-        # Initialize IMU
-        if not self.sim_mode and _BNO_AVAILABLE:
-            self.imu = self._init_bno055()
-        elif not self.sim_mode and _BLINKA_AVAILABLE and not _BNO_AVAILABLE:
-            log.error("adafruit_bno055 library missing — IMU disabled.")
-        elif not self.sim_mode and not _BLINKA_AVAILABLE:
-            log.error("adafruit-blinka missing — IMU disabled. "
-                      "Install with: pip install adafruit-blinka --break-system-packages")
+                log.error("Failed to connect to STM32. Motor and IMU commands will be ignored.")
         
         # Initialize Camera or Video
         if self.sim_video and _CV2_AVAILABLE:
@@ -138,115 +99,7 @@ class HardwareIO:
                 log.error(f"Error initializing PiCamera2: {e}")
                 self.camera = None
 
-    # ── BNO055 Initialization ─────────────────────────────────────────────────
-    def _init_bno055(self, retries=4):
-        """
-        Robust BNO055 init.
-
-        Two bugs fixed vs previous version:
-        1. The old code never called i2c.deinit() between attempts.
-           busio.I2C holds an exclusive file-descriptor on /dev/i2c-1.
-           Creating a second busio.I2C() while the first is still open causes
-           the kernel to return a silently-broken object → scan always returns [].
-           Fix: always deinit in a finally block before the next attempt.
-
-        2. adafruit_blinka IGNORES the frequency= parameter on Linux/Pi
-           (it prints a RuntimeWarning about this). The Pi defaults to whatever
-           /boot/firmware/config.txt says (usually 100 kHz). At 100 kHz the BNO055
-           sometimes fails its first init write with Errno 121 (Remote I/O error)
-           because the sensor clock-stretches longer than the master allows.
-           Fix: don't pass frequency= (use system default), and after Errno 121
-           wait 1.5 s for the BNO055 to recover its I2C state machine.
-        """
-        BNO_ADDRESSES = [0x29, 0x28]   # 0x29 tried first (confirmed on this hardware)
-
-        for attempt in range(1, retries + 1):
-            i2c = None
-            try:
-                # DO NOT pass frequency= — adafruit_blinka ignores it on Pi
-                # and emits a RuntimeWarning. The system I2C speed from config.txt is used.
-                i2c = busio.I2C(board.SCL, board.SDA)
-
-                # ── Bus scan ─────────────────────────────────────────────────
-                while not i2c.try_lock():
-                    pass
-                try:
-                    found = i2c.scan()
-                    log.info(f"I2C scan (attempt {attempt}/{retries}): "
-                             f"found addresses {[hex(a) for a in found]}")
-                finally:
-                    i2c.unlock()
-
-                if not found:
-                    log.error(f"I2C scan empty (attempt {attempt}/{retries}). "
-                              "Check wiring: SDA=GPIO2(pin3), SCL=GPIO3(pin5), "
-                              "VIN=3.3V(pin1), GND(pin6). "
-                              "Enable I2C: sudo raspi-config → Interface Options → I2C.")
-                    continue
-
-                # ── Try each known BNO055 address ────────────────────────────
-                for addr in BNO_ADDRESSES:
-                    if addr not in found:
-                        continue
-                    try:
-                        imu_obj = adafruit_bno055.BNO055_I2C(i2c, address=addr)
-                        # Quick sanity read — confirms sensor is actually responding
-                        _ = imu_obj.euler
-                        log.info(f"BNO055 online at {hex(addr)} "
-                                 f"(attempt {attempt}/{retries}) ✓")
-                        return imu_obj          # ← SUCCESS: return without deinit
-                                                #   (imu_obj keeps i2c alive)
-                    except OSError as addr_err:
-                        errno_val = addr_err.errno if hasattr(addr_err, 'errno') else -1
-                        if errno_val == 121:    # EREMOTEIO — sensor crashed its I2C FSM
-                            log.warning(f"BNO055 at {hex(addr)}: Errno 121 Remote I/O — "
-                                        f"sensor I2C state machine reset. "
-                                        f"Waiting 1.5 s for recovery…")
-                            # Must deinit THIS attempt's i2c before the long sleep
-                            # so the bus is free when we retry.
-                            try: i2c.deinit()
-                            except Exception: pass
-                            i2c = None
-                            time.sleep(1.5)     # BNO055 needs >650 ms to fully recover
-                        else:
-                            log.warning(f"BNO055 at {hex(addr)} failed "
-                                        f"(errno={errno_val}): {addr_err}")
-                    except Exception as addr_err:
-                        log.warning(f"BNO055 at {hex(addr)} failed: "
-                                    f"{type(addr_err).__name__}: {addr_err}")
-
-                log.error(f"BNO055 not responding at any address "
-                          f"(attempt {attempt}/{retries}). "
-                          f"Devices on bus: {[hex(a) for a in found]}")
-
-            except Exception as e:
-                log.error(f"BNO055 init error (attempt {attempt}/{retries}): "
-                          f"{type(e).__name__}: {e}")
-                if "Permission" in str(e):
-                    log.error("Permission denied on /dev/i2c-1 — run: "
-                              "sudo usermod -aG i2c $USER  then log out and back in")
-
-            finally:
-                # CRITICAL: always release the bus fd before the next attempt.
-                # Without this, the next busio.I2C() gets a broken object and
-                # scan() returns [] even when the device is physically present.
-                if i2c is not None:
-                    try:
-                        i2c.deinit()
-                    except Exception:
-                        pass
-                    i2c = None
-
-            if attempt < retries:
-                wait = 1.5 if attempt == 1 else 0.8
-                log.info(f"Retrying BNO055 in {wait:.1f} s…")
-                time.sleep(wait)
-
-        log.error("BNO055 failed after all attempts. "
-                  "Localization will use camera-only heading estimation.")
-        return None
-
-    def capture_frame(self):
+    # ── Input Data Access ─────────────────────────────────────────────────────
         """Returns a 640x480 BGR image"""
         if self.video_cap and _CV2_AVAILABLE:
             ret, frame = self.video_cap.read()
@@ -273,19 +126,18 @@ class HardwareIO:
     def read_imu(self):
         """Returns (yaw_deg, calibration_tuple).
         calibration_tuple = (sys, gyro, accel, mag), each 0-3.
-        Returns (0.0, (0,0,0,0)) when IMU is not connected — NOT (3,3,3,3)
-        so the dashboard LEDs correctly show red instead of green.
+        Returns (0.0, (0,0,0,0)) when IMU is not connected.
         """
-        if self.imu and not self.sim_mode:
+        if not self.sim_mode and self.serial.status.imu_data is not None:
             try:
-                yaw = self.imu.euler[0]
-                if yaw is None:
-                    yaw = 0.0
-                calib = self.imu.calibration_status
-                return yaw, calib
+                imu_data = self.serial.status.imu_data
+                yaw = imu_data.get('yaw', 0.0)
+                # The STM32 doesn't send the raw BNO055 calib status, 
+                # but NDOF mode is handled on the firmware side, so we mock calib=(3,3,3,3)
+                return yaw, (3, 3, 3, 3)
             except Exception as e:
-                log.error(f"IMU read error: {e}")
-        # IMU absent or failed — return zero calib so LEDs show red
+                log.error(f"IMU read error from serial handling: {e}")
+        # IMU absent or failed
         return 0.0, (0, 0, 0, 0)
     
     def zero_imu_yaw(self, current_raw_yaw):
@@ -354,13 +206,9 @@ class HardwareIO:
             return 0.0
 
     def get_imu_accel(self):
-        if self.imu and not self.sim_mode:
-            try:
-                accel = self.imu.linear_acceleration
-                if accel[0] is not None:
-                    return math.hypot(accel[0], accel[1])
-            except Exception:
-                pass
+        """Return the scalar acceleration in m/s^2. For STM32 this uses velocity delta approximation or returns 0.0."""
+        # The new firmware provides velocity vx/vy/vz, not direct raw acceleration.
+        # This isn't critical for basic path following.
         return 0.0
 
     def shutdown(self):

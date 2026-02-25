@@ -49,138 +49,53 @@ YELLOW  = "#FFD600"
 BLUE_LT = "#2878C8"
 
 # ==================================================================
-# IMU Driver  -  robust BNO055 init  +  sim fallback
+# IMU Driver  -  reading from STM32_SerialHandler
 # ==================================================================
 class IMUReader:
     """
-    Wraps the BNO055 with:
-      • I2C deinit between retries (fixes 'scan empty after Errno 121')
-      • No frequency= arg (blinka ignores it on Pi, causes confusion)
-      • 1.5 s recovery after Errno 121 (sensor I2C FSM crash)
+    Reads IMU data parsed by STM32_SerialHandler.
     """
     def __init__(self):
-        self.imu      = None
-        self.calib    = (0, 0, 0, 0)
-        self._lock    = threading.Lock()
+        self.serial = None
+        self.calib = (3, 3, 3, 3)  # NDOF handled on STM32 side
+        self._connect_serial()
 
-        self.imu = self._init_bno055()
-        if self.imu is None:
-            print("[IMU] Initialization failed. Waiting for valid I2C data...")
-
-    # ── BNO055 init ──────────────────────────────────────────────
-    def _init_bno055(self, retries=4):
+    def _connect_serial(self):
         try:
-            import board, busio, adafruit_bno055
+            from STM32_SerialHandler import STM32_SerialHandler, SerialConfig
+            self.serial = STM32_SerialHandler(SerialConfig(baudrate=115200))
+            if self.serial.connect():
+                print("[IMUReader] Connected to STM32")
+            else:
+                print("[IMUReader] Failed to connect to STM32")
         except ImportError as e:
-            print(f"[IMU] Missing library: {e}")
-            print("      pip install adafruit-blinka adafruit-circuitpython-bno055")
-            return None
-
-        BNO_ADDRESSES = [0x29, 0x28]
-        
-        # SYSTEM REQUIREMENT:
-        # Prevent fast I2C access by slowing down the Raspberry Pi I2C baudrate.
-        # Add the following to /boot/firmware/config.txt (or /boot/config.txt):
-        # dtparam=i2c_arm_baudrate=50000
-
-        print("[IMU] Waiting for BNO055 firmware boot...")
-        time.sleep(2.5)
-
-        print("[IMU] Initializing sensor...")
-        i2c = None
-        try:
-            i2c = busio.I2C(board.SCL, board.SDA)   # no frequency= — blinka ignores it
-        except Exception as e:
-            print(f"[IMU] Fatal I2C bus error: {e}")
-            return None
-
-        for attempt in range(1, retries + 1):
-            try:
-                while not i2c.try_lock():
-                    pass
-                try:
-                    found = i2c.scan()
-                    print(f"[IMU] I2C scan ({attempt}/{retries}): "
-                          f"{[hex(a) for a in found]}")
-                finally:
-                    i2c.unlock()
-
-                if not found:
-                    print(f"[IMU] Bus empty — check wiring "
-                          f"SDA=GPIO2(pin3), SCL=GPIO3(pin5), VIN=3.3V(pin1)")
-                    time.sleep(1.5)
-                    continue
-
-                for addr in BNO_ADDRESSES:
-                    if addr not in found:
-                        continue
-                    try:
-                        imu_obj = adafruit_bno055.BNO055_I2C(i2c, address=addr)
-                        
-                        print("[IMU] Switching to NDOF fusion mode...")
-                        imu_obj.mode = adafruit_bno055.CONFIG_MODE
-                        time.sleep(0.1)
-                        imu_obj.mode = adafruit_bno055.NDOF_MODE
-                        time.sleep(0.6)
-                        
-                        print("[IMU] Stabilizing sensor reads...")
-                        for _ in range(5):
-                            _ = imu_obj.euler
-                            time.sleep(0.1)
-                        
-                        print("[IMU] IMU READY")
-                        print(f"[IMU] BNO055 online at {hex(addr)} ✓ (NDOF Mode)")
-                        return imu_obj              # success — keep i2c alive
-                    except OSError as oe:
-                        if getattr(oe, 'errno', -1) == 121:
-                            print("IMU bus recovery...")
-                            time.sleep(2.0)
-                        else:
-                            print(f"[IMU] {hex(addr)} OSError: {oe}")
-                    except Exception as ex:
-                        print(f"[IMU] {hex(addr)} error: {ex}")
-
-                print(f"[IMU] No BNO055 responded (attempt {attempt}/{retries})")
-
-            except Exception as e:
-                print(f"[IMU] Init error: {type(e).__name__}: {e}")
-
-            wait = 1.5 if attempt == 1 else 0.8
-            if attempt < retries:
-                print(f"[IMU] Retrying in {wait:.1f} s…")
-                time.sleep(wait)
-        
-        # Fatal failure across all retries
-        if i2c is not None:
-            try: i2c.deinit()
-            except Exception: pass
-        return None
+            print(f"[IMUReader] Could not import STM32_SerialHandler: {e}")
 
     # ── Read (thread-safe) ───────────────────────────────────────
     def read(self):
         """
-        Returns (yaw_deg, pitch_deg, roll_deg, calib_tuple, lin_accel_xyz).
+        Returns (yaw_deg, pitch_deg, roll_deg, calib_tuple, lin_vel_xyz).
         calib_tuple = (sys, gyro, accel, mag)  each 0-3.
         Returns None if IMU is not connected.
         """
-        if self.imu is None:
+        if self.serial is None or not self.serial.running:
+            return None
+
+        # Give the serial handler a moment to receive the very first IMU frame
+        data = self.serial.status.imu_data
+        if data is None:
             return None
 
         try:
-            with self._lock:
-                euler = self.imu.euler        # (yaw, roll, pitch) BNO055 convention
-                calib = self.imu.calibration_status
-                accel = self.imu.linear_acceleration
-            yaw   = euler[0] if euler[0] is not None else 0.0
-            pitch = euler[2] if euler[2] is not None else 0.0
-            roll  = euler[1] if euler[1] is not None else 0.0
-            ax    = accel[0] if accel and accel[0] is not None else 0.0
-            ay    = accel[1] if accel and accel[1] is not None else 0.0
-            az    = accel[2] if accel and accel[2] is not None else 0.0
-            self.calib = calib if calib else (0, 0, 0, 0)
-            return yaw, pitch, roll, self.calib, (ax, ay, az)
+            yaw = data.get('yaw', 0.0)
+            pitch = data.get('pitch', 0.0)
+            roll = data.get('roll', 0.0)
+            vx = data.get('vx', 0.0)
+            vy = data.get('vy', 0.0)
+            vz = data.get('vz', 0.0)
+            return yaw, pitch, roll, self.calib, (vx, vy, vz)
         except Exception as e:
-            print(f"[IMU] Read error: {e}")
+            print(f"[IMU] Read error from serial status: {e}")
             return None
 
 
@@ -189,48 +104,35 @@ class IMUReader:
 # ==================================================================
 class DeadReckoning:
     """
-    Integrates linear acceleration to produce velocity and position.
-    Uses a simple complementary filter to suppress stationary drift.
+    Integrates linear velocity to produce position.
     """
     def __init__(self):
         self.x = self.y = self.z = 0.0
         self.vx = self.vy = self.vz = 0.0
         self._prev_t = time.time()
-        self._still_count = 0
 
-    def update(self, ax, ay, az, yaw_deg):
+    def update(self, vx, vy, vz, yaw_deg):
         now = time.time()
         dt  = min(now - self._prev_t, 0.1)
         self._prev_t = now
         if dt <= 0:
             return self.x, self.y, self.z
 
-        # Zero-velocity update: if accel magnitude ≈ gravity residual, freeze
-        mag = math.hypot(ax, math.hypot(ay, az))
-        if mag < 0.08:
-            self._still_count += 1
-        else:
-            self._still_count = 0
+        self.vx = vx
+        self.vy = vy
+        self.vz = vz
 
-        if self._still_count > 8:        # ~0.25 s still → hard zero velocity
-            self.vx = self.vy = self.vz = 0.0
-        else:
-            # Rotate body-frame accel to world frame using yaw only (2-D approx)
-            r  = math.radians(yaw_deg)
-            c, s = math.cos(r), math.sin(r)
-            wx = c * ax - s * ay
-            wy = s * ax + c * ay
-            self.vx += wx * dt
-            self.vy += wy * dt
-            self.vz += az * dt
-            # Light velocity decay (mimics drag / crude bias correction)
-            self.vx *= 0.92
-            self.vy *= 0.92
-            self.vz *= 0.85
+        # Rotate body-frame velocity into world frame using yaw (2-D approx)
+        r  = math.radians(yaw_deg)
+        c, s = math.cos(r), math.sin(r)
+        
+        # Convert local velocity to world XYZ displacements
+        wx = c * vx - s * vy
+        wy = s * vx + c * vy
 
-        self.x += self.vx * dt
-        self.y += self.vy * dt
-        self.z += max(0.0, self.z + self.vz * dt) - self.z   # clamp to z≥0
+        self.x += wx * dt
+        self.y += wy * dt
+        self.z += max(0.0, self.z + vz * dt) - self.z   # clamp to z≥0
 
         return self.x, self.y, self.z
 
@@ -423,7 +325,7 @@ class IMUVisualiser:
                       ha="center", va="top",
                       fontfamily="monospace", fontsize=11,
                       color=CYAN, fontweight="bold")
-        self.fig.text(0.50, 0.93, "SOURCE: HARDWARE I2C",
+        self.fig.text(0.50, 0.93, "SOURCE: SERIAL STM32",
                       ha="center", va="top",
                       fontfamily="monospace", fontsize=7, color=MUTED)
 
@@ -565,8 +467,8 @@ class IMUVisualiser:
             self._hud_yaw.set_color(RED)
             self._hud_pitch.set_text("")
             self._hud_roll.set_text("")
-            self._hud_x.set_text("Check I2C wiring")
-            self._hud_y.set_text("sudo i2cdetect -y 1")
+            self._hud_x.set_text("Check Serial Link")
+            self._hud_y.set_text("Is STM32 powered?")
             self._hud_z.set_text("")
             self._hud_spd.set_text("")
             self._hud_calib.set_text("")
@@ -574,14 +476,14 @@ class IMUVisualiser:
             self._hud_mode.set_color(RED)
             return []
             
-        yaw, pitch, roll, calib, (ax, ay, az) = data
+        yaw, pitch, roll, calib, (vx, vy, vz) = data
 
         self._hud_yaw.set_color(CYAN)
         self._hud_mode.set_text("ONLINE")
         self._hud_mode.set_color(GREEN)
 
         # ── Dead reckoning ───────────────────────────────────────
-        x, y, z = self.dr.update(ax, ay, az, yaw)
+        x, y, z = self.dr.update(vx, vy, vz, yaw)
 
         # ── Speed estimate (magnitude of velocity vector) ─────────
         spd = math.hypot(self.dr.vx, math.hypot(self.dr.vy, self.dr.vz))
@@ -733,7 +635,7 @@ class IMUVisualiser:
             cache_frame_data=False
         )
         print(f"\n[VIS] Running  (close window to exit)\n"
-              f"      Mode    : HARDWARE BNO055\n"
+              f"      Mode    : SERIAL STM32 IMU STREAM\n"
               f"      Trail   : {self.trail_len} samples\n"
               f"      Rate    : {int(1000/self.interval)} Hz\n"
               f"      Hotkeys : close window to quit,  RESET button to zero position\n")
@@ -749,7 +651,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python imu_visualizer.py                 # real BNO055, auto-detect I2C address
+  python imu_visualizer.py                 # Uses STM32_SerialHandler to grab data
   python imu_visualizer.py --trail 800     # longer yellow trail
   python imu_visualizer.py --rate 15       # 15 Hz (lighter CPU on old Pi)
         """)

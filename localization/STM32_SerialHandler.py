@@ -192,10 +192,27 @@ class STM32_SerialHandler:
                 cb(str(e))
 
     def _process_line(self, line: str):
-        if line.startswith("TOTALV:"):
-            self.status.battery_voltage = float(line.split(":")[1])
-        elif line.startswith("INSTANT:"):
-            self.status.instant_current = float(line.split(":")[1])
+        if line.startswith("@battery:"):
+            try:
+                # e.g. @battery:8200;;
+                val = line.split(":")[1].split(";")[0]
+                self.status.battery_voltage = float(val) / 1000.0  # mV to V
+            except: pass
+        elif line.startswith("@imu:"):
+            try:
+                # e.g. @imu:roll;pitch;yaw;vx;vy;vz;;
+                parts = line.split(":")[1].split(";")[0:6]
+                if len(parts) >= 6:
+                    self.status.imu_data = {
+                        'roll': float(parts[0]),
+                        'pitch': float(parts[1]),
+                        'yaw': float(parts[2]),
+                        'vx': float(parts[3]),
+                        'vy': float(parts[4]),
+                        'vz': float(parts[5]),
+                    }
+            except Exception as e:
+                logger.debug(f"IMU Parse Error: {e}")
         elif line.startswith("{") and "feedback" in line:
             import json
             try:
