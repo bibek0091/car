@@ -57,10 +57,6 @@ class STM32_SerialHandler:
             'connection_lost': [],
         }
 
-        self._feedback_speed = 0.0
-        self._feedback_steer = 0.0
-        self.feedback_lock = threading.Lock()
-
         self.read_buffer = ""
         logger.info("STM32 Serial Handler initialized")
 
@@ -129,19 +125,9 @@ class STM32_SerialHandler:
         self.send_command("alive", "1")
         time.sleep(0.1)
 
-        # BFMC-CORRECT IGNITION
-        # The new mbed-os-empty firmware requires KL:15 to be sent FIRST to enable the IMU parsing.
-        # Sending KL:30 directly bypasses the IMU activation block.
-        self.send_command("kl", "15")
-        time.sleep(0.2)
-        
-        # ACTIVATE IMU STREAM EXPLICITLY
-        self.send_command("imu", "1")
-        time.sleep(0.2)
-        
-        # Now upgrade to KL:30 to enable motor drive
-        self.send_command("kl", "30")
-        time.sleep(0.2)
+        # BFMC-CORRECT IGNITION (KL30)
+        self.enable_ignition()
+        time.sleep(0.4)
 
         self.send_command("steer", "0")
         self.send_command("speed", "0")
@@ -191,10 +177,7 @@ class STM32_SerialHandler:
 
                     while "\r\n" in self.read_buffer:
                         line, self.read_buffer = self.read_buffer.split("\r\n", 1)
-                        line = line.strip()
-                        if line:
-                            logger.info(f"RAW RX: {line}")
-                            self._process_line(line)
+                        self._process_line(line.strip())
 
                 time.sleep(0.001)
 
@@ -205,41 +188,10 @@ class STM32_SerialHandler:
                 cb(str(e))
 
     def _process_line(self, line: str):
-        if line.startswith("@battery:"):
-            try:
-                # e.g. @battery:8200;;
-                val = line.split(":")[1].split(";")[0]
-                self.status.battery_voltage = float(val) / 1000.0  # mV to V
-            except: pass
-        elif line.startswith("@imu:"):
-            try:
-                # e.g. @imu:roll;pitch;yaw;vx;vy;vz;;
-                parts = line.split(":")[1].split(";")[0:6]
-                if len(parts) >= 6:
-                    self.status.imu_data = {
-                        'roll': float(parts[0]),
-                        'pitch': float(parts[1]),
-                        'yaw': float(parts[2]),
-                        'vx': float(parts[3]),
-                        'vy': float(parts[4]),
-                        'vz': float(parts[5]),
-                    }
-            except Exception as e:
-                logger.debug(f"IMU Parse Error: {e}")
-        elif line.startswith("{") and "feedback" in line:
-            import json
-            try:
-                pkt = json.loads(line)
-                if pkt.get("action") == "feedback":
-                    with self.feedback_lock:
-                        self._feedback_speed = float(pkt.get("speed", self._feedback_speed))
-                        self._feedback_steer = float(pkt.get("steer", self._feedback_steer))
-            except Exception as e:
-                logger.debug(f"JSON Parse Error on feedback: {e}")
-
-    def get_feedback(self):
-        with self.feedback_lock:
-            return self._feedback_speed, self._feedback_steer
+        if line.startswith("TOTALV:"):
+            self.status.battery_voltage = float(line.split(":")[1])
+        elif line.startswith("INSTANT:"):
+            self.status.instant_current = float(line.split(":")[1])
 
     # ===================== VEHICLE COMMANDS =====================
 
