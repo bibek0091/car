@@ -191,7 +191,10 @@ class STM32_SerialHandler:
 
                     while "\r\n" in self.read_buffer:
                         line, self.read_buffer = self.read_buffer.split("\r\n", 1)
-                        self._process_line(line.strip())
+                        line = line.strip()
+                        if line:
+                            logger.info(f"RAW RX: {line}")
+                            self._process_line(line)
 
                 time.sleep(0.001)
 
