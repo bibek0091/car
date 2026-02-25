@@ -77,12 +77,25 @@ class IMUReader:
             return None
 
         BNO_ADDRESSES = [0x29, 0x28]
+        
+        # SYSTEM REQUIREMENT:
+        # Prevent fast I2C access by slowing down the Raspberry Pi I2C baudrate.
+        # Add the following to /boot/firmware/config.txt (or /boot/config.txt):
+        # dtparam=i2c_arm_baudrate=50000
+
+        print("[IMU] Waiting for BNO055 firmware boot...")
+        time.sleep(2.5)
+
+        print("[IMU] Initializing sensor...")
+        i2c = None
+        try:
+            i2c = busio.I2C(board.SCL, board.SDA)   # no frequency= — blinka ignores it
+        except Exception as e:
+            print(f"[IMU] Fatal I2C bus error: {e}")
+            return None
 
         for attempt in range(1, retries + 1):
-            i2c = None
             try:
-                i2c = busio.I2C(board.SCL, board.SDA)   # no frequency= — blinka ignores it
-
                 while not i2c.try_lock():
                     pass
                 try:
@@ -95,6 +108,7 @@ class IMUReader:
                 if not found:
                     print(f"[IMU] Bus empty — check wiring "
                           f"SDA=GPIO2(pin3), SCL=GPIO3(pin5), VIN=3.3V(pin1)")
+                    time.sleep(1.5)
                     continue
 
                 for addr in BNO_ADDRESSES:
@@ -102,21 +116,25 @@ class IMUReader:
                         continue
                     try:
                         imu_obj = adafruit_bno055.BNO055_I2C(i2c, address=addr)
-                        _ = imu_obj.euler           # sanity read
                         
-                        # Force NDOF mode for absolute fusion
-                        imu_obj.mode = 0X0C # NDOF mode
+                        print("[IMU] Switching to NDOF fusion mode...")
+                        imu_obj.mode = adafruit_bno055.CONFIG_MODE
+                        time.sleep(0.1)
+                        imu_obj.mode = adafruit_bno055.NDOF_MODE
+                        time.sleep(0.6)
                         
+                        print("[IMU] Stabilizing sensor reads...")
+                        for _ in range(5):
+                            _ = imu_obj.euler
+                            time.sleep(0.1)
+                        
+                        print("[IMU] IMU READY")
                         print(f"[IMU] BNO055 online at {hex(addr)} ✓ (NDOF Mode)")
                         return imu_obj              # success — keep i2c alive
                     except OSError as oe:
                         if getattr(oe, 'errno', -1) == 121:
-                            print(f"[IMU] Errno 121 at {hex(addr)} — "
-                                  f"sensor I2C crash, waiting 1.5 s…")
-                            try: i2c.deinit()
-                            except Exception: pass
-                            i2c = None
-                            time.sleep(1.5)
+                            print("IMU bus recovery...")
+                            time.sleep(2.0)
                         else:
                             print(f"[IMU] {hex(addr)} OSError: {oe}")
                     except Exception as ex:
@@ -126,16 +144,16 @@ class IMUReader:
 
             except Exception as e:
                 print(f"[IMU] Init error: {type(e).__name__}: {e}")
-            finally:
-                if i2c is not None:
-                    try: i2c.deinit()
-                    except Exception: pass
 
             wait = 1.5 if attempt == 1 else 0.8
             if attempt < retries:
                 print(f"[IMU] Retrying in {wait:.1f} s…")
                 time.sleep(wait)
-
+        
+        # Fatal failure across all retries
+        if i2c is not None:
+            try: i2c.deinit()
+            except Exception: pass
         return None
 
     # ── Read (thread-safe) ───────────────────────────────────────
