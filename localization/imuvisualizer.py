@@ -103,7 +103,11 @@ class IMUReader:
                     try:
                         imu_obj = adafruit_bno055.BNO055_I2C(i2c, address=addr)
                         _ = imu_obj.euler           # sanity read
-                        print(f"[IMU] BNO055 online at {hex(addr)} ✓")
+                        
+                        # Force NDOF mode for absolute fusion
+                        imu_obj.mode = 0X0C # NDOF mode
+                        
+                        print(f"[IMU] BNO055 online at {hex(addr)} ✓ (NDOF Mode)")
                         return imu_obj              # success — keep i2c alive
                     except OSError as oe:
                         if getattr(oe, 'errno', -1) == 121:
@@ -218,44 +222,113 @@ class DeadReckoning:
 
 
 # ==================================================================
-# Build car geometry  (8-corner box in local frame)
+# Build car geometry  (3D Race Car in local frame)
 # ==================================================================
 def make_car_verts():
     """
-    Returns (8×3 local vertices, face index lists, face colours).
-    Local frame: +Y = forward (nose), +X = right, +Z = up.
+    Returns (vertices, face_indices, face_colors) for a 3D car model.
+    The car points in the +X direction (forward).
     """
-    L, W, H = 0.23, 0.135, 0.072   # metres — 1:10 scale BFMC car
-    CF, CR  = L * 0.55, L * 0.45   # forward/rear half-lengths
+    # 1. Chassis (Main body)
+    L_c, W_c, H_c = 0.40, 0.20, 0.08  # Length, Width, Height
+    x1, x2 = -L_c * 0.4, L_c * 0.6    # Chassis is shifted slightly forward
+    y1, y2 = -W_c / 2, W_c / 2
+    z1, z2 = 0.02, 0.02 + H_c
 
-    verts = np.array([
-        [-W/2, -CR,  0.0],  # 0 rear-left  bottom
-        [ W/2, -CR,  0.0],  # 1 rear-right bottom
-        [ W/2,  CF,  0.0],  # 2 front-right bottom
-        [-W/2,  CF,  0.0],  # 3 front-left  bottom
-        [-W/2, -CR,   H ],  # 4 rear-left  top
-        [ W/2, -CR,   H ],  # 5 rear-right top
-        [ W/2,  CF,   H ],  # 6 front-right top
-        [-W/2,  CF,   H ],  # 7 front-left  top
-    ])
+    chassis_verts = [
+        [x1, y1, z1], [x2, y1, z1], [x2, y2, z1], [x1, y2, z1],  # Bottom
+        [x1, y1, z2], [x2, y1, z2], [x2, y2, z2], [x1, y2, z2]   # Top
+    ]
+    
+    CHASSIS_COLOR = "#D32F2F" # Red
 
-    face_idx = [
-        [3,2,6,7],   # front (nose)     — brightest
-        [4,5,6,7],   # roof
-        [0,3,7,4],   # left side
-        [1,2,6,5],   # right side
-        [0,1,5,4],   # rear
-        [0,1,2,3],   # bottom           — darkest
+    chassis_faces = [
+        ([0, 1, 2, 3], "#111111"), # Bottom (dark)
+        ([4, 5, 6, 7], CHASSIS_COLOR), # Top
+        ([0, 1, 5, 4], CHASSIS_COLOR), # Right
+        ([2, 3, 7, 6], CHASSIS_COLOR), # Left
+        ([1, 2, 6, 5], "#FFCDD2"), # Front
+        ([3, 0, 4, 7], CHASSIS_COLOR)  # Back
     ]
-    face_col = [
-        "#3A9EE8",   # nose
-        "#1E5090",   # roof
-        "#1858B0",   # left
-        "#1858B0",   # right
-        "#0D3060",   # rear
-        "#0A1E40",   # bottom
+
+    # 2. Cabin (Cockpit)
+    L_cab, W_cab, H_cab = 0.15, 0.14, 0.06
+    xc1, xc2 = -L_c * 0.1, -L_c * 0.1 + L_cab
+    yc1, yc2 = -W_cab / 2, W_cab / 2
+    zc1, zc2 = z2, z2 + H_cab
+
+    cabin_verts = [
+        [xc1, yc1, zc1], [xc2, yc1, zc1], [xc2, yc2, zc1], [xc1, yc2, zc1],
+        [xc1+0.02, yc1+0.01, zc2], [xc2-0.03, yc1+0.01, zc2], 
+        [xc2-0.03, yc2-0.01, zc2], [xc1+0.02, yc2-0.01, zc2] # Tapered top
     ]
-    return verts, face_idx, face_col
+    
+    CABIN_COLOR = "#1E88E5" # Blue/Glass
+    
+    cabin_faces = [
+        ([4, 5, 6, 7], "#424242"), # Roof
+        ([0, 1, 5, 4], CABIN_COLOR), # Right window
+        ([2, 3, 7, 6], CABIN_COLOR), # Left window
+        ([1, 2, 6, 5], "#90CAF9"), # Windshield (lighter)
+        ([3, 0, 4, 7], CABIN_COLOR)  # Rear window
+    ]
+
+    # 3. Wheels
+    WHEEL_R = 0.05
+    WHEEL_W = 0.04
+    wheel_base = 0.25
+    track_width = 0.24
+    
+    wx_f, wx_r = x2 - 0.08, x1 + 0.08
+    wy_l, wy_r = track_width/2, -track_width/2
+    wz = WHEEL_R
+    
+    wheel_centers = [
+        (wx_f, wy_l, wz), (wx_f, wy_r, wz), # Front-Left, Front-Right
+        (wx_r, wy_l, wz), (wx_r, wy_r, wz)  # Rear-Left, Rear-Right
+    ]
+    
+    WHEEL_COLOR = "#212121"
+    
+    wheel_verts_list = []
+    wheel_faces = []
+    v_idx = len(chassis_verts) + len(cabin_verts)
+    
+    # Very simple wheels (just vertical rectangles for low polygon count in matplotlib)
+    for cx, cy, cz in wheel_centers:
+        w_verts = [
+            [cx-WHEEL_R, cy-WHEEL_W/2, cz-WHEEL_R], [cx+WHEEL_R, cy-WHEEL_W/2, cz-WHEEL_R],
+            [cx+WHEEL_R, cy+WHEEL_W/2, cz-WHEEL_R], [cx-WHEEL_R, cy+WHEEL_W/2, cz-WHEEL_R],
+            [cx-WHEEL_R, cy-WHEEL_W/2, cz+WHEEL_R], [cx+WHEEL_R, cy-WHEEL_W/2, cz+WHEEL_R],
+            [cx+WHEEL_R, cy+WHEEL_W/2, cz+WHEEL_R], [cx-WHEEL_R, cy+WHEEL_W/2, cz+WHEEL_R]
+        ]
+        wheel_verts_list.extend(w_verts)
+        
+        # Add faces for this wheel (sides, front, back, top, bottom)
+        wheel_faces.extend([
+            ([v_idx+0, v_idx+1, v_idx+2, v_idx+3], "#111111"), # Bottom
+            ([v_idx+4, v_idx+5, v_idx+6, v_idx+7], WHEEL_COLOR), # Top
+            ([v_idx+0, v_idx+1, v_idx+5, v_idx+4], WHEEL_COLOR), # Right
+            ([v_idx+2, v_idx+3, v_idx+7, v_idx+6], WHEEL_COLOR), # Left
+            ([v_idx+1, v_idx+2, v_idx+6, v_idx+5], "#424242"), # Front
+            ([v_idx+3, v_idx+0, v_idx+4, v_idx+7], WHEEL_COLOR)  # Back
+        ])
+        v_idx += 8
+
+    # Combine everything
+    all_verts = np.array(chassis_verts + cabin_verts + wheel_verts_list)
+    
+    # Adjust cabin indices
+    chassis_len = len(chassis_verts)
+    adjusted_cabin_faces = [([idx + chassis_len for idx in face], color) for face, color in cabin_faces]
+
+    all_faces_and_colors = chassis_faces + adjusted_cabin_faces + wheel_faces
+    
+    face_indices = [item[0] for item in all_faces_and_colors]
+    face_colors = [item[1] for item in all_faces_and_colors]
+
+    return all_verts, face_indices, face_colors
+
 
 
 def rotate_verts(verts, yaw_deg, pitch_deg=0.0, roll_deg=0.0):
@@ -385,12 +458,8 @@ class IMUVisualiser:
         )
         ax.add_collection3d(self._car_col)
 
-        # Windshield
-        self._ws_col = Poly3DCollection(
-            [np.zeros((4, 3))],
-            facecolors=["#00CCDD"], edgecolors="#00FFFF",
-            linewidths=0.5, alpha=0.55, zorder=6)
-        ax.add_collection3d(self._ws_col)
+        # The dashboard elements for the windshield and arrow will just be empty
+        self._ws_col = None
 
         # ── Trail line ────────────────────────────────────────────
         self._trail_line, = ax.plot([], [], [], color=AMBER,
@@ -541,21 +610,28 @@ class IMUVisualiser:
 
         # ── Car body (rotated with full yaw/pitch/roll) ───────────
         rv = rotate_verts(self._car_verts, yaw, pitch, roll)
-        faces = [rv[idx] for idx in self._car_face_idx]
-        self._car_col.set_verts(faces)
+        rv[:,0] += x
+        rv[:,1] += y
+        rv[:,2] += z
 
-        # Windshield quad (top-front of car)
-        CW = abs(self._car_verts[1, 0]) * 2
-        CF = self._car_verts[2, 1]
-        CH = self._car_verts[6, 2]
-        ws_local = np.array([
-            [-CW*0.38, CF,        CH],
-            [ CW*0.38, CF,        CH],
-            [ CW*0.38, CF * 0.55, CH],
-            [-CW*0.38, CF * 0.55, CH],
-        ])
-        ws_world = rotate_verts(ws_local, yaw, pitch, roll)
-        self._ws_col.set_verts([ws_world])
+        c_polys = []
+        c_z_cents = []
+        for face_idx in self._car_face_idx:
+            poly = rv[face_idx]
+            c_polys.append(poly)
+            # Simple depth heuristic for top-down-ish camera
+            c_z_cents.append(np.mean(poly[:, 2]))
+
+        # Sort faces by Z to draw bottom ones first (Painter's algo)
+        sort_idx = np.argsort(c_z_cents)
+
+        sorted_polys = [c_polys[i] for i in sort_idx]
+        sorted_colors = [self._car_face_cols[i] for i in sort_idx]
+        
+        self._car_col.set_verts(sorted_polys)
+        self._car_col.set_facecolors(sorted_colors)
+
+
 
         # ── Heading arrow (nose direction, length = speed × 0.6) ──
         nose_local = np.array([[0, CF, CH * 0.5]])
