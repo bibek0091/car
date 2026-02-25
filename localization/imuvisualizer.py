@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════════╗
-║           BNO055 IMU  —  3D Dead-Reckoning Visualiser            ║
-║                                                                  ║
-║  Standalone script.  No project files needed.                    ║
-║  Works on Raspberry Pi with BNO055 wired to I2C, or on any      ║
-║  machine in --sim mode (kinematic simulation).                   ║
-║                                                                  ║
-║  Usage:                                                          ║
-║    python imu_visualizer.py              # real IMU              ║
-║    python imu_visualizer.py --sim        # simulation mode       ║
-║    python imu_visualizer.py --trail 600  # longer trail          ║
-║    python imu_visualizer.py --rate 20    # 20 Hz update rate     ║
-║                                                                  ║
-║  Dependencies (Pi):                                              ║
-║    pip install adafruit-blinka adafruit-circuitpython-bno055     ║
-║    pip install matplotlib numpy                                  ║
-╚══════════════════════════════════════════════════════════════════╝
+==================================================================
+           BNO055 IMU  -  3D Dead-Reckoning Visualiser            
+                                                                  
+  Standalone script.  No project files needed.                    
+  Works on Raspberry Pi with BNO055 wired to I2C, or on any      
+  machine in --sim mode (kinematic simulation).                   
+                                                                  
+  Usage:                                                          
+    python imu_visualizer.py              # real IMU              
+    python imu_visualizer.py --trail 600  # longer trail          
+    python imu_visualizer.py --rate 20    # 20 Hz update rate     
+                                                                  
+  Dependencies (Pi):                                              
+    pip install adafruit-blinka adafruit-circuitpython-bno055     
+    pip install matplotlib numpy                                  
+==================================================================
 """
 
 import sys
@@ -35,9 +34,9 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.patches as mpatches
 from matplotlib.patches import Arc, FancyArrowPatch
 
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 # Colour palette  (dark cockpit theme)
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 BG      = "#0A0A12"
 PANEL   = "#0F0F1A"
 CYAN    = "#00E5FF"
@@ -49,34 +48,24 @@ WHITE   = "#E8E8F0"
 YELLOW  = "#FFD600"
 BLUE_LT = "#2878C8"
 
-# ══════════════════════════════════════════════════════════════════
-# IMU Driver  —  robust BNO055 init  +  sim fallback
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
+# IMU Driver  -  robust BNO055 init  +  sim fallback
+# ==================================================================
 class IMUReader:
     """
     Wraps the BNO055 with:
       • I2C deinit between retries (fixes 'scan empty after Errno 121')
       • No frequency= arg (blinka ignores it on Pi, causes confusion)
       • 1.5 s recovery after Errno 121 (sensor I2C FSM crash)
-      • Simulation fallback when --sim or hardware unavailable
     """
-    def __init__(self, sim=False):
-        self.sim      = sim
+    def __init__(self):
         self.imu      = None
         self.calib    = (0, 0, 0, 0)
         self._lock    = threading.Lock()
 
-        # Sim state
-        self._sim_yaw   = 0.0
-        self._sim_t     = time.time()
-        self._sim_pitch = 0.0
-        self._sim_roll  = 0.0
-
-        if not sim:
-            self.imu = self._init_bno055()
-            if self.imu is None:
-                print("[IMU] Falling back to simulation mode.")
-                self.sim = True
+        self.imu = self._init_bno055()
+        if self.imu is None:
+            print("[IMU] Initialization failed. Waiting for valid I2C data...")
 
     # ── BNO055 init ──────────────────────────────────────────────
     def _init_bno055(self, retries=4):
@@ -150,9 +139,10 @@ class IMUReader:
         """
         Returns (yaw_deg, pitch_deg, roll_deg, calib_tuple, lin_accel_xyz).
         calib_tuple = (sys, gyro, accel, mag)  each 0-3.
+        Returns None if IMU is not connected.
         """
-        if self.sim:
-            return self._sim_read()
+        if self.imu is None:
+            return None
 
         try:
             with self._lock:
@@ -169,27 +159,12 @@ class IMUReader:
             return yaw, pitch, roll, self.calib, (ax, ay, az)
         except Exception as e:
             print(f"[IMU] Read error: {e}")
-            return 0.0, 0.0, 0.0, (0, 0, 0, 0), (0.0, 0.0, 0.0)
-
-    def _sim_read(self):
-        """Kinematic simulation: figure-8 path with gentle pitch/roll."""
-        t  = time.time()
-        dt = t - self._sim_t
-        self._sim_t = t
-        # Slowly rotating figure-8 heading
-        self._sim_yaw   += 25.0 * dt          # 25 deg/s yaw rate
-        self._sim_pitch  = 8.0 * math.sin(t * 0.4)
-        self._sim_roll   = 5.0 * math.cos(t * 0.3)
-        # Fake linear accel from centripetal of circle
-        ax = 0.15 * math.cos(math.radians(self._sim_yaw))
-        ay = 0.15 * math.sin(math.radians(self._sim_yaw))
-        return (self._sim_yaw % 360, self._sim_pitch,
-                self._sim_roll, (3, 3, 3, 3), (ax, ay, 0.0))
+            return None
 
 
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 # Dead-Reckoning integrator
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 class DeadReckoning:
     """
     Integrates linear acceleration to produce velocity and position.
@@ -242,9 +217,9 @@ class DeadReckoning:
         self.vx = self.vy = self.vz = 0.0
 
 
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 # Build car geometry  (8-corner box in local frame)
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 def make_car_verts():
     """
     Returns (8×3 local vertices, face index lists, face colours).
@@ -299,9 +274,9 @@ def rotate_verts(verts, yaw_deg, pitch_deg=0.0, roll_deg=0.0):
     return verts @ R.T
 
 
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 # Main Visualiser
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 class IMUVisualiser:
 
     GRID_R = 1.8    # metres, half-width of visible floor grid
@@ -357,8 +332,7 @@ class IMUVisualiser:
                       ha="center", va="top",
                       fontfamily="monospace", fontsize=11,
                       color=CYAN, fontweight="bold")
-        src = "SIMULATION" if self.imu.sim else "HARDWARE"
-        self.fig.text(0.50, 0.93, f"SOURCE: {src}",
+        self.fig.text(0.50, 0.93, "SOURCE: HARDWARE I2C",
                       ha="center", va="top",
                       fontfamily="monospace", fontsize=7, color=MUTED)
 
@@ -447,8 +421,8 @@ class IMUVisualiser:
         self._hud_fps   = ax.text2D(0.98, 0.97, "FPS  —", color=MUTED,
                                      ha="right", **_tf)
         self._hud_mode  = ax.text2D(0.98, 0.91,
-                                     "SIM" if self.imu.sim else "HW",
-                                     color=AMBER if self.imu.sim else GREEN,
+                                     "HW",
+                                     color=GREEN,
                                      ha="right", **_tf)
 
         # ── Axis cosmetics ────────────────────────────────────────
@@ -496,7 +470,28 @@ class IMUVisualiser:
         t_now = time.time()
 
         # ── Read sensor ──────────────────────────────────────────
-        yaw, pitch, roll, calib, (ax, ay, az) = self.imu.read()
+        data = self.imu.read()
+
+        if data is None:
+            # Handle NO DATA dynamically 
+            self._hud_yaw.set_text("NO IMU DETECTED")
+            self._hud_yaw.set_color(RED)
+            self._hud_pitch.set_text("")
+            self._hud_roll.set_text("")
+            self._hud_x.set_text("Check I2C wiring")
+            self._hud_y.set_text("sudo i2cdetect -y 1")
+            self._hud_z.set_text("")
+            self._hud_spd.set_text("")
+            self._hud_calib.set_text("")
+            self._hud_mode.set_text("OFFLINE")
+            self._hud_mode.set_color(RED)
+            return []
+            
+        yaw, pitch, roll, calib, (ax, ay, az) = data
+
+        self._hud_yaw.set_color(CYAN)
+        self._hud_mode.set_text("ONLINE")
+        self._hud_mode.set_color(GREEN)
 
         # ── Dead reckoning ───────────────────────────────────────
         x, y, z = self.dr.update(ax, ay, az, yaw)
@@ -644,16 +639,16 @@ class IMUVisualiser:
             cache_frame_data=False
         )
         print(f"\n[VIS] Running  (close window to exit)\n"
-              f"      Mode    : {'SIMULATION' if self.imu.sim else 'HARDWARE BNO055'}\n"
+              f"      Mode    : HARDWARE BNO055\n"
               f"      Trail   : {self.trail_len} samples\n"
               f"      Rate    : {int(1000/self.interval)} Hz\n"
               f"      Hotkeys : close window to quit,  RESET button to zero position\n")
         plt.show()
 
 
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 # Entry point
-# ══════════════════════════════════════════════════════════════════
+# ==================================================================
 def main():
     parser = argparse.ArgumentParser(
         description="BNO055 IMU 3D Dead-Reckoning Visualiser",
@@ -661,23 +656,20 @@ def main():
         epilog="""
 Examples:
   python imu_visualizer.py                 # real BNO055, auto-detect I2C address
-  python imu_visualizer.py --sim           # simulation (no hardware needed)
   python imu_visualizer.py --trail 800     # longer yellow trail
   python imu_visualizer.py --rate 15       # 15 Hz (lighter CPU on old Pi)
         """)
-    parser.add_argument("--sim",   action="store_true",
-                        help="Run in simulation mode (no hardware required)")
     parser.add_argument("--trail", type=int, default=400,
                         help="Number of trail positions to keep (default 400)")
     parser.add_argument("--rate",  type=int, default=30,
                         help="Update rate in Hz (default 30)")
     args = parser.parse_args()
 
-    print("╔══════════════════════════════════════════════════╗")
-    print("║   BNO055 IMU  3D  Dead-Reckoning  Visualiser    ║")
-    print("╚══════════════════════════════════════════════════╝")
+    print("==================================================")
+    print("   BNO055 IMU  3D  Dead-Reckoning  Visualiser    ")
+    print("==================================================")
 
-    imu = IMUReader(sim=args.sim)
+    imu = IMUReader()
     dr  = DeadReckoning()
     vis = IMUVisualiser(imu, dr, trail_len=args.trail, update_hz=args.rate)
     vis.run()
