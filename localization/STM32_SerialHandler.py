@@ -129,15 +129,22 @@ class STM32_SerialHandler:
         self.send_command("alive", "1")
         time.sleep(0.1)
 
-        # BFMC-CORRECT IGNITION (KL30)
-        self.enable_ignition()
-        time.sleep(0.4)
+        # BFMC-CORRECT IGNITION
+        # The new mbed-os-empty firmware requires KL:15 to be sent FIRST to enable the IMU parsing.
+        # Sending KL:30 directly bypasses the IMU activation block.
+        self.send_command("kl", "15")
+        time.sleep(0.2)
+        
+        # ACTIVATE IMU STREAM EXPLICITLY
+        self.send_command("imu", "1")
+        time.sleep(0.2)
+        
+        # Now upgrade to KL:30 to enable motor drive
+        self.send_command("kl", "30")
+        time.sleep(0.2)
 
         self.send_command("steer", "0")
         self.send_command("speed", "0")
-        
-        # ACTIVATE IMU STREAM
-        self.send_command("imu", "1")
 
         self.status.state = VehicleState.READY
         logger.info("Vehicle READY (KL30 enabled)")
