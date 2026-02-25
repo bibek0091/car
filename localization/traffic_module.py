@@ -29,17 +29,49 @@ class ThreadedYOLODetector:
         self.result_queue = queue.Queue(maxsize=1)
         self.running = True
         self.active_detections = []
-        
+        self.yolo_ok = False          # True only when model actually loaded
+        self.model_path_used = None   # The resolved path that worked (or None)
+
         self.model = None
         if _YOLO_AVAILABLE:
-            try:
-                self.model = YOLO(model_path)
-            except Exception as e:
-                print(f"Failed to load YOLO model: {e}")
-                self.model = None
+            resolved = self._resolve_model_path(model_path)
+            if resolved:
+                try:
+                    self.model = YOLO(resolved)
+                    self.yolo_ok = True
+                    self.model_path_used = resolved
+                    print(f"[YOLO] Model loaded from: {resolved}")
+                except Exception as e:
+                    print(f"[YOLO] Failed to load model at '{resolved}': {e}")
+                    self.model = None
+            else:
+                print(f"[YOLO] Model file '{model_path}' not found in any search path. "
+                      f"Traffic detection DISABLED.")
 
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
+
+    @staticmethod
+    def _resolve_model_path(model_path):
+        """
+        Search for the model file in order:
+          1. Exact path as given (absolute or relative to CWD)
+          2. Same directory as traffic_module.py  (handles running from any folder)
+          3. Parent directory of traffic_module.py
+          4. Parent's parent (repo root)
+        Returns the first existing path, or None if not found.
+        """
+        import os
+        candidates = [
+            model_path,                                                         # 1. as given
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), model_path),  # 2. script dir
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", model_path),  # 3. parent
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", model_path),  # 4. grandparent
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return os.path.abspath(c)
+        return None
 
     def _run(self):
         while self.running:
@@ -220,9 +252,7 @@ class TrafficDecisionEngine:
                 else: dist = "HALT"
                 
                 fsm_st = self.tl_fsm.update(clr=="RED", clr=="GREEN", dist)
-                
-                # BUG 6: FSM has wrong state name here. Should be LIGHT_DETECTED_FAR
-                if fsm_st == "LIGHT_DETECTED_FAR":
+                if fsm_st == "LIGHT_APPROACHING":
                     light_st = "[RED] APPROACH"
                     commit(4, "SYS_SLOW", "RED LIGHT AHEAD")
                 elif fsm_st in ["LIGHT_RED_STOPPING", "LIGHT_RED_STOPPED"]:

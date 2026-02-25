@@ -1,3 +1,4 @@
+adafruit-blinka>=8.20.0
 adafruit-circuitpython-bno055==5.3.4
 gpiozero==2.0
 networkx==3.1

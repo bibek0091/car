@@ -839,6 +839,18 @@ class DashboardApp:
 
         tk.Label(pnl_cam, text="YOLO CAMERA FEED",
                  font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(10, 2))
+
+        # YOLO model status line — shows path or "NO MODEL" warning
+        yolo_status = "NO MODEL — traffic detection disabled"
+        yolo_status_col = self.RED_C
+        if hasattr(self.orch, 'yolo_worker') and self.orch.yolo_worker.yolo_ok:
+            yolo_status = f"✓ {self.orch.yolo_worker.model_path_used}"
+            yolo_status_col = self.GREEN_C
+        self.lbl_yolo_status = tk.Label(pnl_cam, text=yolo_status,
+                                        font=("Courier", 8), fg=yolo_status_col,
+                                        bg=self.PANEL_BG, wraplength=440)
+        self.lbl_yolo_status.pack(pady=(0, 2))
+
         self.lbl_yolo = tk.Label(pnl_cam, bg="black")
         self.lbl_yolo.pack(pady=2)
 
@@ -1246,7 +1258,7 @@ class Orchestrator:
         self.planner   = PathPlanner("Competition_track_graph.graphml")
         self.hw        = HardwareIO(sim_mode=args.sim,
                                      sim_video=getattr(args, "sim_video", None))
-        self.yolo_worker = ThreadedYOLODetector()
+        self.yolo_worker = ThreadedYOLODetector(model_path=getattr(args, "model", "best.pt"))
         self.traffic   = TrafficDecisionEngine(self.yolo_worker)
         self.vision    = VisionPipeline()
         self.localizer = LocalizationEngine()
@@ -1638,6 +1650,8 @@ def parse_args():
     p.add_argument("--sim-video", type=str,            help="Path to .mp4 for camera sim")
     p.add_argument("--start",     type=str,            help="Start node ID (skips wizard)")
     p.add_argument("--target",    type=str,            help="Target node ID (skips wizard)")
+    p.add_argument("--model",     type=str,            default="best.pt",
+                   help="Path to YOLO .pt model file (default: best.pt, searched relative to script)")
     return p.parse_args()
 
 
