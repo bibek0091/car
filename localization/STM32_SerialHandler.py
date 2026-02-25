@@ -135,6 +135,9 @@ class STM32_SerialHandler:
 
         self.send_command("steer", "0")
         self.send_command("speed", "0")
+        
+        # ACTIVATE IMU STREAM
+        self.send_command("imu", "1")
 
         self.status.state = VehicleState.READY
         logger.info("Vehicle READY (KL30 enabled)")
