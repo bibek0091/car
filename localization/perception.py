@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import math
 from dataclasses import dataclass
 
 @dataclass
@@ -15,6 +16,28 @@ class PerceptionResult:
     curvature: float
     l_conf: float
     r_conf: float
+
+
+def estimate_heading_from_lanes(sl, sr, h=480):
+    """
+    Estimates the car's heading offset from the road centre line using the
+    derivative of the lane polynomials at the bottom of the BEV image.
+
+    x = a*y^2 + b*y + c   →   dx/dy = 2a*y + b
+    A positive tangent slope means the road curves right relative to the camera.
+    Returns the correction in RADIANS to add to the current yaw estimate.
+    A negative return value = road turns left = car needs to yaw left.
+    """
+    tangents = []
+    for fit in [sl, sr]:
+        if fit is None:
+            continue
+        dxdy = 2.0 * fit[0] * h + fit[1]   # derivative at bottom row
+        tangents.append(math.atan2(dxdy, 1.0))
+    if not tangents:
+        return 0.0
+    # Negate: a rightward lean in BEV = road curving right = positive yaw rate
+    return -float(np.mean(tangents))
 
 class HybridLaneTracker:
     NWINDOWS         = 9
@@ -169,13 +192,16 @@ class HybridLaneTracker:
                     self.r_stale = self.STALE_FIT_FRAMES
                     has_r = False
             else:
+                # y=400 is at the BOTTOM of the BEV (closest to car) — most reliable
+                # y=100 is at the TOP (furthest) — least reliable
+                # Weights must be [1,2,3,4] for [100,200,300,400]
                 y_pos = [100, 200, 300, 400]
                 widths = []
                 for y in y_pos:
                     lx = np.polyval(self.sl, y)
                     rx = np.polyval(self.sr, y)
                     widths.append(rx - lx)
-                w = np.average(widths, weights=[4, 3, 2, 1])
+                w = np.average(widths, weights=[1, 2, 3, 4])   # bottom row = highest weight
                 self.lane_width_px = 0.8 * self.lane_width_px + 0.2 * w
 
         self.lane_width_px = max(150.0, min(self.lane_width_px, 400.0))
@@ -255,23 +281,3 @@ class VisionPipeline:
             l_conf=self.tracker.l_conf,
             r_conf=self.tracker.r_conf
         )
-
-def estimate_heading_from_lanes(sl, sr, h=480):
-    """
-    Returns heading_correction_rad relative to current heading.
-    Positive = road curves right.
-    Uses derivative of lane polynomial at bottom of image.
-    """
-    tangents = []
-    for fit in [sl, sr]:
-        if fit is None:
-            continue
-        # dx/dy = 2a*y + b  (derivative of x=ay^2+by+c w.r.t. y)
-        dxdy = 2 * fit[0] * h + fit[1]
-        # Road heading offset from image center axis (forward = 0)
-        # Small dxdy = road going straight, large = road curving
-        angle_rad = math.atan2(dxdy, 1.0)  # angle of road tangent
-        tangents.append(angle_rad)
-    if not tangents:
-        return 0.0
-    return -float(np.mean(tangents))   # negate: right lean = left correction

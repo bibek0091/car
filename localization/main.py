@@ -1285,11 +1285,20 @@ class Orchestrator:
                     
                 # 4. IMU heading
                 imu_yaw_deg, imu_calib = self.hw.get_fused_imu_yaw()
+                # IMU is available only when the real BNO055 driver loaded AND
+                # we are not in sim mode (sim uses kinematic model internally)
+                imu_available = (not self.hw.sim_mode) and (self.hw.imu is not None)
                 
                 # Assign visual confidences for the CSV later
                 v_res_curv = v_res.curvature
                 l_conf = v_res.l_conf
                 r_conf = v_res.r_conf
+
+                # Camera-only yaw correction (used when IMU is dead)
+                cam_yaw_corr = 0.0
+                if not imu_available:
+                    from perception import estimate_heading_from_lanes
+                    cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
 
                 # Snapshot the planned path to avoid mid-frame GUI mutations
                 with self.path_lock:
@@ -1314,19 +1323,23 @@ class Orchestrator:
                     velocity_ms = 0.0
 
                 pose = self.localizer.update(
-                    velocity_ms     = velocity_ms,
-                    steer_angle_deg = steer,
-                    imu_yaw_deg     = imu_yaw_deg,
-                    lane_error_px   = v_res.lateral_error_px,
-                    lane_width_px   = v_res.lane_width_px,
-                    conf            = v_res.confidence,
-                    dt              = self._dt
+                    velocity_ms            = velocity_ms,
+                    steer_angle_deg        = steer,
+                    imu_yaw_deg            = imu_yaw_deg,
+                    lane_error_px          = v_res.lateral_error_px,
+                    lane_width_px          = v_res.lane_width_px,
+                    conf                   = v_res.confidence,
+                    dt                     = self._dt,
+                    imu_available          = imu_available,
+                    camera_yaw_correction  = cam_yaw_corr
                 )
 
                 # 7. Lookahead waypoints from A* path
-                waypoints, self._path_cursor = self.planner.get_lookahead_waypoints(
+                waypoints, new_cursor = self.planner.get_lookahead_waypoints(
                     pose[0], pose[1], current_path, cursor=self._path_cursor, lookahead_m=0.8
                 )
+                # Never let cursor go backward — prevents waypoints pointing behind car
+                self._path_cursor = max(self._path_cursor, new_cursor)
 
                 # 8. Nearest node (for telemetry)
                 nearest_node = self.planner.get_nearest_node(pose[0], pose[1])
@@ -1506,8 +1519,19 @@ if __name__ == "__main__":
             log.info(f"A* path: {len(orch.planned_path)} nodes  ({start_node} → {target_node})")
 
         sp = orch.planner.node_positions.get(start_node, (0.0, 0.0))
-        orch.localizer.set_pose(sp[0], sp[1], 0.0)
-        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f})")
+
+        # Derive initial heading from first A* edge so dead-reckoning starts correct.
+        # Without this, yaw=0 and the car dead-reckons east regardless of orientation.
+        init_yaw = 0.0
+        if orch.planned_path and len(orch.planned_path) >= 2:
+            p1 = orch.planner.node_positions.get(orch.planned_path[0])
+            p2 = orch.planner.node_positions.get(orch.planned_path[1])
+            if p1 and p2:
+                init_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
+                log.info(f"Initial yaw from A* edge: {math.degrees(init_yaw):.1f}°")
+
+        orch.localizer.set_pose(sp[0], sp[1], init_yaw)
+        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f})  yaw={math.degrees(init_yaw):.1f}°")
         
         dash.draw_route_on_map(orch.planned_path, start_node, target_node)
         
