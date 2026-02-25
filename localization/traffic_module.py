@@ -37,24 +37,34 @@ class ThreadedYOLODetector:
             resolved = self._resolve_model_path(model_path)
             if resolved:
                 try:
-                    # PyTorch 2.6+ changed torch.load default to weights_only=True.
-                    # Custom YOLO models contain DetectionModel which is blocked by default.
-                    # Allowlist it so the model loads without needing weights_only=False
-                    # (which would allow arbitrary code execution).
-                    try:
-                        import torch
-                        from ultralytics.nn.tasks import DetectionModel
-                        if hasattr(torch.serialization, 'add_safe_globals'):
-                            torch.serialization.add_safe_globals([DetectionModel])
-                            print("[YOLO] Allowlisted DetectionModel for PyTorch 2.6+ safe load")
-                    except Exception as sg_err:
-                        # Older PyTorch or ultralytics version — no action needed
-                        print(f"[YOLO] Safe-globals patch skipped ({sg_err}) — likely PyTorch < 2.6")
+                    # PyTorch 2.6 changed torch.load default to weights_only=True.
+                    # A YOLO .pt model pickle contains 15-20 internal torch/ultralytics
+                    # classes (Sequential, DetectionModel, Conv, etc.). Allowlisting
+                    # them individually is a whack-a-mole — each PyTorch version adds
+                    # more blocked classes.
+                    #
+                    # The correct fix for a TRUSTED LOCAL MODEL (your own best.pt)
+                    # is to temporarily patch torch.load to use weights_only=False
+                    # ONLY during this one YOLO() call, then restore it immediately.
+                    # This is scoped — it does NOT affect any other torch.load calls
+                    # elsewhere in the process.
+                    import torch
+                    _orig_torch_load = torch.load
 
-                    self.model = YOLO(resolved)
-                    self.yolo_ok = True
-                    self.model_path_used = resolved
-                    print(f"[YOLO] Model loaded from: {resolved}")
+                    def _patched_load(*args, **kwargs):
+                        kwargs['weights_only'] = False
+                        return _orig_torch_load(*args, **kwargs)
+
+                    torch.load = _patched_load
+                    try:
+                        self.model = YOLO(resolved)
+                        self.yolo_ok = True
+                        self.model_path_used = resolved
+                        print(f"[YOLO] Model loaded from: {resolved}")
+                    finally:
+                        # ALWAYS restore original torch.load even if YOLO() throws
+                        torch.load = _orig_torch_load
+
                 except Exception as e:
                     print(f"[YOLO] Failed to load model at '{resolved}': {e}")
                     self.model = None

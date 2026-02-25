@@ -139,78 +139,110 @@ class HardwareIO:
                 self.camera = None
 
     # ── BNO055 Initialization ─────────────────────────────────────────────────
-    def _init_bno055(self, retries=3):
+    def _init_bno055(self, retries=4):
         """
-        Robust BNO055 init with:
-          - I2C bus scan to confirm device is visible before init
-          - Address fallback: tries 0x28 then 0x29
-          - Retry loop (sensor needs up to 650ms boot time)
-          - Detailed per-failure logging so you know exactly what went wrong
-        Returns the BNO055 object, or None on total failure.
+        Robust BNO055 init.
+
+        Two bugs fixed vs previous version:
+        1. The old code never called i2c.deinit() between attempts.
+           busio.I2C holds an exclusive file-descriptor on /dev/i2c-1.
+           Creating a second busio.I2C() while the first is still open causes
+           the kernel to return a silently-broken object → scan always returns [].
+           Fix: always deinit in a finally block before the next attempt.
+
+        2. adafruit_blinka IGNORES the frequency= parameter on Linux/Pi
+           (it prints a RuntimeWarning about this). The Pi defaults to whatever
+           /boot/firmware/config.txt says (usually 100 kHz). At 100 kHz the BNO055
+           sometimes fails its first init write with Errno 121 (Remote I/O error)
+           because the sensor clock-stretches longer than the master allows.
+           Fix: don't pass frequency= (use system default), and after Errno 121
+           wait 1.5 s for the BNO055 to recover its I2C state machine.
         """
-        BNO_ADDRESSES = [0x28, 0x29]   # 0x28 = PS1 low (default), 0x29 = PS1 high
+        BNO_ADDRESSES = [0x29, 0x28]   # 0x29 tried first (confirmed on this hardware)
 
         for attempt in range(1, retries + 1):
+            i2c = None
             try:
-                # busio.I2C uses 100kHz by default; pass frequency= for fast mode
-                # BNO055 works at both 100kHz and 400kHz; 400k is more reliable
-                # on Pi because it reduces the window where clock-stretching stalls.
-                i2c = busio.I2C(board.SCL, board.SDA, frequency=400_000)
+                # DO NOT pass frequency= — adafruit_blinka ignores it on Pi
+                # and emits a RuntimeWarning. The system I2C speed from config.txt is used.
+                i2c = busio.I2C(board.SCL, board.SDA)
 
-                # ── I2C Bus Scan ──────────────────────────────────────────────
-                # Lock the bus, scan for visible addresses, release.
+                # ── Bus scan ─────────────────────────────────────────────────
                 while not i2c.try_lock():
                     pass
                 try:
                     found = i2c.scan()
-                    log.info(f"I2C scan (attempt {attempt}): found addresses "
-                             f"{[hex(a) for a in found]}")
+                    log.info(f"I2C scan (attempt {attempt}/{retries}): "
+                             f"found addresses {[hex(a) for a in found]}")
                 finally:
                     i2c.unlock()
 
                 if not found:
                     log.error(f"I2C scan empty (attempt {attempt}/{retries}). "
-                              "Check: SDA=GPIO2(pin3), SCL=GPIO3(pin5), "
-                              "3.3V power, GND, I2C enabled in raspi-config.")
-                    if attempt < retries:
-                        time.sleep(0.7)
+                              "Check wiring: SDA=GPIO2(pin3), SCL=GPIO3(pin5), "
+                              "VIN=3.3V(pin1), GND(pin6). "
+                              "Enable I2C: sudo raspi-config → Interface Options → I2C.")
                     continue
 
-                # ── Try BNO055 at each known address ─────────────────────────
-                imu_obj = None
+                # ── Try each known BNO055 address ────────────────────────────
                 for addr in BNO_ADDRESSES:
                     if addr not in found:
-                        log.debug(f"BNO055 address {hex(addr)} not on bus — skipping")
                         continue
                     try:
                         imu_obj = adafruit_bno055.BNO055_I2C(i2c, address=addr)
-                        log.info(f"BNO055 initialised at address {hex(addr)} "
+                        # Quick sanity read — confirms sensor is actually responding
+                        _ = imu_obj.euler
+                        log.info(f"BNO055 online at {hex(addr)} "
                                  f"(attempt {attempt}/{retries}) ✓")
-                        return imu_obj
+                        return imu_obj          # ← SUCCESS: return without deinit
+                                                #   (imu_obj keeps i2c alive)
+                    except OSError as addr_err:
+                        errno_val = addr_err.errno if hasattr(addr_err, 'errno') else -1
+                        if errno_val == 121:    # EREMOTEIO — sensor crashed its I2C FSM
+                            log.warning(f"BNO055 at {hex(addr)}: Errno 121 Remote I/O — "
+                                        f"sensor I2C state machine reset. "
+                                        f"Waiting 1.5 s for recovery…")
+                            # Must deinit THIS attempt's i2c before the long sleep
+                            # so the bus is free when we retry.
+                            try: i2c.deinit()
+                            except Exception: pass
+                            i2c = None
+                            time.sleep(1.5)     # BNO055 needs >650 ms to fully recover
+                        else:
+                            log.warning(f"BNO055 at {hex(addr)} failed "
+                                        f"(errno={errno_val}): {addr_err}")
                     except Exception as addr_err:
-                        log.warning(f"BNO055 at {hex(addr)} failed: {addr_err}")
+                        log.warning(f"BNO055 at {hex(addr)} failed: "
+                                    f"{type(addr_err).__name__}: {addr_err}")
 
-                # Neither address worked even though something was on the bus
-                log.error(f"BNO055 not responding at {[hex(a) for a in BNO_ADDRESSES]} "
+                log.error(f"BNO055 not responding at any address "
                           f"(attempt {attempt}/{retries}). "
-                          f"Found on bus: {[hex(a) for a in found]}")
+                          f"Devices on bus: {[hex(a) for a in found]}")
 
             except Exception as e:
                 log.error(f"BNO055 init error (attempt {attempt}/{retries}): "
                           f"{type(e).__name__}: {e}")
-                if "Permission" in str(e) or "Access" in str(e):
-                    log.error("Permission denied — add user to i2c group: "
+                if "Permission" in str(e):
+                    log.error("Permission denied on /dev/i2c-1 — run: "
                               "sudo usermod -aG i2c $USER  then log out and back in")
-                if "No module" in str(e):
-                    log.error("Missing dependency — run: "
-                              "pip install adafruit-blinka adafruit-circuitpython-bno055 "
-                              "--break-system-packages")
+
+            finally:
+                # CRITICAL: always release the bus fd before the next attempt.
+                # Without this, the next busio.I2C() gets a broken object and
+                # scan() returns [] even when the device is physically present.
+                if i2c is not None:
+                    try:
+                        i2c.deinit()
+                    except Exception:
+                        pass
+                    i2c = None
 
             if attempt < retries:
-                log.info(f"Retrying BNO055 init in 0.7s...")
-                time.sleep(0.7)   # BNO055 boot time is up to 650ms
+                wait = 1.5 if attempt == 1 else 0.8
+                log.info(f"Retrying BNO055 in {wait:.1f} s…")
+                time.sleep(wait)
 
-        log.error("BNO055 failed to initialise after all attempts. "
+        log.error("BNO055 failed after all attempts. "
                   "Localization will use camera-only heading estimation.")
         return None
 
