@@ -620,29 +620,136 @@ class DashboardApp:
                                    fg=self.MUTED, bg=self.PANEL_BG)
         self.lbl_reason.pack(pady=2)
 
-        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=8)
+        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=6)
 
-        self.lbl_speed = tk.Label(pnl_stat, text="Speed: 0.0 %",
-                                  font=("Courier", 14), fg=self.CYAN, bg=self.PANEL_BG)
-        self.lbl_speed.pack(pady=6)
+        # ── IMU INSTRUMENT PANEL ──────────────────────────────────────────────
+        tk.Label(pnl_stat, text="IMU INSTRUMENTS", font=("Courier", 9),
+                 fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(2, 0))
+
+        self._imu_fig, (self._ax_compass, self._ax_speed) = plt.subplots(
+            1, 2, figsize=(2.9, 1.55), facecolor=self.PANEL_BG)
+        self._imu_fig.subplots_adjust(left=0.02, right=0.98,
+                                      top=0.92, bottom=0.08, wspace=0.12)
+
+        # ── Compass rose ─────────────────────────────────────────────────────
+        ax = self._ax_compass
+        ax.set_facecolor("#0E0E14")
+        ax.set_xlim(-1.25, 1.25);  ax.set_ylim(-1.25, 1.25)
+        ax.set_aspect("equal");    ax.axis("off")
+        ax.add_patch(plt.Circle((0, 0), 1.0, color="#1A1A28", zorder=1))
+        ax.add_patch(plt.Circle((0, 0), 1.0, color="#4A4A5A",
+                                fill=False, lw=1.5, zorder=2))
+        _CARDS = {"N": (90, "#FF4040"), "E": (0, "#909098"),
+                  "S": (270, "#909098"), "W": (180, "#909098")}
+        for label, (deg, col) in _CARDS.items():
+            r = math.radians(deg)
+            ax.plot([0.80*math.cos(r), 0.98*math.cos(r)],
+                    [0.80*math.sin(r), 0.98*math.sin(r)], color=col, lw=1.5, zorder=3)
+            ax.text(0.60*math.cos(r), 0.60*math.sin(r), label,
+                    color=col, ha="center", va="center",
+                    fontsize=6, fontweight="bold", zorder=4)
+        for deg in range(0, 360, 45):
+            r = math.radians(deg)
+            ax.plot([0.88*math.cos(r), 0.98*math.cos(r)],
+                    [0.88*math.sin(r), 0.98*math.sin(r)],
+                    color="#404050", lw=0.8, zorder=3)
+        self._compass_needle, = ax.plot([0, 0], [0, 0.82], color=self.CYAN,
+                                        lw=2.5, solid_capstyle="round", zorder=5)
+        self._compass_tail,   = ax.plot([0, 0], [0, -0.38], color="#FF5050",
+                                        lw=2.0, solid_capstyle="round", zorder=5)
+        ax.add_patch(plt.Circle((0, 0), 0.07, color=self.CYAN, zorder=6))
+        self._compass_txt = ax.text(0, -1.18, "0.0°", color=self.CYAN,
+                                    ha="center", va="center",
+                                    fontsize=7, fontfamily="monospace", zorder=6)
+        ax.set_title("HEADING", color=self.MUTED, fontsize=6, pad=2)
+
+        # ── Speedometer arc ──────────────────────────────────────────────────
+        ax2 = self._ax_speed
+        ax2.set_facecolor("#0E0E14")
+        ax2.set_xlim(-1.3, 1.3);  ax2.set_ylim(-0.55, 1.25)
+        ax2.set_aspect("equal");   ax2.axis("off")
+
+        _SPEED_MAX = 1.0          # m/s full scale
+        _ARC_START = 225          # mpl angle at 0 m/s  (lower-left)
+        _ARC_END   = -45          # mpl angle at max    (lower-right)
+        self._speed_max  = _SPEED_MAX
+        self._arc_start  = _ARC_START
+        self._arc_end    = _ARC_END
+
+        from matplotlib.patches import Arc as _Arc
+        # background arc
+        ax2.add_patch(_Arc((0,0), 2.0, 2.0, angle=0,
+                           theta1=_ARC_END, theta2=_ARC_START,
+                           color="#2A2A38", lw=10, zorder=1))
+        # coloured zones
+        def _arc_seg(v0, v1, col):
+            def _v2t(v):
+                return _ARC_START - min(max(v/_SPEED_MAX,0),1)*(_ARC_START-_ARC_END)
+            ax2.add_patch(_Arc((0,0), 2.0, 2.0, angle=0,
+                               theta1=_v2t(v1), theta2=_v2t(v0),
+                               color=col, lw=9, zorder=2))
+        _arc_seg(0.0,  0.5,  "#1A6A1A")   # green
+        _arc_seg(0.5,  0.8,  "#8A5A00")   # amber
+        _arc_seg(0.8,  1.01, "#8A1A1A")   # red
+        # tick marks
+        for v_tick in [0, 0.25, 0.5, 0.75, 1.0]:
+            frac = v_tick / _SPEED_MAX
+            theta = math.radians(_ARC_START - frac*(_ARC_START-_ARC_END))
+            ax2.plot([0.82*math.cos(theta), 1.02*math.cos(theta)],
+                     [0.82*math.sin(theta), 1.02*math.sin(theta)],
+                     color="#606070", lw=1.2, zorder=3)
+            ax2.text(0.66*math.cos(theta), 0.66*math.sin(theta),
+                     f"{v_tick:.2g}", color="#808090",
+                     ha="center", va="center", fontsize=5.5, zorder=4)
+        self._speed_needle, = ax2.plot([0, 0], [0, 0], color=self.AMBER,
+                                       lw=2.5, solid_capstyle="round", zorder=5)
+        ax2.add_patch(plt.Circle((0, 0), 0.07, color=self.AMBER, zorder=6))
+        self._speed_txt = ax2.text(0, -0.42, "0.000 m/s", color=self.AMBER,
+                                   ha="center", va="center",
+                                   fontsize=7, fontfamily="monospace", zorder=6)
+        ax2.set_title("SPEED", color=self.MUTED, fontsize=6, pad=2)
+
+        self._imu_canvas = FigureCanvasTkAgg(self._imu_fig, master=pnl_stat)
+        self._imu_canvas.get_tk_widget().pack(pady=2)
+
+        # ── Calibration status LEDs: SYS / GYRO / ACCEL / MAG ───────────────
+        # Each LED is 0-3: 0=red, 1=orange, 2=yellow, 3=green
+        frm_leds = tk.Frame(pnl_stat, bg=self.PANEL_BG)
+        frm_leds.pack(pady=(0, 4))
+        self._calib_leds = []
+        _LED_NAMES = ["SYS", "GYR", "ACC", "MAG"]
+        for name in _LED_NAMES:
+            cell = tk.Frame(frm_leds, bg=self.PANEL_BG)
+            cell.pack(side=tk.LEFT, padx=6)
+            tk.Label(cell, text=name, font=("Courier", 7),
+                     fg=self.MUTED, bg=self.PANEL_BG).pack()
+            led = tk.Label(cell, text="●", font=("Courier", 12),
+                           fg="#1A1A2A", bg=self.PANEL_BG)
+            led.pack()
+            self._calib_leds.append(led)
+
+        # ── Compact numeric readouts ─────────────────────────────────────────
+        self.lbl_speed = tk.Label(pnl_stat, text="PWM: 0.0 %",
+                                  font=("Courier", 11), fg=self.CYAN, bg=self.PANEL_BG)
+        self.lbl_speed.pack(pady=1)
 
         self.lbl_steer = tk.Label(pnl_stat, text="Steer: 0.0°",
-                                  font=("Courier", 14), fg=self.YELLOW, bg=self.PANEL_BG)
-        self.lbl_steer.pack(pady=6)
+                                  font=("Courier", 11), fg=self.YELLOW, bg=self.PANEL_BG)
+        self.lbl_steer.pack(pady=1)
 
         self.lbl_pose = tk.Label(pnl_stat, text="Pose: x=0.00  y=0.00  ψ=0°",
-                                 font=("Courier", 10), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_pose.pack(pady=4)
+                                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
+        self.lbl_pose.pack(pady=2)
 
         self.lbl_anchor = tk.Label(pnl_stat, text="Anchor: —",
-                                   font=("Courier", 10), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_anchor.pack(pady=2)
+                                   font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
+        self.lbl_anchor.pack(pady=1)
 
         self.lbl_node = tk.Label(pnl_stat, text="Nearest Node: —",
-                                 font=("Courier", 10), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_node.pack(pady=2)
+                                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
+        self.lbl_node.pack(pady=1)
 
-        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=8)
+        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=6)
 
         # Calibration countdown
         self.lbl_calib = tk.Label(pnl_stat, text="CALIBRATING\n6.0 s",
@@ -868,6 +975,9 @@ class DashboardApp:
         waypoints = t.get("waypoints", [])
         yolo_frame = t.get("yolo_frame")
         bev_frame  = t.get("bev_frame")
+        imu_yaw_deg = t.get("imu_yaw_deg", 0.0)
+        imu_calib   = t.get("imu_calib", (0, 0, 0, 0))
+        velocity_ms = t.get("velocity_ms", 0.0)
 
         # ── Status labels ──────────────────────────────────────────────────────
         short = trf_st.replace("SYS_", "")
@@ -875,7 +985,7 @@ class DashboardApp:
                  self.RED_C   if "STOP" in short else self.AMBER
         self.lbl_traffic.config(text=short, fg=colour)
         self.lbl_reason.config(text=reason[:40])
-        self.lbl_speed.config(text=f"Speed: {speed:.1f} %")
+        self.lbl_speed.config(text=f"PWM: {speed:.1f} %   {velocity_ms:.3f} m/s")
         self.lbl_steer.config(text=f"Steer: {steer:+.1f}°")
         yaw_deg = math.degrees(yaw) if abs(yaw) < 10 else yaw
         self.lbl_pose.config(text=f"Pose: x={x:.2f}  y={y:.2f}  ψ={yaw_deg:.1f}°")
@@ -888,6 +998,9 @@ class DashboardApp:
         self.lbl_light.config(text=f"LIGHT: {light_st}", fg=lc)
         lbl_str = "  ".join(act_lbl[:6]) if act_lbl else "—"
         self.lbl_labels.config(text=f"Detections: {lbl_str}")
+
+        # ── IMU instruments (compass + speedometer + calib LEDs) ─────────────
+        self._update_imu_instruments(imu_yaw_deg, velocity_ms, imu_calib)
 
         # Calibration overlay
         if calib_remain > 0:
@@ -972,6 +1085,47 @@ class DashboardApp:
 
         self._bev_img = self._cv2tk(bev_frame, 460, 240)
         self.lbl_bev.config(image=self._bev_img)
+
+    def _update_imu_instruments(self, yaw_deg, velocity_ms, imu_calib):
+        """Redraw compass needle and speedometer needle from latest IMU data."""
+
+        # ── Compass ──────────────────────────────────────────────────────────
+        # BNO055 yaw: 0=East on BFMC map convention (same as math angle).
+        # We draw the needle pointing in the heading direction.
+        # In our compass axes: East=0°(right), North=90°(up) → standard math.
+        r = math.radians(yaw_deg)
+        nx, ny =  math.cos(r) * 0.82,  math.sin(r) * 0.82    # needle tip
+        tx, ty = -math.cos(r) * 0.38, -math.sin(r) * 0.38    # tail
+        self._compass_needle.set_data([0, nx], [0, ny])
+        self._compass_tail.set_data([0, tx],   [0, ty])
+        self._compass_txt.set_text(f"{yaw_deg % 360:.1f}°")
+
+        # ── Speedometer ──────────────────────────────────────────────────────
+        frac = min(max(velocity_ms / self._speed_max, 0.0), 1.0)
+        theta_deg = self._arc_start - frac * (self._arc_start - self._arc_end)
+        theta_rad = math.radians(theta_deg)
+        self._speed_needle.set_data([0, 0.88 * math.cos(theta_rad)],
+                                    [0, 0.88 * math.sin(theta_rad)])
+        self._speed_txt.set_text(f"{velocity_ms:.3f} m/s")
+
+        # Needle colour: green→amber→red with speed
+        if frac < 0.5:
+            needle_col = self.GREEN_C
+        elif frac < 0.8:
+            needle_col = self.AMBER
+        else:
+            needle_col = self.RED_C
+        self._speed_needle.set_color(needle_col)
+        self._speed_txt.set_color(needle_col)
+
+        # ── Calibration LEDs ─────────────────────────────────────────────────
+        # calib tuple = (sys, gyro, accel, mag), each 0-3
+        _LED_COLS = ["#5A1010", "#AA5500", "#AAAA00", "#00CC44"]  # 0→3
+        for i, val in enumerate(imu_calib[:4]):
+            val = max(0, min(3, int(val)))
+            self._calib_leds[i].config(fg=_LED_COLS[val])
+
+        self._imu_canvas.draw_idle()
 
     def _cv2tk(self, cv_img, w: int, h: int):
         """Convert a cv2 BGR/BGRA frame to a Tkinter PhotoImage safely."""
@@ -1285,6 +1439,7 @@ class Orchestrator:
                     
                 # 4. IMU heading
                 imu_yaw_deg, imu_calib = self.hw.get_fused_imu_yaw()
+                self.hw._last_imu_calib = imu_calib          # cache for telem
                 # IMU is available only when the real BNO055 driver loaded AND
                 # we are not in sim mode (sim uses kinematic model internally)
                 imu_available = (not self.hw.sim_mode) and (self.hw.imu is not None)
@@ -1441,6 +1596,10 @@ class Orchestrator:
                 "waypoints": waypoints,
                 "yolo_frame": yolo_frame,
                 "bev_frame":  bev_frame,
+                # ── IMU instrument data ──────────────────────────────────────
+                "imu_yaw_deg":  imu_yaw_deg,              # degrees, map-frame
+                "imu_calib":    getattr(self.hw, '_last_imu_calib', (0, 0, 0, 0)),
+                "velocity_ms":  velocity_ms,              # m/s from encoder/sim
             }
 
             if pose is not None:
