@@ -626,42 +626,104 @@ class DashboardApp:
         tk.Label(pnl_stat, text="IMU INSTRUMENTS", font=("Courier", 9),
                  fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(2, 0))
 
-        self._imu_fig, (self._ax_compass, self._ax_speed) = plt.subplots(
-            1, 2, figsize=(2.9, 1.55), facecolor=self.PANEL_BG)
+        self._imu_fig, (self._ax_car, self._ax_speed) = plt.subplots(
+            1, 2, figsize=(2.9, 1.75), facecolor=self.PANEL_BG)
         self._imu_fig.subplots_adjust(left=0.02, right=0.98,
-                                      top=0.92, bottom=0.08, wspace=0.12)
+                                      top=0.90, bottom=0.06, wspace=0.10)
 
-        # ── Compass rose ─────────────────────────────────────────────────────
-        ax = self._ax_compass
-        ax.set_facecolor("#0E0E14")
-        ax.set_xlim(-1.25, 1.25);  ax.set_ylim(-1.25, 1.25)
-        ax.set_aspect("equal");    ax.axis("off")
-        ax.add_patch(plt.Circle((0, 0), 1.0, color="#1A1A28", zorder=1))
-        ax.add_patch(plt.Circle((0, 0), 1.0, color="#4A4A5A",
-                                fill=False, lw=1.5, zorder=2))
-        _CARDS = {"N": (90, "#FF4040"), "E": (0, "#909098"),
-                  "S": (270, "#909098"), "W": (180, "#909098")}
-        for label, (deg, col) in _CARDS.items():
+        # ── Top-down 2D car model ─────────────────────────────────────────────
+        # The car is always drawn centred at (0,0).
+        # The WHOLE model rotates with IMU yaw → front wheels also steer.
+        # "North" (map-up) is the +Y axis of this axes.
+        ax = self._ax_car
+        ax.set_facecolor("#080810")
+        ax.set_xlim(-1.1, 1.1);  ax.set_ylim(-1.2, 1.2)
+        ax.set_aspect("equal");  ax.axis("off")
+
+        # Compass ring + cardinal letters (static, world frame)
+        ax.add_patch(plt.Circle((0, 0), 1.05, color="#1A1A28",
+                                fill=True, zorder=1))
+        ax.add_patch(plt.Circle((0, 0), 1.05, color="#3A3A4A",
+                                fill=False, lw=1.0, zorder=2))
+        _CARDS = [("N", 90, "#FF4040"), ("E", 0, "#606068"),
+                  ("S", 270, "#606068"), ("W", 180, "#606068")]
+        for lbl, deg, col in _CARDS:
             r = math.radians(deg)
-            ax.plot([0.80*math.cos(r), 0.98*math.cos(r)],
-                    [0.80*math.sin(r), 0.98*math.sin(r)], color=col, lw=1.5, zorder=3)
-            ax.text(0.60*math.cos(r), 0.60*math.sin(r), label,
+            ax.text(0.88*math.cos(r), 0.88*math.sin(r), lbl,
                     color=col, ha="center", va="center",
-                    fontsize=6, fontweight="bold", zorder=4)
-        for deg in range(0, 360, 45):
+                    fontsize=6, fontweight="bold", zorder=3)
+
+        # Heading arc ticks every 30°
+        for deg in range(0, 360, 30):
             r = math.radians(deg)
-            ax.plot([0.88*math.cos(r), 0.98*math.cos(r)],
-                    [0.88*math.sin(r), 0.98*math.sin(r)],
-                    color="#404050", lw=0.8, zorder=3)
-        self._compass_needle, = ax.plot([0, 0], [0, 0.82], color=self.CYAN,
-                                        lw=2.5, solid_capstyle="round", zorder=5)
-        self._compass_tail,   = ax.plot([0, 0], [0, -0.38], color="#FF5050",
-                                        lw=2.0, solid_capstyle="round", zorder=5)
-        ax.add_patch(plt.Circle((0, 0), 0.07, color=self.CYAN, zorder=6))
-        self._compass_txt = ax.text(0, -1.18, "0.0°", color=self.CYAN,
+            is_card = (deg % 90 == 0)
+            ax.plot([0.93*math.cos(r), 1.02*math.cos(r)],
+                    [0.93*math.sin(r), 1.02*math.sin(r)],
+                    color="#303040" if not is_card else "#504050",
+                    lw=1.0 if is_card else 0.5, zorder=2)
+
+        # Ground shadow under car (static circle, for depth)
+        ax.add_patch(plt.Circle((0, 0), 0.38, color="#111118",
+                                fill=True, zorder=3))
+
+        # ── Pre-create all car body patches ───────────────────────────────────
+        # All patches live in data coords; we update set_xy() every frame.
+        # Car geometry (local frame, +Y = forward = car nose):
+        #   body:       rect  W=0.52  L=0.76  (display units, ~0.23m scale)
+        #   windshield: rect  top third of body, cyan tint
+        #   bonnet line: separator stripe
+        #   4 wheels:   small rects at corners; front pair rotate with steer
+        _car_col     = "#1E3A5A"     # body blue
+        _wind_col    = "#0A5A60"     # windshield teal
+        _stripe_col  = "#0A2030"     # bonnet divider
+        _whl_col     = "#CCCCCC"     # wheel light grey
+        _whl_rim_col = "#888888"     # wheel rim
+
+        dummy4 = np.zeros((4, 2))
+
+        # Body
+        self._cp_body  = mpatches.Polygon(dummy4, closed=True,
+                                          fc=_car_col, ec="#4A8AAA", lw=1.0, zorder=5)
+        ax.add_patch(self._cp_body)
+        # Windshield
+        self._cp_wind  = mpatches.Polygon(dummy4, closed=True,
+                                          fc=_wind_col, ec="#0AFFFF", lw=0.5, zorder=6)
+        ax.add_patch(self._cp_wind)
+        # Bonnet stripe
+        self._cp_hood  = mpatches.Polygon(np.zeros((4,2)), closed=True,
+                                          fc=_stripe_col, ec="none", zorder=6)
+        ax.add_patch(self._cp_hood)
+        # 4 wheels (FL, FR, RL, RR)
+        self._cp_wheels = []
+        for _ in range(4):
+            p = mpatches.Polygon(dummy4, closed=True,
+                                 fc=_whl_col, ec="#404040", lw=0.4, zorder=7)
+            ax.add_patch(p)
+            self._cp_wheels.append(p)
+        # Wheel rim dots (one per wheel for detail) — drawn as small circles via scatter
+        self._wheel_rim_sc = ax.scatter([], [], s=6, c=_whl_rim_col,
+                                        zorder=8, edgecolors="none")
+
+        # Forward velocity arrow (shows how fast / which direction)
+        self._car_vel_arrow, = ax.plot([], [], color=self.CYAN,
+                                       lw=1.5, solid_capstyle="round",
+                                       zorder=8, alpha=0.85)
+        # Heading text
+        self._car_hdg_txt = ax.text(0, -1.10, "HDG  0.0°", color=self.CYAN,
                                     ha="center", va="center",
-                                    fontsize=7, fontfamily="monospace", zorder=6)
-        ax.set_title("HEADING", color=self.MUTED, fontsize=6, pad=2)
+                                    fontsize=6.5, fontfamily="monospace", zorder=9)
+        ax.set_title("CAR MODEL  (IMU)", color=self.MUTED, fontsize=6, pad=2)
+
+        # Store geometry constants used in update
+        # Scale: 1 display-unit ≈ 0.115 m  → scale=3.5 gives 0.23m wb = 0.8 du
+        self._CAR_SCALE   = 3.5
+        self._CAR_BW      = 0.115   # half-body-width  m
+        self._CAR_BL      = 0.115   # half-body-length m
+        self._CAR_WHL_W   = 0.032   # wheel half-width  m
+        self._CAR_WHL_L   = 0.055   # wheel half-length m
+        self._CAR_FRONT_Y = 0.085   # front axle offset m
+        self._CAR_REAR_Y  = -0.085  # rear axle offset  m
+        self._CAR_TRACK   = 0.072   # half track width  m
 
         # ── Speedometer arc ──────────────────────────────────────────────────
         ax2 = self._ax_speed
@@ -669,29 +731,26 @@ class DashboardApp:
         ax2.set_xlim(-1.3, 1.3);  ax2.set_ylim(-0.55, 1.25)
         ax2.set_aspect("equal");   ax2.axis("off")
 
-        _SPEED_MAX = 1.0          # m/s full scale
-        _ARC_START = 225          # mpl angle at 0 m/s  (lower-left)
-        _ARC_END   = -45          # mpl angle at max    (lower-right)
+        _SPEED_MAX = 1.0
+        _ARC_START = 225
+        _ARC_END   = -45
         self._speed_max  = _SPEED_MAX
         self._arc_start  = _ARC_START
         self._arc_end    = _ARC_END
 
         from matplotlib.patches import Arc as _Arc
-        # background arc
         ax2.add_patch(_Arc((0,0), 2.0, 2.0, angle=0,
                            theta1=_ARC_END, theta2=_ARC_START,
                            color="#2A2A38", lw=10, zorder=1))
-        # coloured zones
         def _arc_seg(v0, v1, col):
             def _v2t(v):
                 return _ARC_START - min(max(v/_SPEED_MAX,0),1)*(_ARC_START-_ARC_END)
             ax2.add_patch(_Arc((0,0), 2.0, 2.0, angle=0,
                                theta1=_v2t(v1), theta2=_v2t(v0),
                                color=col, lw=9, zorder=2))
-        _arc_seg(0.0,  0.5,  "#1A6A1A")   # green
-        _arc_seg(0.5,  0.8,  "#8A5A00")   # amber
-        _arc_seg(0.8,  1.01, "#8A1A1A")   # red
-        # tick marks
+        _arc_seg(0.0,  0.5,  "#1A6A1A")
+        _arc_seg(0.5,  0.8,  "#8A5A00")
+        _arc_seg(0.8,  1.01, "#8A1A1A")
         for v_tick in [0, 0.25, 0.5, 0.75, 1.0]:
             frac = v_tick / _SPEED_MAX
             theta = math.radians(_ARC_START - frac*(_ARC_START-_ARC_END))
@@ -1011,8 +1070,8 @@ class DashboardApp:
         lbl_str = "  ".join(act_lbl[:6]) if act_lbl else "—"
         self.lbl_labels.config(text=f"Detections: {lbl_str}")
 
-        # ── IMU instruments (compass + speedometer + calib LEDs) ─────────────
-        self._update_imu_instruments(imu_yaw_deg, velocity_ms, imu_calib)
+        # ── IMU instruments (car model + speedometer + calib LEDs) ──────────
+        self._update_imu_instruments(imu_yaw_deg, velocity_ms, imu_calib, steer)
 
         # Calibration overlay
         if calib_remain > 0:
@@ -1098,44 +1157,123 @@ class DashboardApp:
         self._bev_img = self._cv2tk(bev_frame, 460, 240)
         self.lbl_bev.config(image=self._bev_img)
 
-    def _update_imu_instruments(self, yaw_deg, velocity_ms, imu_calib):
-        """Redraw compass needle and speedometer needle from latest IMU data."""
+    def _update_imu_instruments(self, yaw_deg, velocity_ms, imu_calib, steer_deg=0.0):
+        """
+        Redraws the top-down car model and speedometer each frame.
 
-        # ── Compass ──────────────────────────────────────────────────────────
-        # BNO055 yaw: 0=East on BFMC map convention (same as math angle).
-        # We draw the needle pointing in the heading direction.
-        # In our compass axes: East=0°(right), North=90°(up) → standard math.
-        r = math.radians(yaw_deg)
-        nx, ny =  math.cos(r) * 0.82,  math.sin(r) * 0.82    # needle tip
-        tx, ty = -math.cos(r) * 0.38, -math.sin(r) * 0.38    # tail
-        self._compass_needle.set_data([0, nx], [0, ny])
-        self._compass_tail.set_data([0, tx],   [0, ty])
-        self._compass_txt.set_text(f"{yaw_deg % 360:.1f}°")
+        Car geometry (local frame, before world rotation):
+          +Y  = car forward (nose)
+          +X  = car right
+          Origin = car centre
 
-        # ── Speedometer ──────────────────────────────────────────────────────
-        frac = min(max(velocity_ms / self._speed_max, 0.0), 1.0)
-        theta_deg = self._arc_start - frac * (self._arc_start - self._arc_end)
-        theta_rad = math.radians(theta_deg)
-        self._speed_needle.set_data([0, 0.88 * math.cos(theta_rad)],
-                                    [0, 0.88 * math.sin(theta_rad)])
-        self._speed_txt.set_text(f"{velocity_ms:.3f} m/s")
+        The whole car group is then rotated by imu_yaw_deg so it faces the
+        correct direction in the world frame (North = +Y in axes coords).
 
-        # Needle colour: green→amber→red with speed
-        if frac < 0.5:
-            needle_col = self.GREEN_C
-        elif frac < 0.8:
-            needle_col = self.AMBER
+        Front wheels are steered by steer_deg ON TOP of the world rotation.
+        """
+
+        # ── Helper: rotate a list of (x,y) points around origin ──────────────
+        def _rot(pts, angle_deg):
+            r = math.radians(angle_deg)
+            c, s = math.cos(r), math.sin(r)
+            return [(c*x - s*y, s*x + c*y) for x, y in pts]
+
+        # ── Helper: rect of half-width hw, half-length hl, centred at (cx,cy) ─
+        def _rect(cx, cy, hw, hl):
+            return [( cx-hw, cy-hl), (cx+hw, cy-hl),
+                    (cx+hw, cy+hl), (cx-hw, cy+hl)]
+
+        S   = self._CAR_SCALE          # display-unit per metre
+        BW  = self._CAR_BW  * S        # body half-width   du
+        BL  = self._CAR_BL  * S        # body half-length  du
+        WW  = self._CAR_WHL_W * S      # wheel half-width
+        WL  = self._CAR_WHL_L * S      # wheel half-length
+        FY  = self._CAR_FRONT_Y * S    # front axle Y
+        RY  = self._CAR_REAR_Y  * S    # rear axle Y
+        TR  = self._CAR_TRACK   * S    # half-track
+
+        # BNO055 yaw convention:  0° = East, CCW positive (standard math).
+        # Our axes: East = +X, North = +Y.
+        # Car forward in local frame = +Y.
+        # World rotation = yaw_deg (rotate local +Y to map heading).
+        world_yaw = yaw_deg   # degrees, CCW from East
+
+        # ── 1. Body ──────────────────────────────────────────────────────────
+        body_local = _rect(0, 0, BW, BL)
+        body_world = _rot(body_local, world_yaw)
+        self._cp_body.set_xy(np.array(body_world))
+
+        # ── 2. Windshield (top 35% of body, slightly inset) ──────────────────
+        wind_local = _rect(0, BL * 0.35, BW * 0.82, BL * 0.30)
+        wind_world = _rot(wind_local, world_yaw)
+        self._cp_wind.set_xy(np.array(wind_world))
+
+        # ── 3. Bonnet / hood divider stripe ──────────────────────────────────
+        hood_local = _rect(0, BL * 0.02, BW * 0.90, BL * 0.05)
+        hood_world = _rot(hood_local, world_yaw)
+        self._cp_hood.set_xy(np.array(hood_world))
+
+        # ── 4. Wheels ────────────────────────────────────────────────────────
+        # Rear wheels: rotated only by world yaw (they don't steer)
+        # Front wheels: rotated by world_yaw + steer_deg
+        wheel_configs = [
+            # (cx_local, cy_local, steer?)
+            (-TR,  FY, True),   # Front-Left
+            ( TR,  FY, True),   # Front-Right
+            (-TR,  RY, False),  # Rear-Left
+            ( TR,  RY, False),  # Rear-Right
+        ]
+        for i, (cx, cy, steers) in enumerate(wheel_configs):
+            whl_local = _rect(0, 0, WW, WL)
+            # rotate wheel in its own local frame
+            rot_angle = world_yaw + (steer_deg if steers else 0.0)
+            whl_world = _rot(whl_local, rot_angle)
+            # translate to axle position (also world-rotated)
+            axle = _rot([(cx, cy)], world_yaw)[0]
+            whl_final = [(p[0] + axle[0], p[1] + axle[1]) for p in whl_world]
+            self._cp_wheels[i].set_xy(np.array(whl_final))
+
+        # Wheel rim centre dots
+        rim_xs, rim_ys = [], []
+        for cx, cy, _ in wheel_configs:
+            ax_pt = _rot([(cx, cy)], world_yaw)[0]
+            rim_xs.append(ax_pt[0])
+            rim_ys.append(ax_pt[1])
+        self._wheel_rim_sc.set_offsets(np.c_[rim_xs, rim_ys])
+
+        # ── 5. Velocity arrow (forward from centre, length ∝ speed) ──────────
+        arrow_len = min(velocity_ms * 0.6, 0.55)   # max 0.55 du at 1 m/s
+        tip = _rot([(0, arrow_len)], world_yaw)[0]
+        self._car_vel_arrow.set_data([0, tip[0]], [0, tip[1]])
+        # colour by speed
+        if velocity_ms < 0.1:
+            arr_col = "#444455"
+        elif velocity_ms < 0.5:
+            arr_col = self.CYAN
         else:
-            needle_col = self.RED_C
-        self._speed_needle.set_color(needle_col)
-        self._speed_txt.set_color(needle_col)
+            arr_col = self.GREEN_C
+        self._car_vel_arrow.set_color(arr_col)
 
-        # ── Calibration LEDs ─────────────────────────────────────────────────
-        # calib tuple = (sys, gyro, accel, mag), each 0-3
-        _LED_COLS = ["#5A1010", "#AA5500", "#AAAA00", "#00CC44"]  # 0→3
+        # ── 6. Heading text ───────────────────────────────────────────────────
+        card = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"][
+            int(((90 - yaw_deg) % 360 + 22.5) / 45) % 8]
+        self._car_hdg_txt.set_text(f"{yaw_deg % 360:.1f}°  {card}")
+
+        # ── 7. Speedometer ────────────────────────────────────────────────────
+        frac = min(max(velocity_ms / self._speed_max, 0.0), 1.0)
+        theta_rad = math.radians(
+            self._arc_start - frac * (self._arc_start - self._arc_end))
+        self._speed_needle.set_data([0, 0.88*math.cos(theta_rad)],
+                                    [0, 0.88*math.sin(theta_rad)])
+        self._speed_txt.set_text(f"{velocity_ms:.3f} m/s")
+        s_col = self.GREEN_C if frac < 0.5 else (self.AMBER if frac < 0.8 else self.RED_C)
+        self._speed_needle.set_color(s_col)
+        self._speed_txt.set_color(s_col)
+
+        # ── 8. Calibration LEDs ───────────────────────────────────────────────
+        _LED_COLS = ["#5A1010", "#AA5500", "#AAAA00", "#00CC44"]
         for i, val in enumerate(imu_calib[:4]):
-            val = max(0, min(3, int(val)))
-            self._calib_leds[i].config(fg=_LED_COLS[val])
+            self._calib_leds[i].config(fg=_LED_COLS[max(0, min(3, int(val)))])
 
         self._imu_canvas.draw_idle()
 
