@@ -100,6 +100,7 @@ class HardwareIO:
                 self.camera = None
 
     # ── Input Data Access ─────────────────────────────────────────────────────
+    def read_camera(self):
         """Returns a 640x480 BGR image"""
         if self.video_cap and _CV2_AVAILABLE:
             ret, frame = self.video_cap.read()
