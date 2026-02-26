@@ -157,19 +157,30 @@ def draw_rich_map(ax, planner, signs_dict=None, svg_path: str = None):
             gy0, gy1 = min(ys) - pad, max(ys) + pad
 
             # Map SVG image to GraphML space.
-            # SVG has Y going DOWN (same as imshow); matplotlib will invert_yaxis later.
-            # So we use extent = [left, right, bottom, top] where bottom > top because yaxis is inverted.
-            # extent format for imshow: [xmin, xmax, ymin, ymax] — ymin is the BOTTOM of the image
-            #   but since the axis is inverted bottom becomes the larger y number.
+            #
+            # COORDINATE SYSTEM NOTES
+            # ────────────────────────
+            # • SVG Y increases DOWNWARD  (row 0 = physical north = small data-Y)
+            # • GraphML Y increases downward too; ax.invert_yaxis() makes small Y
+            #   appear at the VISUAL TOP (north up).
+            #
+            # imshow extent = [left, right, ymin, ymax] in DATA coordinates.
+            # With origin="lower":  row 0 -> ymin in data coords.
+            # After invert_yaxis(): data ymin (=gy0=min_y) -> VISUAL TOP (correct)
+            # -> SVG row 0 (physical north) lands at VISUAL TOP aligned with GraphML.
+            #
+            # OLD (buggy): origin="upper" + swapped extent [gx0,gx1,gy1,gy0]
+            # that put row 0 at data gy0=min_y -> after invert -> VISUAL BOTTOM (wrong)
             ax.imshow(
                 svg_img,
                 aspect="auto",
-                extent=[gx0, gx1, gy1, gy0],   # [left, right, bottom(=gy1), top(=gy0)]
-                origin="upper",
-                alpha=0.30,                      # 30 % transparent so GraphML roads show clearly
+                extent=[gx0, gx1, gy0, gy1],   # [left, right, data_ymin, data_ymax]
+                origin="lower",                  # row 0 -> data_ymin -> VISUAL TOP
+                alpha=0.30,
                 zorder=0,
                 interpolation="bilinear",
             )
+
 
     parking_nodes = {k: p for k, p in pos.items() if p[1] > 9.0}
     if parking_nodes:
