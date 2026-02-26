@@ -1064,6 +1064,26 @@ class DashboardApp:
                                    wraplength=440, justify=tk.LEFT)
         self.lbl_labels.pack(pady=1, padx=8)
 
+        # ── Camera View + BEV Lane View ───────────────────────────────────────
+        frm_feeds = tk.Frame(pnl_cam, bg=self.PANEL_BG)
+        frm_feeds.pack(fill=tk.X, padx=6, pady=(4, 2))
+
+        frm_cam = tk.Frame(frm_feeds, bg="#0A0A0E", bd=1, relief=tk.FLAT)
+        frm_cam.pack(side=tk.LEFT, padx=3)
+        tk.Label(frm_cam, text="CAMERA", font=("Courier", 7, "bold"),
+                 fg=self.CYAN, bg="#0A0A0E").pack()
+        self.lbl_camera = tk.Label(frm_cam, bg="#0A0A0E", bd=0)
+        self.lbl_camera.pack()
+        self._photo_camera = None   # keep reference to prevent GC
+
+        frm_bev = tk.Frame(frm_feeds, bg="#0A0A0E", bd=1, relief=tk.FLAT)
+        frm_bev.pack(side=tk.LEFT, padx=3)
+        tk.Label(frm_bev, text="BEV LANE", font=("Courier", 7, "bold"),
+                 fg=self.AMBER, bg="#0A0A0E").pack()
+        self.lbl_bev = tk.Label(frm_bev, bg="#0A0A0E", bd=0)
+        self.lbl_bev.pack()
+        self._photo_bev = None      # keep reference to prevent GC
+
         # Store face indices and car geometry for the update method
         self._car3d_faces_idx = _car_faces_idx
         self._GRID_R = GRID_R
@@ -1221,7 +1241,20 @@ class DashboardApp:
             wp_str = "  ".join([f"({w[0]:.1f},{w[1]:.1f})" for w in waypoints[:4]])
             self.lbl_wp.config(text=f"→ {wp_str}")
 
-        # ── Steering history graph ──────────────────────────────────────────────
+        # ── Camera + BEV image feeds ────────────────────────────────────────────
+        cam_frame = t.get("camera_frame")
+        bev_frame2 = t.get("bev_frame")
+
+        # Camera feed: show YOLO overlay if available, else raw frame (320x240)
+        cam_src = yolo_frame if (yolo_frame is not None and isinstance(yolo_frame, np.ndarray)) else cam_frame
+        self._photo_camera = self._cv2tk(cam_src, 320, 240)
+        if self._photo_camera:
+            self.lbl_camera.config(image=self._photo_camera)
+
+        # BEV lane debug (colourised sliding-window / poly-track image)
+        self._photo_bev = self._cv2tk(bev_frame2, 320, 240)
+        if self._photo_bev:
+            self.lbl_bev.config(image=self._photo_bev)
         self._steer_hist.append(steer)
         if len(self._steer_hist) > 120:
             self._steer_hist.pop(0)
@@ -1982,6 +2015,7 @@ class Orchestrator:
                 "waypoints": waypoints,
                 "yolo_frame": yolo_frame,
                 "bev_frame":  bev_frame,
+                "camera_frame": frame,
                 # ── IMU instrument data ──────────────────────────────────────
                 "imu_yaw_deg":  imu_yaw_deg,              # degrees, map-frame
                 "imu_calib":    getattr(self.hw, '_last_imu_calib', (0, 0, 0, 0)),
