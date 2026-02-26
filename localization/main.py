@@ -1802,7 +1802,7 @@ class Orchestrator:
 
                 # 1. Capture raw frame
                 try:
-                    frame = self.hw.capture_frame()
+                    frame = self.hw.read_camera()
                     if frame is None: raise ValueError("Empty frame")
                 except Exception as e:
                     log.error(f"Camera failure: {e}")
