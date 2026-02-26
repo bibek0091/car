@@ -1793,6 +1793,27 @@ class Orchestrator:
                 vision_ok = True
                 yolo_ok = True
 
+                # Edge-info defaults (used in step 2 and step 9; updated in step 4b)
+                _line_type     = "UNKNOWN"
+                _in_roundabout = False
+                _bus_lane      = False
+                _map_zone      = "CITY"
+                _zone_mode     = "CITY"
+
+                # 0. Query map edge properties using last-frame pose (O(1)).
+                # Done first so line_type is available for the YOLO call (step 2).
+                with self.path_lock:
+                    _early_path = list(self.planned_path)
+                _lx = self.localizer.x
+                _ly = self.localizer.y
+                edge_info = self.planner.get_current_edge_info(
+                    _lx, _ly, _early_path, cursor=self._path_cursor
+                )
+                _line_type     = "DASHED" if edge_info["dotted"] else "CONTINUOUS"
+                _in_roundabout = edge_info["in_roundabout"]
+                _bus_lane      = edge_info["bus_lane"]
+                _map_zone      = edge_info["zone"]
+
                 # 1. Capture raw frame
                 try:
                     frame = self.hw.read_camera()
@@ -1804,17 +1825,22 @@ class Orchestrator:
                     nav_state = "CAM_ERROR"
                     frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-                # 2. Traffic YOLO (async)
+                # 2. Traffic YOLO (async) — pass line_type so engine can gate overtaking
                 yolo_t0 = time.time()
                 try:
-                    t_res = self.traffic.process(frame)
+                    t_res = self.traffic.process(frame, line_type=_line_type)
                 except Exception as e:
                     log.warning(f"YOLO failure: {e}")
                     yolo_ok = False
-                    # Fallback empty traffic result
                     from traffic_module import TrafficResult
                     t_res = TrafficResult("SYS_GO", "YOLO_DEAD", 0.5)
                 yolo_ms = (time.time() - yolo_t0) * 1000.0
+
+                # Resolve zone: sign-based wins; map-based is the fallback so
+                # the car is in the correct mode even if it misses a sign.
+                _zone_mode = t_res.zone_mode
+                if _zone_mode == "CITY" and _map_zone == "HIGHWAY":
+                    _zone_mode = "HIGHWAY"   # map says highway even if sign missed
 
                 # 3. Vision / lane perception
                 vis_t0 = time.time()
@@ -1973,21 +1999,35 @@ class Orchestrator:
                 # 8c. Lookahead map curvature
                 map_curv = self.planner.get_path_curvature(pose[0], pose[1], current_path, cursor=self._path_cursor, window_m=1.0)
 
-                # 9. Control
+                # Resolve final zone: sign-based wins; map-based is fallback
+                # (car stays in correct mode even if highway sign is missed)
+                _zone_mode = t_res.zone_mode
+                if _zone_mode == "CITY" and _map_zone == "HIGHWAY":
+                    _zone_mode = "HIGHWAY"
+
+                # 9. Control — pass all new context: zone, line type, parking, roundabout
                 nav_state = "PILOTING"
                 ctrl = self.controller.compute(
                     v_res, pose, waypoints, nav_state,
-                    t_res.state, base_speed=50.0, map_curvature=map_curv,
-                    velocity_ms=velocity_ms, dt=self._dt
+                    t_res.state,
+                    base_speed    = 50.0,
+                    map_curvature = map_curv,
+                    velocity_ms   = velocity_ms,
+                    dt            = self._dt,
+                    zone_mode     = _zone_mode,
+                    line_type     = _line_type,
+                    parking_state = t_res.parking_state,
+                    steer_bias    = t_res.steer_bias,
+                    bus_lane      = _bus_lane,
+                    in_roundabout = _in_roundabout,
                 )
                 
-                # Apply level degradation speed overrides
+                # Apply degradation speed overrides
                 speed  = ctrl.speed_pwm * t_res.speed_multiplier
                 if not yolo_ok:
-                    speed *= 0.40 # Level 1 degrade
+                    speed *= 0.40
                     reason = "DEGRADED: YOLO DEAD"
                 if not vision_ok:
-                    # Level 2 degrade: crawl briefly to see if we regain it, else dead-reckon
                     speed *= 0.25
                     reason = "DEGRADED: VISION DEAD"
                     
