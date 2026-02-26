@@ -1896,7 +1896,12 @@ class Orchestrator:
 
                 else:
                     # ── Gate B: visual calibration ──────────────────────────
-                    if not hasattr(self, '_calib_started'):
+                    # Gate B: visual calibration
+                    # Use getattr(..., False) not hasattr() so that the reset
+                    # orch._calib_started = False in on_startup_confirmed() is
+                    # correctly seen as "not yet started" (hasattr would be True
+                    # because the attribute EXISTS even when its value is False).
+                    if not getattr(self, '_calib_started', False):
                         self._calib_started = True
                         self.calibrator = VisualCalibrator(
                             self.planner, self.localizer, self.vision
@@ -1910,7 +1915,8 @@ class Orchestrator:
                     try:
                         frame = self.hw.capture_frame()
                         if frame is not None and frame.any():
-                            self.calibrator.add_frame(frame)
+                            if self.calibrator is not None:
+                                self.calibrator.add_frame(frame)
                             t_warm = self.traffic.process(frame)
                             v_warm = self.vision.process(frame)
                             yolo_frame = t_warm.yolo_debug_frame if t_warm.yolo_debug_frame is not None else frame
@@ -1925,22 +1931,26 @@ class Orchestrator:
 
                     # Finalize calibration at 3 s in (3 s of frames collected)
                     if elapsed > 3.0 and not getattr(self, '_calib_applied', False):
-                        cal_result = self.calibrator.finalize()
-                        if cal_result.src_pts is not None:
-                            self.vision.update_bev_transform(cal_result.src_pts)
-                        # Apply detected heading to localizer
-                        cx, cy, _ = self.localizer.get_pose()
-                        _cal_imu_yaw, _ = self.imu.get_yaw_data()
-                        self.localizer.set_pose(
-                            cx, cy,
-                            math.radians(cal_result.initial_heading_deg),
-                            imu_yaw_rad=_cal_imu_yaw
-                        )
-                        self._calib_applied = True
-                        log.info(f"=== CALIBRATION COMPLETE: {cal_result.status_msg} ===")
-                        log.info(f"  Initial heading : {cal_result.initial_heading_deg:.1f}°")
-                        log.info(f"  BEV calibrated  : {self.vision.bev_calibrated}")
-                        log.info(f"  Confidence      : {cal_result.confidence:.0%}")
+                        if self.calibrator is None:
+                            log.warning("Calibrator is None at finalize — skipping calibration")
+                            self._calib_applied = True
+                        else:
+                            cal_result = self.calibrator.finalize()
+                            if cal_result.src_pts is not None:
+                                self.vision.update_bev_transform(cal_result.src_pts)
+                            # Apply detected heading to localizer
+                            cx, cy, _ = self.localizer.get_pose()
+                            _cal_imu_yaw, _ = self.imu.get_yaw_data()
+                            self.localizer.set_pose(
+                                cx, cy,
+                                math.radians(cal_result.initial_heading_deg),
+                                imu_yaw_rad=_cal_imu_yaw
+                            )
+                            self._calib_applied = True
+                            log.info(f"=== CALIBRATION COMPLETE: {cal_result.status_msg} ===")
+                            log.info(f"  Initial heading : {cal_result.initial_heading_deg:.1f}°")
+                            log.info(f"  BEV calibrated  : {self.vision.bev_calibrated}")
+                            log.info(f"  Confidence      : {cal_result.confidence:.0%}")
 
                     cal_msg = self.calibrator._result.status_msg if self.calibrator else "collecting..."
                     reason  = f"CAL {calib_remain:.1f}s remaining  |  {cal_msg}"
