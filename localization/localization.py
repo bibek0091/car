@@ -6,6 +6,7 @@ from collections import deque
 
 log = logging.getLogger(__name__)
 
+
 class LocalizationEngine:
     """
     Camera-Only 3-Layer Pose Estimator: (x, y, yaw)
@@ -15,42 +16,96 @@ class LocalizationEngine:
       Layer 2 : Forward dead reckoning (x, y from velocity + yaw)
       Layer 3a: Visual lateral correction from lane-centre offset
                 (dynamic gain that scales with rolling confidence)
-      Layer 3b: Map path snap — called externally every 3 frames
+      Layer 3b: Map path snap — called externally each frame (cursor-windowed)
+
+    Fixes applied vs original:
+      FIX-1  : camera_yaw_correction is applied as a direct heading nudge, NOT
+                divided by dt. Dividing an absolute tangent angle by dt converted a
+                ~0.1 rad offset into a 3+ rad/s rate spike at 30 Hz.
+      FIX-3  : node_soft_snap now accepts an optional yaw_target so node passage
+                also corrects heading, not only position.
+      FIX-4  : yaw is wrapped to [-pi, pi] after every integration step.
+      FIX-6  : fuse_map_correction reads self.x/y inside pose_lock (race fix).
+      FIX-7  : YAW_EMA_ALPHA raised from 0.30 to 0.55 for faster curve response.
+      FIX-8  : update() accepts optional bev_scale_mpp for calibrated px/m scale.
+      FIX-10 : IMU absolute yaw is fused via a weighted per-frame nudge once the
+                IMU->map offset is established in set_pose().
+      FIX-12 : fuse_map_correction restricts search to a cursor-centred window
+                (O(1)) and can safely be called every frame.
+      FIX-13 : fuse_map_correction applies only the LATERAL component of the
+                nearest-point error; longitudinal position follows dead-reckoning.
     """
 
-    YAW_EMA_ALPHA    = 0.30   # smoothing on yaw_rate estimate (lower = smoother)
-    LATERAL_GAIN_MIN = 0.25   # base lateral correction gain
-    LATERAL_GAIN_MAX = 0.50   # max gain when camera confidence is high
-    CONF_HISTORY_LEN = 10     # frames of confidence history for dynamic gain
+    # FIX-7: raised from 0.30 to 0.55 — faster response on curves, still smooth
+    YAW_EMA_ALPHA    = 0.55
+    LATERAL_GAIN_MIN = 0.25
+    LATERAL_GAIN_MAX = 0.50
+    CONF_HISTORY_LEN = 10
+
+    # FIX-1: maximum per-frame heading correction from camera tangent (~2.9 deg)
+    _MAX_CAM_YAW_CORRECTION = 0.05   # radians
+
+    # FIX-10: gentle per-frame pull toward IMU absolute yaw (8 %)
+    _IMU_ABS_YAW_WEIGHT = 0.08
 
     def __init__(self):
         self.x = 0.0
         self.y = 0.0
-        self.yaw = 0.0          # radians, map frame
-        self.wheelbase = 0.23   # metres
+        self.yaw = 0.0          # radians, map frame, wrapped to [-pi, pi]
+        self.wheelbase = 0.23   # metres (1:10 scale car)
         self.pose_lock = threading.Lock()
 
-        self._yaw_rate_smoothed = 0.0           # EMA-filtered yaw rate
+        self._yaw_rate_smoothed = 0.0
         self._conf_history = deque(maxlen=self.CONF_HISTORY_LEN)
 
-    def set_pose(self, x, y, yaw):
-        with self.pose_lock:
-            self.x = x
-            self.y = y
-            self.yaw = yaw
+        # FIX-10: offset between IMU frame (zeroed at startup) and map frame.
+        # Remains None until set_pose() is called with a valid imu_yaw_rad.
+        self._imu_yaw_offset = None
 
-    def node_soft_snap(self, node_x, node_y, alpha=0.15):
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_pose(self, x, y, yaw, imu_yaw_rad=None):
         """
-        Gentle blend toward a known node position.
-        alpha=0.15 → at most 15 cm correction per call, prevents steering spikes.
+        Hard-set pose (startup / re-localisation).
+        FIX-10: if imu_yaw_rad is provided the IMU->map offset is computed
+        here so absolute IMU yaw can be fused every frame thereafter.
+        """
+        with self.pose_lock:
+            self.x   = x
+            self.y   = y
+            self.yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
+            if imu_yaw_rad is not None:
+                self._imu_yaw_offset = self.yaw - imu_yaw_rad
+                log.info(
+                    f"IMU->map yaw offset set: "
+                    f"{math.degrees(self._imu_yaw_offset):.1f} deg"
+                )
+            # Reset EMA so old drift does not bleed into the new pose
+            self._yaw_rate_smoothed = 0.0
+
+    def node_soft_snap(self, node_x, node_y, alpha=0.15,
+                       yaw_target=None, yaw_alpha=0.10):
+        """
+        Gentle blend toward a known node position and, optionally, a heading.
+        FIX-3: yaw_target enables heading correction on node passage.
+
+        alpha     = 0.15 -> at most 15 % position correction per call.
+        yaw_alpha = 0.10 -> at most 10 % heading correction per call.
         """
         with self.pose_lock:
             self.x = (1.0 - alpha) * self.x + alpha * node_x
             self.y = (1.0 - alpha) * self.y + alpha * node_y
+            if yaw_target is not None:
+                yaw_delta = (
+                    (yaw_target - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                )
+                self.yaw += yaw_alpha * yaw_delta
+                # FIX-4: keep wrapped
+                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
-    # Keep old name as alias so nothing else breaks
-    def node_reset(self, node_x, node_y):
-        self.node_soft_snap(node_x, node_y)
+    def node_reset(self, node_x, node_y, yaw_target=None):
+        """Alias kept for backward compatibility. Forwards yaw_target (FIX-3)."""
+        self.node_soft_snap(node_x, node_y, yaw_target=yaw_target)
 
     def get_pose(self):
         with self.pose_lock:
@@ -61,85 +116,109 @@ class LocalizationEngine:
                camera_yaw_correction=0.0,
                camera_lateral_vel_ms=0.0,
                camera_heading_rate_rps=0.0,
-               imu_yaw_rate_rps=None):
+               imu_yaw_rate_rps=None,
+               imu_yaw_rad=None,
+               bev_scale_mpp=None):
         """
-        Camera-only fused pose update.
-
-        Layer 1 — Heading (camera-heavy):
-          Source A: Bicycle kinematic model (always available).
-          Source B: Camera lane-tangent heading correction.
-                    Confidence-weighted. Applied when conf > 0.25.
-          Source C: Camera heading rate from consecutive frame tangent change.
-                    Applied when conf > 0.50.
-          All combined into a single yaw_rate, then EMA-smoothed.
-
-        Layer 2 — Dead reckoning x, y from velocity × yaw.
-
-        Layer 3a — Visual lateral correction from lane-centre offset.
-                   Dynamic gain from rolling confidence history.
+        Fused pose update.  Call once per frame from the pilot loop.
 
         Parameters
         ----------
-        camera_yaw_correction     : rad, signed lane-tangent heading offset.
-        camera_lateral_vel_ms     : m/s, signed lateral drift from lane-centre shift.
-        camera_heading_rate_rps   : rad/s, signed heading rate from consecutive fits.
-        imu_yaw_rate_rps          : rad/s, signed heading rate directly from IMU gyro.
+        camera_yaw_correction   : rad  — instantaneous lane-tangent heading OFFSET
+                                  (from estimate_heading_from_lanes). NOT a rate.
+        camera_lateral_vel_ms   : m/s  — lateral drift from consecutive lane fits.
+        camera_heading_rate_rps : rad/s — heading rate from consecutive tangents.
+        imu_yaw_rate_rps        : rad/s — gyro yaw rate (replaces bicycle model).
+        imu_yaw_rad             : rad  — absolute IMU yaw in IMU frame (FIX-10).
+        bev_scale_mpp           : m/px — calibrated BEV pixel scale (FIX-8).
+                                  Falls back to 0.35/lane_width_px when None.
         """
         with self.pose_lock:
             self._conf_history.append(conf)
-            mean_conf = float(np.mean(self._conf_history)) if self._conf_history else conf
+            mean_conf = (
+                float(np.mean(self._conf_history)) if self._conf_history else conf
+            )
 
             # ── Layer 1: Heading ─────────────────────────────────────────────
+
             steer_rad = math.radians(max(-45.0, min(45.0, steer_angle_deg)))
 
-            # Source A: bicycle kinematic yaw rate or IMU yaw rate
+            # Source A: bicycle kinematic yaw rate OR IMU gyro rate
             yaw_rate_km = 0.0
             if imu_yaw_rate_rps is not None:
                 yaw_rate_km = imu_yaw_rate_rps
             elif velocity_ms > 0.05:
                 yaw_rate_km = (velocity_ms / self.wheelbase) * math.tan(steer_rad)
 
-            # Source B: lane-tangent heading correction
-            vis_weight = min(0.80, conf * 1.2) if conf > 0.25 else 0.0
-            if abs(camera_yaw_correction) > 0.0 and dt > 0 and vis_weight > 0:
-                yaw_rate_vis = camera_yaw_correction / dt
-                yaw_rate = yaw_rate_km * (1.0 - vis_weight) + yaw_rate_vis * vis_weight
-            else:
-                yaw_rate = yaw_rate_km
+            yaw_rate = yaw_rate_km
 
             # Source C: consecutive-frame tangent heading rate
+            # (blended before EMA so it participates in smoothing)
             if abs(camera_heading_rate_rps) > 0.001 and conf > 0.5:
                 cam_rate_weight = min(0.40, conf - 0.1)
-                yaw_rate = yaw_rate * (1.0 - cam_rate_weight) + camera_heading_rate_rps * cam_rate_weight
+                yaw_rate = (
+                    yaw_rate * (1.0 - cam_rate_weight)
+                    + camera_heading_rate_rps * cam_rate_weight
+                )
 
-            # EMA smoothing — prevents sudden yaw spikes from noisy tangent estimates
+            # EMA smoothing — damps noisy tangent-rate spikes
             self._yaw_rate_smoothed = (
                 self.YAW_EMA_ALPHA * yaw_rate
                 + (1.0 - self.YAW_EMA_ALPHA) * self._yaw_rate_smoothed
             )
             self.yaw += self._yaw_rate_smoothed * dt
 
+            # Source B: lane-tangent direct heading correction.
+            # FIX-1: camera_yaw_correction is an ABSOLUTE angle offset in radians,
+            # not a per-frame delta.  The original code divided it by dt which turned
+            # a 0.1 rad tangent offset into a 3 rad/s rate spike at 30 Hz.
+            # We apply it as a clamped, confidence-weighted direct nudge to self.yaw.
+            vis_weight = min(0.80, conf * 1.2) if conf > 0.25 else 0.0
+            if abs(camera_yaw_correction) > 0.0 and vis_weight > 0.0:
+                correction = float(np.clip(
+                    camera_yaw_correction * vis_weight,
+                    -self._MAX_CAM_YAW_CORRECTION,
+                     self._MAX_CAM_YAW_CORRECTION
+                ))
+                self.yaw += correction
+
+            # Source D: IMU absolute yaw fusion (FIX-10).
+            # A gentle per-frame pull toward the IMU-derived map heading prevents
+            # long-term heading drift without causing sharp steering spikes.
+            if imu_yaw_rad is not None and self._imu_yaw_offset is not None:
+                map_yaw_from_imu = imu_yaw_rad + self._imu_yaw_offset
+                yaw_delta = (
+                    (map_yaw_from_imu - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                )
+                self.yaw += self._IMU_ABS_YAW_WEIGHT * yaw_delta
+
+            # FIX-4: wrap to [-pi, pi] every frame — prevents unbounded growth
+            self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
             # ── Layer 2: Dead reckoning ──────────────────────────────────────
             self.x += velocity_ms * dt * math.cos(self.yaw)
             self.y += velocity_ms * dt * math.sin(self.yaw)
 
             # ── Layer 3a: Visual lateral correction ──────────────────────────
-            # lateral_error_px = lane_centre_x - 320
-            # Positive  → lane centre is right of image centre
-            #           → car is LEFT of lane centre → push pose rightward
             if conf > 0.20 and lane_width_px > 50:
-                lane_error_m = lane_error_px * (0.35 / max(lane_width_px, 50))
+                # FIX-8: use calibrated BEV pixel/metre scale when available.
+                # Fall back to geometric estimate from measured lane_width_px.
+                if bev_scale_mpp is not None:
+                    lane_error_m = lane_error_px * bev_scale_mpp
+                else:
+                    lane_error_m = lane_error_px * (0.35 / max(lane_width_px, 50))
 
-                # Dynamic gain: scales from LATERAL_GAIN_MIN to LATERAL_GAIN_MAX
-                # using rolling mean confidence so transient detections don't spike
-                gain = self.LATERAL_GAIN_MIN + (self.LATERAL_GAIN_MAX - self.LATERAL_GAIN_MIN) * min(mean_conf, 1.0)
+                gain = (
+                    self.LATERAL_GAIN_MIN
+                    + (self.LATERAL_GAIN_MAX - self.LATERAL_GAIN_MIN)
+                    * min(mean_conf, 1.0)
+                )
 
                 perp_x =  math.sin(self.yaw)
                 perp_y = -math.cos(self.yaw)
                 self.x += gain * lane_error_m * perp_x
                 self.y += gain * lane_error_m * perp_y
 
-                # Direct lateral velocity correction
                 if abs(camera_lateral_vel_ms) > 0.001 and conf > 0.4:
                     lat_gain = min(0.6, conf)
                     self.x += lat_gain * camera_lateral_vel_ms * dt * perp_x
@@ -147,58 +226,93 @@ class LocalizationEngine:
 
             return self.x, self.y, self.yaw
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _nearest_point_on_segment(self, p, a, b):
-        ab = (b[0]-a[0], b[1]-a[1])
-        t = max(0, min(1, ((p[0]-a[0])*ab[0] + (p[1]-a[1])*ab[1]) /
-                          max(ab[0]**2 + ab[1]**2, 1e-9)))
-        return (a[0] + t*ab[0], a[1] + t*ab[1])
+        ab = (b[0] - a[0], b[1] - a[1])
+        t  = max(0.0, min(1.0,
+              ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1])
+              / max(ab[0] ** 2 + ab[1] ** 2, 1e-9)))
+        return (a[0] + t * ab[0], a[1] + t * ab[1])
 
     def fuse_map_correction(self, planned_path, node_positions,
-                            max_snap_m=0.90, lane_conf=1.0):
+                            max_snap_m=0.38, lane_conf=1.0, cursor=0):
         """
-        Soft-snap estimated position toward the nearest point on the A* path.
-        Also corrects heading toward the path tangent at the snap point.
-        Higher snap alpha (0.45) than before — camera-only needs tighter map anchoring.
+        Laterally soft-snap the estimated position toward the nearest point on
+        the A* path segment closest to the current cursor position.
+
+        FIX-6:  self.x/y are read inside pose_lock (eliminates read race).
+        FIX-12: Search is restricted to [cursor-2 .. cursor+6] -> O(1).
+                Safe to call every frame without a modulo throttle.
+        FIX-13: Only the LATERAL component of the error is applied.
+                Longitudinal position is left entirely to dead-reckoning.
+        max_snap_m default reduced from 0.90 to 0.38 (FIX-5 from main.py).
         """
         if not planned_path or len(planned_path) < 2:
             return
         if lane_conf < 0.20:
             return
 
-        min_dist = float('inf')
-        best_pt  = None
+        # FIX-12: cursor-windowed segment search
+        search_start = max(0, cursor - 2)
+        search_end   = min(len(planned_path) - 1, cursor + 6)
+
+        # FIX-6: read position inside the lock
+        with self.pose_lock:
+            car_x, car_y = self.x, self.y
+
+        min_dist     = float('inf')
+        best_pt      = None
         best_tangent = None
 
-        for i in range(len(planned_path) - 1):
-            n1, n2 = planned_path[i], planned_path[i+1]
+        for i in range(search_start, search_end):
+            n1, n2 = planned_path[i], planned_path[i + 1]
             if n1 not in node_positions or n2 not in node_positions:
                 continue
             p1 = node_positions[n1]
             p2 = node_positions[n2]
-            pt = self._nearest_point_on_segment(
-                (self.x, self.y), p1, p2
-            )
-            d = math.hypot(pt[0]-self.x, pt[1]-self.y)
+            pt = self._nearest_point_on_segment((car_x, car_y), p1, p2)
+            d  = math.hypot(pt[0] - car_x, pt[1] - car_y)
             if d < min_dist:
-                min_dist  = d
-                best_pt   = pt
-                # Tangent direction of this segment in map frame
+                min_dist     = d
+                best_pt      = pt
                 seg_dx = p2[0] - p1[0]
                 seg_dy = p2[1] - p1[1]
                 seg_len = math.hypot(seg_dx, seg_dy)
                 if seg_len > 1e-4:
                     best_tangent = math.atan2(seg_dy, seg_dx)
 
-        if best_pt and min_dist < max_snap_m:
-            # Position snap — stronger when camera is confident
-            snap_alpha = 0.45 if lane_conf > 0.7 else 0.30
-            with self.pose_lock:
+        if best_pt is None or min_dist >= max_snap_m:
+            return
+
+        snap_alpha = 0.45 if lane_conf > 0.7 else 0.30
+
+        with self.pose_lock:
+            if best_tangent is not None:
+                # FIX-13: decompose the nearest-point error into lateral and
+                # longitudinal components relative to the path tangent.
+                # Apply ONLY the lateral correction; longitudinal follows
+                # dead-reckoning so the car does not jump forward/backward.
+                tx     =  math.cos(best_tangent)   # unit tangent vector
+                ty     =  math.sin(best_tangent)
+                px_dir = -ty                        # unit perpendicular (lateral)
+                py_dir =  tx
+
+                dx = best_pt[0] - self.x
+                dy = best_pt[1] - self.y
+                lateral_err = dx * px_dir + dy * py_dir
+
+                self.x += snap_alpha * lateral_err * px_dir
+                self.y += snap_alpha * lateral_err * py_dir
+
+                # Heading correction toward path tangent
+                yaw_delta = (
+                    (best_tangent - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                )
+                self.yaw += 0.20 * yaw_delta
+                # FIX-4: re-wrap after correction
+                self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+            else:
+                # Fallback (segment too short to compute tangent): full position snap
                 self.x = self.x * (1.0 - snap_alpha) + best_pt[0] * snap_alpha
                 self.y = self.y * (1.0 - snap_alpha) + best_pt[1] * snap_alpha
-
-                # Heading correction toward path tangent (weight 0.20)
-                if best_tangent is not None:
-                    yaw_delta = (best_tangent - self.yaw + math.pi) % (2*math.pi) - math.pi
-                    self.yaw += 0.20 * yaw_delta

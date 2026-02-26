@@ -159,21 +159,32 @@ class HardwareIO:
         self.serial.set_speed(speed_pwm)
 
     def get_velocity_ms(self):
-        """Return encoder speed in m/s."""
+        """
+        Return IIR-filtered encoder speed in m/s.
+        FIX-11: raw encoder/sim readings are noisy and feed directly into
+        dead-reckoning x/y.  A one-pole IIR (alpha=0.20) cuts high-frequency
+        noise while adding only ~1 frame of lag at 30 Hz.
+        """
         if self.sim_mode:
             cmd = getattr(self, "_last_cmd_speed", 0.0)
-            return max(0.0, (cmd - 12.0) * self.SPEED_CALIB)
-        try:
-            if hasattr(self.serial, 'get_feedback'):
-                raw_mms = self.serial.get_feedback()[0]
-            else:
-                import contextlib
-                with getattr(self.serial, 'feedback_lock', contextlib.nullcontext()):
-                    raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
-            return raw_mms / 1000.0   # mm/s → m/s
-        except Exception as e:
-            log.warning(f"get_velocity_ms error: {e}")
-            return 0.0
+            raw = max(0.0, (cmd - 12.0) * self.SPEED_CALIB)
+        else:
+            try:
+                if hasattr(self.serial, 'get_feedback'):
+                    raw_mms = self.serial.get_feedback()[0]
+                else:
+                    import contextlib
+                    with getattr(self.serial, 'feedback_lock', contextlib.nullcontext()):
+                        raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
+                raw = max(0.0, raw_mms / 1000.0)   # mm/s -> m/s, clamp negative
+            except Exception as e:
+                log.warning(f"get_velocity_ms error: {e}")
+                raw = 0.0
+
+        # IIR low-pass: y[n] = 0.80*y[n-1] + 0.20*x[n]
+        # alpha=0.20 balances noise rejection vs. response lag
+        self._vel_filtered = 0.80 * getattr(self, '_vel_filtered', 0.0) + 0.20 * raw
+        return self._vel_filtered
 
     def get_encoder_steer_deg(self):
         """Return encoder steering angle in degrees."""

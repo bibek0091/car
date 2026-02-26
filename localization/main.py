@@ -1675,7 +1675,6 @@ class Orchestrator:
         log.info("Pilot loop started")
         frame_idx   = 0
         self._last_nearest_node = None
-        map_fuse_ctr = 0
         speed  = 0.0
         steer  = 0.0
         anchor = "INIT"
@@ -1768,10 +1767,15 @@ class Orchestrator:
                     cal_result = self.calibrator.finalize()
                     if cal_result.src_pts is not None:
                         self.vision.update_bev_transform(cal_result.src_pts)
-                    # Apply detected initial heading to localizer
+                    # Apply detected initial heading to localizer.
+                    # FIX-10: also pass current IMU yaw so the IMU->map offset
+                    # is calibrated here (IMU has been running 3+ s, stable reading).
                     cx, cy, _ = self.localizer.get_pose()
+                    _cal_imu_yaw, _ = self.imu.get_yaw_data()
                     self.localizer.set_pose(
-                        cx, cy, math.radians(cal_result.initial_heading_deg)
+                        cx, cy,
+                        math.radians(cal_result.initial_heading_deg),
+                        imu_yaw_rad=_cal_imu_yaw   # may be None if IMU not connected
                     )
                     self._calib_applied = True
                     log.info(f"Visual calibration applied: {cal_result.status_msg}")
@@ -1844,12 +1848,28 @@ class Orchestrator:
 
                 _prev_sl = getattr(self, '_prev_sl', None)
                 _prev_sr = getattr(self, '_prev_sr', None)
+
+                # FIX-9: while the lane is lost, cached polynomials are from a
+                # prior position.  Computing camera_odometry between those stale
+                # fits and the first recovered fit after loss would produce a huge
+                # spurious heading-rate spike (the fits differ by many frames of
+                # travel, but dt is still one frame).  Invalidate cache during loss.
+                _dead_frames = getattr(self, '_dead_reckon_frames', 0)
+                if v_res.anchor == "DEAD_RECKONING":
+                    self._dead_reckon_frames = _dead_frames + 1
+                else:
+                    self._dead_reckon_frames = 0
+
+                if _dead_frames > 2:
+                    _prev_sl = None
+                    _prev_sr = None
+
                 cam_lat_vel, cam_heading_rate = estimate_camera_odometry(
                     v_res.sl, v_res.sr, _prev_sl, _prev_sr, max(self._dt, 1e-4)
                 )
-                # Cache current fits for next-frame comparison
-                self._prev_sl = v_res.sl
-                self._prev_sr = v_res.sr
+                # Cache only valid (non-dead-reckoning) fits for next-frame use
+                self._prev_sl = v_res.sl if v_res.anchor != "DEAD_RECKONING" else None
+                self._prev_sr = v_res.sr if v_res.anchor != "DEAD_RECKONING" else None
 
                 # Camera heading in degrees for telemetry / CSV
                 imu_yaw_deg = math.degrees(self.localizer.yaw)  # reuse CSV column name
@@ -1858,20 +1878,24 @@ class Orchestrator:
                 with self.path_lock:
                     current_path = list(self.planned_path)
 
-                # 5. Map-matching correction (every 3 frames ≈ 10 Hz)
-                map_fuse_ctr += 1
-                if map_fuse_ctr >= 3:
-                    map_fuse_ctr = 0
-                    self.localizer.fuse_map_correction(
-                        current_path,
-                        self.planner.node_positions,
-                        max_snap_m=0.90,
-                        lane_conf=v_res.confidence
-                    )
+                # 5. Map-matching correction — called every frame.
+                # FIX-5:  max_snap_m reduced from 0.90 m to 0.38 m (one lane width).
+                #          At 90 cm the car could be in the wrong lane before snapping.
+                # FIX-12: cursor restricts the segment search to a local window so
+                #          the call is O(1) and does not need a modulo throttle.
+                self.localizer.fuse_map_correction(
+                    current_path,
+                    self.planner.node_positions,
+                    max_snap_m=0.38,
+                    lane_conf=v_res.confidence,
+                    cursor=self._path_cursor
+                )
 
-                # 6. Camera-only localizer update
-                imu_yaw_rad, imu_yaw_rate_rps = self.imu.get_yaw_data() if hasattr(self, 'imu') else (None, None)
-                
+                # 6. Localizer update — fuses kinematics, camera, and IMU
+                imu_yaw_rad, imu_yaw_rate_rps = (
+                    self.imu.get_yaw_data() if hasattr(self, 'imu') else (None, None)
+                )
+
                 pose = self.localizer.update(
                     velocity_ms              = velocity_ms,
                     steer_angle_deg          = steer,
@@ -1882,7 +1906,8 @@ class Orchestrator:
                     camera_yaw_correction    = cam_yaw_corr,
                     camera_lateral_vel_ms    = cam_lat_vel,
                     camera_heading_rate_rps  = cam_heading_rate,
-                    imu_yaw_rate_rps         = imu_yaw_rate_rps
+                    imu_yaw_rate_rps         = imu_yaw_rate_rps,
+                    imu_yaw_rad              = imu_yaw_rad,   # FIX-10: absolute fusion
                 )
 
                 # 7. Lookahead waypoints from A* path
@@ -1895,11 +1920,36 @@ class Orchestrator:
                 # 8. Nearest node (for telemetry)
                 nearest_node = self.planner.get_nearest_node(pose[0], pose[1])
                 
-                # 8.1 Node Reset
+                # 8.1 Node Snap
+                # FIX-2: proximity guard — only snap when actually near the node.
+                #         The KDTree always returns *a* nearest node regardless of
+                #         distance; without the guard a 2 m off-track drift could
+                #         snap the localizer to the wrong lane.
+                # FIX-3: compute path tangent at the node and pass it so heading
+                #         is also corrected, not only position.
                 if nearest_node != self._last_nearest_node and nearest_node in self.planner.node_positions:
-                    node_pos = self.planner.node_positions[nearest_node]
-                    self.localizer.node_reset(node_pos[0], node_pos[1])
-                    self._last_nearest_node = nearest_node
+                    node_pos  = self.planner.node_positions[nearest_node]
+                    node_dist = math.hypot(pose[0] - node_pos[0], pose[1] - node_pos[1])
+                    if node_dist < 0.40:                 # within 40 cm
+                        # Derive heading from the path segment leaving this node
+                        _node_yaw_target = None
+                        try:
+                            _ni = current_path.index(nearest_node)
+                            if _ni < len(current_path) - 1:
+                                _n2 = current_path[_ni + 1]
+                                if _n2 in self.planner.node_positions:
+                                    _p1 = node_pos
+                                    _p2 = self.planner.node_positions[_n2]
+                                    _node_yaw_target = math.atan2(
+                                        _p2[1] - _p1[1], _p2[0] - _p1[0]
+                                    )
+                        except (ValueError, IndexError):
+                            pass
+                        self.localizer.node_reset(
+                            node_pos[0], node_pos[1],
+                            yaw_target=_node_yaw_target    # FIX-3
+                        )
+                        self._last_nearest_node = nearest_node
                 
                 # 8a. Lap completion check
                 if nearest_node == self.target_node:
