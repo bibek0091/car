@@ -1,2435 +1,698 @@
 """
-BFMC Autonomous Pilot — main.py  (Improved v2)
+main.py — BFMC Single-Window Autonomous Pilot
 ==============================================
-Key fixes over original:
-  1. STARTUP LOCALIZATION WIZARD: User places car on map before driving.
-  2. CORRECT MAP RENDERING: Equal-axis, no distortion, exact track proportions.
-  3. CALIBRATION PHASE: Clearly shows 6-second countdown with IMU zero.
-  4. CLEAN THREAD SAFETY: All GUI updates via queue — no cross-thread Tk calls.
-  5. MAP CLICK LOCALISATION: Click any node on the map to teleport car position.
-  6. REROUTE DIALOG: Re-plan A* to a new target without restarting.
+Architecture (V3 YOLO Lane Control + SVG Self-Localization):
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Single Tkinter Window                                   │
+  │  ┌──────────────┐  ┌─────────────┐  ┌─────────────────┐│
+  │  │  SVG Map     │  │ YOLO Camera │  │  BEV Lane View  ││
+  │  │  (click to  │  │ (raw+YOLO  │  │  (sliding window││
+  │  │   set pose) │  │  overlay)  │  │   poly fit)     ││
+  │  └──────────────┘  └─────────────┘  └─────────────────┘│
+  │  ┌────────────────────────────────────────────────────┐ │
+  │  │  Status Bar: Speed  Steer  AnchorMode  Nav  E-STOP │ │
+  │  └────────────────────────────────────────────────────┘ │
+  └─────────────────────────────────────────────────────────┘
+
+Self-localization:
+  - User LEFT-CLICKS on SVG map → sets (x, y) start pose
+  - IMU gyro (gz) integrates yaw continuously at 30 Hz
+  - velocity from hardware_io.get_velocity_ms() advances (x, y)
+  - Lane tangent provides a soft heading nudge per frame
+  - Car dot drifts across SVG as the car moves (no A*)
+
+Lane control (exact V3 YOLO logic):
+  - HybridLaneTracker (sliding window → poly search)
+  - Pure pursuit steering
+  - DividerGuard forcefield
+  - JunctionDetector (autonomous decision: LEFT / RIGHT / STRAIGHT)
+
+Traffic (YOLO):
+  - ThreadedYOLODetector (async queue, 0.25 conf)
+  - TrafficDecisionEngine: red light / stop sign / crosswalk / collision
+
+Usage:
+  python main.py [--sim] [--speed SPEED] [--svg PATH_TO_SVG]
 """
 
-import logging
-import threading
-import queue
-import time
-import csv
 import argparse
-import tkinter as tk
-from tkinter import ttk, simpledialog, messagebox
-from datetime import datetime
-import numpy as np
-import cv2
+import logging
 import math
+import os
+import sys
+import threading
+import time
+import queue
+from collections import deque
 
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d import Axes3D                        # noqa: F401 — registers 3d projection
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageTk
 
-# ── Custom Modules ─────────────────────────────────────────────────────────────
-from map_planner import PathPlanner
+# ── Internal modules ───────────────────────────────────────────────────────
+from perception   import VisionPipeline, estimate_heading_from_lanes
 from localization import LocalizationEngine
-from perception import VisionPipeline
-from control import Controller
-from hardware_io import HardwareIO
-from traffic_module import ThreadedYOLODetector, TrafficDecisionEngine
-from visual_calibrator import VisualCalibrator
-from mpu9250_imu import MPU9250_Thread
+from control      import Controller, ControlOutput
+from hardware_io  import HardwareIO
+from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector
+from mpu9250_imu  import MPU9250_Thread
 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level   = logging.INFO,
+    format  = "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("main")
 
-# Global e-stop event — any thread can halt the car
-estop_event = threading.Event()
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════════════
+TARGET_FPS   = 30
+FRAME_PERIOD = 1.0 / TARGET_FPS
+PWM_DEADBAND = 14.0   # Motors silent below this PWM (applied after traffic mult)
 
-# ── Global Constants & Utilities ─────────────────────────────────────────────
-BFMC_SIGNS = {
-    # format: "label": [(x, y, "char", "color")]
-    "STOP":        [(4.17, 6.89, "STP", "#FF2020"),   
-                    (2.35, 3.84, "STP", "#FF2020")],   
-    "TRAFFIC_LT":  [(5.71, 6.89, "TL", "#FF8000"),   
-                    (4.94, 3.83, "TL", "#FF8000")],   
-    "CROSSWALK":   [(3.50, 6.89, "CW", "#FFFFFF"),
-                    (4.94, 5.50, "CW", "#FFFFFF")],
-    "SPEED_30":    [(7.00, 3.83, "30", "#00AAFF")],
-    "ONE_WAY":     [(10.0, 3.83, "->", "#AAAAFF")],
-    "PRIORITY":    [(15.48, 3.83, "YIE", "#FFFF00")],
-}
+# Default SVG path (relative to script location)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SVG_PATH_DEFAULT = os.path.join(_SCRIPT_DIR, "..", "Track.svg")
 
-import matplotlib.collections as mcoll
+# Map coordinate bounds (metres) — adjust to match your SVG/track size
+MAP_W_M = 22.0
+MAP_H_M = 15.0
 
-# ── SVG overlay: rasterise Track.svg once and cache as a numpy image ──────────
-_SVG_IMAGE_CACHE: dict = {}   # {path: np.ndarray}
+# ═══════════════════════════════════════════════════════════════════════════════
+# JunctionDetector (V3 exact)
+# ═══════════════════════════════════════════════════════════════════════════════
+class AutonomousJunctionPlanner:
+    """Decides junction direction from BEV pixel energy."""
 
-def _load_svg_as_image(svg_path: str, px: int = 1024) -> "np.ndarray | None":
+    def decide(self, warped_binary, left_fit, right_fit, lane_width_px):
+        h, w = warped_binary.shape
+        lroi  = warped_binary[0:240, 0:320]
+        rroi  = warped_binary[0:240, 320:640]
+        sroi  = warped_binary[0:240, 200:440]
+
+        wts   = np.linspace(2.0, 0.5, 240).reshape(-1, 1)
+        ls    = np.sum(lroi * wts) / (320 * 240)
+        rs    = np.sum(rroi * wts) / (320 * 240)
+        ss    = np.sum(sroi * wts) / (240 * 240)
+
+        scores = {"LEFT": ls, "RIGHT": rs, "STRAIGHT": ss}
+        best   = max(scores, key=scores.get)
+        total  = sum(scores.values())
+        conf   = scores[best] / max(total, 1e-6)
+
+        if conf < 0.4:
+            return "RIGHT", 0.3
+        return best, conf
+
+
+class JunctionDetector:
+    ENTRY_FRAMES     = 5
+    EXIT_FRAMES      = 8
+    RATIO_EARLY_WARN = 1.7
+    MIN_BOT_ENERGY   = 500
+
+    def __init__(self):
+        self.state        = "NORMAL"
+        self.entry_count  = 0
+        self.exit_count   = 0
+        self.frames_in_jct = 0
+        self.planner      = AutonomousJunctionPlanner()
+
+    def update(self, warped_binary, left_fit, right_fit, lane_width_px, active_labels):
+        h, w = warped_binary.shape
+
+        # Detect upcoming wide gap at y=150 (top 30%)
+        approaching_wide = False
+        if left_fit is not None and right_fit is not None:
+            lx = np.polyval(left_fit,  150)
+            rx = np.polyval(right_fit, 150)
+            if (rx - lx) > lane_width_px * self.RATIO_EARLY_WARN:
+                approaching_wide = True
+        elif left_fit is not None:
+            lx = np.polyval(left_fit, 150)
+            if lx < max(0, 320 - lane_width_px * self.RATIO_EARLY_WARN):
+                approaching_wide = True
+        elif right_fit is not None:
+            rx = np.polyval(right_fit, 150)
+            if rx > min(640, 320 + lane_width_px * self.RATIO_EARLY_WARN):
+                approaching_wide = True
+
+        hist_bot  = float(np.sum(warped_binary[h // 2:, :]))
+        hist_top  = float(np.sum(warped_binary[:h // 2, :]))
+        cross_e   = False
+        if hist_bot > self.MIN_BOT_ENERGY:
+            cross_e = (hist_top / hist_bot) > 1.4
+        if "crosswalk-sign" in active_labels:
+            cross_e = False
+
+        evidence = approaching_wide or cross_e
+
+        if self.state == "NORMAL":
+            self.entry_count = self.entry_count + 1 if evidence else 0
+            if self.entry_count >= self.ENTRY_FRAMES:
+                direction, conf = self.planner.decide(warped_binary, left_fit, right_fit, lane_width_px)
+                self.state         = f"JUNCTION_{direction}"
+                self.exit_count    = 0
+                self.frames_in_jct = 0
+
+        elif self.state.startswith("JUNCTION_"):
+            self.frames_in_jct += 1
+            self.exit_count = self.exit_count + 1 if not evidence else 0
+            if self.exit_count >= self.EXIT_FRAMES and self.frames_in_jct > 25:
+                self.state       = "NORMAL"
+                self.entry_count = 0
+
+        return self.state
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SVG Map Panel helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+def _load_svg_as_cv2(svg_path: str, display_w: int = 600, display_h: int = 500):
     """
-    Convert Track.svg to an RGBA numpy array at resolution ~px × (px*aspect).
-    Tries three backends in order: cairosvg → svglib+reportlab → skips overlay.
-    Result is cached so the file is only read once per session.
+    Load SVG and return as a BGR numpy array of shape (display_h, display_w, 3).
+    Falls back to a blank grey image if cairosvg / svglib not available.
     """
-    import os
-    if svg_path in _SVG_IMAGE_CACHE:
-        return _SVG_IMAGE_CACHE[svg_path]
-    if not os.path.exists(svg_path):
-        return None
-
-    img = None
-
-    # ── Backend 1: cairosvg (pip install cairosvg) ────────────────────────────
+    # Try cairosvg (fastest, Raspberry Pi installable via pip)
     try:
-        import cairosvg, io
-        from PIL import Image as PILImage
-        png_bytes = cairosvg.svg2png(url=svg_path, output_width=px)
-        img = np.array(PILImage.open(io.BytesIO(png_bytes)).convert("RGBA"), dtype=np.uint8)
-        log.info(f"[SVG] Loaded via cairosvg: {img.shape}")
+        import cairosvg
+        png_bytes = cairosvg.svg2png(
+            url=svg_path, output_width=display_w, output_height=display_h
+        )
+        arr = np.frombuffer(png_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            return img
     except Exception:
         pass
 
-    # ── Backend 2: svglib + reportlab (pip install svglib reportlab) ──────────
-    if img is None:
+    # Try svglib + reportlab
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        drawing = svg2rlg(svg_path)
+        img = renderPM.drawToPIL(drawing)
+        img = img.convert("RGB").resize((display_w, display_h), Image.LANCZOS)
+        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
+
+    log.warning("SVG render unavailable — using blank map. Install cairosvg for SVG support.")
+    blank = np.full((display_h, display_w, 3), 50, np.uint8)
+    cv2.putText(blank, "SVG render unavailable", (20, display_h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(blank, "pip install cairosvg", (20, display_h // 2 + 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (130, 180, 130), 1, cv2.LINE_AA)
+    return blank
+
+
+def map_to_pixel(x_m, y_m, img_w, img_h,
+                 map_w_m=MAP_W_M, map_h_m=MAP_H_M):
+    """Map metres → pixel coords in the displayed SVG image."""
+    px = int(x_m / map_w_m * img_w)
+    py = int(y_m / map_h_m * img_h)
+    return px, py
+
+
+def pixel_to_map(px, py, img_w, img_h,
+                 map_w_m=MAP_W_M, map_h_m=MAP_H_M):
+    """Click pixel → map metres."""
+    x_m = px / img_w * map_w_m
+    y_m = py / img_h * map_h_m
+    return x_m, y_m
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Orchestrator
+# ═══════════════════════════════════════════════════════════════════════════════
+class Orchestrator:
+    """
+    Main pilot loop + Tkinter dashboard coordinator.
+
+    Startup sequence:
+      1. Window opens, SVG map shown — car dot is NOT yet visible.
+      2. User LEFT-CLICKS the SVG to set the start position.
+      3. Pilot thread begins immediately.
+      4. Pressing E-STOP pauses; RESUME resumes.
+    """
+
+    BASE_SPEED = 50     # Default PWM (0-100)
+    MAP_W      = 600    # SVG panel width  (pixels)
+    MAP_H      = 440    # SVG panel height (pixels)
+    CAM_W      = 480    # Camera panel width
+    CAM_H      = 360    # Camera panel height
+
+    def __init__(self, sim_mode=False, base_speed=None, svg_path=None):
+        self.sim_mode  = sim_mode
+        self.base_speed = base_speed or self.BASE_SPEED
+        self.svg_path  = svg_path or SVG_PATH_DEFAULT
+        self.running   = False
+        self._estop    = False
+        self._pilot_thread = None
+
+        # ── Hardware ──────────────────────────────────────────────────────────
+        self.hw = HardwareIO(sim_mode=sim_mode)
+
+        # ── IMU ───────────────────────────────────────────────────────────────
+        self.imu = MPU9250_Thread()
+        if self.imu.is_connected:
+            self.imu.start()
+            log.info("IMU started")
+        else:
+            log.warning("IMU not connected — yaw will be 0.0")
+
+        # ── Perception ────────────────────────────────────────────────────────
+        self.vision = VisionPipeline()
+
+        # ── YOLO (threaded) ───────────────────────────────────────────────────
         try:
-            from svglib.svglib import svg2rlg
-            from reportlab.graphics import renderPM
-            import io
-            from PIL import Image as PILImage
-            drawing = svg2rlg(svg_path)
-            if drawing is not None:
-                scale = px / drawing.width
-                drawing.width  *= scale
-                drawing.height *= scale
-                drawing.transform = (scale, 0, 0, scale, 0, 0)
-                png_bytes = renderPM.drawToString(drawing, fmt="PNG")
-                img = np.array(PILImage.open(io.BytesIO(png_bytes)).convert("RGBA"), dtype=np.uint8)
-                log.info(f"[SVG] Loaded via svglib: {img.shape}")
+            # ThreadedYOLODetector loads YOLO internally from model_path.
+            # TrafficDecisionEngine wraps it for the full decision pipeline.
+            self._threaded_yolo = ThreadedYOLODetector("best.pt")
+            self.traffic_engine = TrafficDecisionEngine(self._threaded_yolo)
+            log.info("YOLO loaded")
+        except Exception as e:
+            log.warning(f"YOLO disabled: {e}")
+            self._threaded_yolo  = None
+            self.traffic_engine  = None
+
+
+        # ── Navigation state machies ──────────────────────────────────────────
+        self.jct_detector  = JunctionDetector()
+        self.controller    = Controller()
+        self.localizer     = LocalizationEngine()
+
+        # ── Telemetry ─────────────────────────────────────────────────────────
+        self._fps          = 0.0
+        self._fps_t        = time.time()
+        self._steer_hist   = deque(maxlen=120)  # ~4 s at 30 Hz
+        self._nav_state    = "NORMAL"
+        self._last_ctrl    = ControlOutput(0.0, 0.0, 320.0, "INIT", 200)
+        self._last_t_res   = None      # TrafficResult
+
+        # ── SVG map ───────────────────────────────────────────────────────────
+        self._svg_base     = _load_svg_as_cv2(self.svg_path, self.MAP_W, self.MAP_H)
+        self._start_clicked = False
+
+        # Frame queues for GUI
+        self._q_yolo  = queue.Queue(maxsize=1)
+        self._q_bev   = queue.Queue(maxsize=1)
+
+        # ── Camera ────────────────────────────────────────────────────────────
+        if not sim_mode:
+            self.hw.open_camera()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # GUI
+    # ─────────────────────────────────────────────────────────────────────────
+    def build_ui(self, root: tk.Tk):
+        self._root = root
+        root.title("BFMC Pilot — V3 Lane Control")
+        root.configure(bg="#0d0d0d")
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── Top row: map | yolo camera | bev lane ────────────────────────────
+        top = tk.Frame(root, bg="#0d0d0d")
+        top.pack(padx=8, pady=8)
+
+        # SVG Map panel
+        map_frame = tk.LabelFrame(top, text=" MAP — click to set car position ",
+                                  bg="#0d0d0d", fg="#00e5ff",
+                                  font=("Courier", 9, "bold"))
+        map_frame.grid(row=0, column=0, padx=6)
+        self._map_label = tk.Label(map_frame, bg="#0d0d0d")
+        self._map_label.pack()
+        self._map_label.bind("<Button-1>", self._on_map_click)
+        self._map_ph = ImageTk.PhotoImage(
+            Image.fromarray(cv2.cvtColor(self._svg_base, cv2.COLOR_BGR2RGB))
+        )
+        self._map_label.config(image=self._map_ph)
+
+        # YOLO camera panel
+        yolo_frame = tk.LabelFrame(top, text=" CAMERA + YOLO ",
+                                   bg="#0d0d0d", fg="#ff9100",
+                                   font=("Courier", 9, "bold"))
+        yolo_frame.grid(row=0, column=1, padx=6)
+        self._yolo_label = tk.Label(yolo_frame, bg="#0d0d0d")
+        self._yolo_label.pack()
+        blank_cam = np.zeros((self.CAM_H, self.CAM_W, 3), dtype=np.uint8)
+        self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(blank_cam))
+        self._yolo_label.config(image=self._yolo_ph)
+
+        # BEV lane panel
+        bev_frame = tk.LabelFrame(top, text=" LANE VIEW (BEV) ",
+                                  bg="#0d0d0d", fg="#69ff47",
+                                  font=("Courier", 9, "bold"))
+        bev_frame.grid(row=0, column=2, padx=6)
+        self._bev_label = tk.Label(bev_frame, bg="#0d0d0d")
+        self._bev_label.pack()
+        blank_bev = np.zeros((360, 480, 3), dtype=np.uint8)
+        self._bev_ph = ImageTk.PhotoImage(Image.fromarray(blank_bev))
+        self._bev_label.config(image=self._bev_ph)
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        status = tk.Frame(root, bg="#111", pady=6)
+        status.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        self._sv_speed  = tk.StringVar(value="Speed: ---")
+        self._sv_steer  = tk.StringVar(value="Steer: ---")
+        self._sv_anchor = tk.StringVar(value="Mode: INIT")
+        self._sv_nav    = tk.StringVar(value="Nav: ---")
+        self._sv_pose   = tk.StringVar(value="Pose: not set")
+        self._sv_imu    = tk.StringVar(value="IMU: ---")
+        self._sv_fps    = tk.StringVar(value="FPS: ---")
+
+        style_lbl = dict(bg="#111", fg="#eee", font=("Courier", 9))
+        for sv in [self._sv_speed, self._sv_steer, self._sv_anchor,
+                   self._sv_nav, self._sv_pose, self._sv_imu, self._sv_fps]:
+            tk.Label(status, textvariable=sv, **style_lbl).pack(side=tk.LEFT, padx=10)
+
+        # E-STOP / RESUME buttons
+        btn_frame = tk.Frame(status, bg="#111")
+        btn_frame.pack(side=tk.RIGHT, padx=10)
+        tk.Button(btn_frame, text="⛔ E-STOP",
+                  bg="#c0392b", fg="white", font=("Courier", 9, "bold"),
+                  command=self._estop_cb).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_frame, text="▶ RESUME",
+                  bg="#27ae60", fg="white", font=("Courier", 9, "bold"),
+                  command=self._resume_cb).pack(side=tk.LEFT, padx=4)
+
+        # Click instruction overlay
+        self._click_hint = tk.Label(root, text="🗺  Click on the map to place the car",
+                                    bg="#0d0d0d", fg="#ffcc00",
+                                    font=("Courier", 11, "bold"))
+        self._click_hint.pack()
+
+        # Start GUI refresh loop
+        self._gui_update()
+
+    def _on_map_click(self, event):
+        """Left-click on SVG map → set localizer pose."""
+        x_m, y_m = pixel_to_map(event.x, event.y, self.MAP_W, self.MAP_H)
+
+        # Estimate initial yaw from IMU (or 0 if not connected)
+        imu_yaw, _ = self.imu.get_yaw_data()
+        init_yaw = imu_yaw if imu_yaw is not None else 0.0
+
+        self.localizer.set_pose(x_m, y_m, init_yaw)
+        self._start_clicked = True
+
+        # Hide the hint
+        if hasattr(self, '_click_hint'):
+            self._click_hint.config(text=f"Start: ({x_m:.1f} m, {y_m:.1f} m) — driving…")
+
+        # Launch pilot thread on first click
+        if self._pilot_thread is None or not self._pilot_thread.is_alive():
+            self.running = True
+            self._pilot_thread = threading.Thread(
+                target=self._pilot_loop, daemon=True)
+            self._pilot_thread.start()
+            log.info(f"Pilot started from x={x_m:.2f} y={y_m:.2f} yaw={math.degrees(init_yaw):.1f}°")
+
+    def _estop_cb(self):
+        self._estop = True
+        self.hw.set_speed(0)
+        self.hw.set_steering(0)
+        log.warning("E-STOP triggered")
+
+    def _resume_cb(self):
+        self._estop = False
+        log.info("E-STOP cleared — resuming")
+
+    def _on_close(self):
+        self.running = False
+        self._estop  = True
+        try:
+            self.hw.set_speed(0)
+            self.hw.set_steering(0)
         except Exception:
             pass
-
-    if img is None:
-        log.warning("[SVG] No SVG backend found (install cairosvg or svglib) — skipping overlay")
-
-    _SVG_IMAGE_CACHE[svg_path] = img
-    return img
-
-
-def draw_rich_map(ax, planner, signs_dict=None, svg_path: str = None):
-    """
-    Render the BFMC track map on `ax`.
-
-    Combines:
-      • Track.svg  — photo-realistic SVG track image as a background
-      • GraphML    — directed-graph roads, roundabouts, traffic signs, car position
-
-    svg_path : absolute path to Track.svg (auto-detected relative to this file if None)
-    """
-
-    if signs_dict is None:
-        signs_dict = BFMC_SIGNS
-
-    G = planner.graph
-    pos = planner.node_positions
-
-    ax.clear()
-    ax.set_facecolor("#121215")
-
-    # ── SVG Track overlay ─────────────────────────────────────────────────────
-    # Auto-detect Track.svg next to main.py if not provided
-    if svg_path is None:
-        import os
-        _here = os.path.dirname(os.path.abspath(__file__))
-        _candidate = os.path.join(_here, "..", "Track.svg")
-        if os.path.exists(_candidate):
-            svg_path = os.path.normpath(_candidate)
-
-    if svg_path is not None:
-        svg_img = _load_svg_as_image(svg_path, px=1200)
-        if svg_img is not None:
-            # Get GraphML coordinate bounds (will be used for axis limits later)
-            xs = [p[0] for p in pos.values()]
-            ys = [p[1] for p in pos.values()]
-            pad = 1.0
-            gx0, gx1 = min(xs) - pad, max(xs) + pad
-            gy0, gy1 = min(ys) - pad, max(ys) + pad
-
-            # Map SVG image to GraphML space.
-            #
-            # COORDINATE SYSTEM NOTES
-            # ────────────────────────
-            # • SVG Y increases DOWNWARD  (row 0 = physical north = small data-Y)
-            # • GraphML Y increases downward too; ax.invert_yaxis() makes small Y
-            #   appear at the VISUAL TOP (north up).
-            #
-            # imshow extent = [left, right, ymin, ymax] in DATA coordinates.
-            # With origin="lower":  row 0 -> ymin in data coords.
-            # After invert_yaxis(): data ymin (=gy0=min_y) -> VISUAL TOP (correct)
-            # -> SVG row 0 (physical north) lands at VISUAL TOP aligned with GraphML.
-            #
-            # OLD (buggy): origin="upper" + swapped extent [gx0,gx1,gy1,gy0]
-            # that put row 0 at data gy0=min_y -> after invert -> VISUAL BOTTOM (wrong)
-            ax.imshow(
-                svg_img,
-                aspect="auto",
-                extent=[gx0, gx1, gy0, gy1],   # [left, right, data_ymin, data_ymax]
-                origin="lower",                  # row 0 -> data_ymin -> VISUAL TOP
-                alpha=0.30,
-                zorder=0,
-                interpolation="bilinear",
-            )
-
-
-    parking_nodes = {k: p for k, p in pos.items() if p[1] > 9.0}
-    if parking_nodes:
-        xs = [p[0] for p in parking_nodes.values()]
-        ys = [p[1] for p in parking_nodes.values()]
-        min_x, max_x = min(xs) - 0.4, max(xs) + 0.4
-        min_y, max_y = min(ys) - 0.4, max(ys) + 0.4
-        rect = mpatches.Rectangle((min_x, min_y), max_x - min_x, max_y - min_y,
-                                  fc="#0A1A0A", ec="none", alpha=0.3, zorder=1)
-        ax.add_patch(rect)
-        ax.text((min_x+max_x)/2, min_y + 0.3, "PARKING ZONE", color="#305030", 
-                fontsize=16, ha="center", fontfamily="monospace", zorder=2)
-
-    # 2.8 Zone Labels
-    ax.text(16.0, 4.5, "HIGHWAY", color="white", alpha=0.12, fontsize=32, ha="center", va="center", fontfamily="sans-serif", rotation=0, zorder=1)
-    ax.text(4.5, 5.5, "URBAN", color="white", alpha=0.12, fontsize=32, ha="center", va="center", fontfamily="sans-serif", rotation=0, zorder=1)
-
-    # 2.1 & 2.2 Edges
-    solid_edges = []
-    dotted_edges = []
-    divider_edges = []
-    
-    for u, v, d in G.edges(data=True):
-        pu, pv = pos.get(u), pos.get(v)
-        if not pu or not pv: continue
-        is_dotted = d.get("dotted", False)
-        if isinstance(is_dotted, str): is_dotted = is_dotted.lower() == "true"
-        
-        if is_dotted:
-            dotted_edges.append([(pu[0], pu[1]), (pv[0], pv[1])])
-            if pu[1] > 9.0 and pv[1] > 9.0 and abs(pu[0]-pv[0]) < 0.1:
-                divider_edges.append([(pu[0], pu[1]), (pv[0], pv[1])])
-        else:
-            solid_edges.append([(pu[0], pu[1]), (pv[0], pv[1])])
-
-    ax.add_collection(mcoll.LineCollection(divider_edges, colors="#808080", linewidths=1.0, zorder=3))
-    ax.add_collection(mcoll.LineCollection(solid_edges, colors="#3A3A42", linewidths=16, capstyle="round", joinstyle="round", zorder=2))
-    ax.add_collection(mcoll.LineCollection(solid_edges, colors="#1E1E24", linewidths=10, capstyle="round", joinstyle="round", zorder=3))
-    ax.add_collection(mcoll.LineCollection(dotted_edges, colors="#FFFF99", linewidths=1.5, linestyles=(0, (6, 4)), capstyle="round", zorder=4))
-
-    # 2.3 Road Direction Arrows
-    for i, edge in enumerate(solid_edges):
-        if i % 5 == 0:
-            (x1, y1), (x2, y2) = edge
-            mx, my = (x1+x2)/2.0, (y1+y2)/2.0
-            dx, dy = x2-x1, y2-y1
-            l = math.hypot(dx, dy)
-            if l > 0:
-                ax.annotate("", xy=(mx + dx/l*0.1, my + dy/l*0.1), xytext=(mx - dx/l*0.1, my - dy/l*0.1),
-                            arrowprops=dict(arrowstyle="->", color="#404050", lw=1.2), zorder=4)
-
-    # 2.4 Roundabouts
-    rbt_clusters = [
-        ("RBT-A", 4.94, 6.71), ("RBT-B", 2.70, 6.70), ("RBT-C", 2.70, 3.84),
-        ("RBT-D", 4.94, 3.83), ("RBT-E", 15.48, 3.83)
-    ]
-    for name, cx, cy in rbt_clusters:
-        ax.add_patch(mpatches.Circle((cx, cy), 0.65, color="#FF6600", fill=False, lw=2.0, zorder=5))
-        ax.add_patch(mpatches.Circle((cx, cy), 0.30, color="#2A1A00", fill=True, alpha=0.8, zorder=5))
-        ax.text(cx, cy - 0.75, name, color="#FF8030", fontsize=7, ha="center", fontfamily="monospace", zorder=6)
-        for angle in [0, 90, 180, 270]:
-            rad = math.radians(angle)
-            tx, ty = cx + 0.65 * math.cos(rad), cy + 0.65 * math.sin(rad)
-            ax.add_patch(mpatches.RegularPolygon((tx, ty), 3, radius=0.08, orientation=rad+math.pi, color="#FF6600", zorder=6))
-
-    # All nodes
-    for px, py in pos.values():
-        ax.plot(px, py, "o", color="#2A2A32", ms=2.5, zorder=4)
-
-    # 2.6 Traffic Signs
-    sign_artists = {}
-    for stype, sign_list in signs_dict.items():
-        for i, data in enumerate(sign_list):
-            if len(data) == 4:
-                sx, sy, char, color = data
-            else:
-                sx, sy, char, color = data[0], data[1], data[2], data[3]
-                
-            min_d, nx, ny = float('inf'), sx, sy
-            best_n = None
-            for nid, (px, py) in pos.items():
-                d = math.hypot(px-sx, py-sy)
-                if d < min_d:
-                    min_d, nx, ny, best_n = d, px, py, nid
-                    
-            if stype == "CROSSWALK" and best_n is not None:
-                connected = [v for u, v in G.edges(best_n)] + [u for u, v in G.edges() if v == best_n]
-                angle = 0
-                if connected:
-                    cx, cy = pos[connected[0]]
-                    angle = math.atan2(cy - ny, cx - nx)
-                
-                for j in range(-2, 2):
-                    offset = j * 0.08
-                    ox = nx + offset * math.cos(angle)
-                    oy = ny + offset * math.sin(angle)
-                    c = "#FFFFFF" if j % 2 == 0 else "#808080"
-                    
-                    rect = mpatches.Rectangle((ox - 0.175*math.sin(angle), oy + 0.175*math.cos(angle)), 
-                                              0.35, 0.05, angle=math.degrees(angle)-90,
-                                              color=c, zorder=3, alpha=0.8)
-                    ax.add_patch(rect)
-                
-            line, = ax.plot([sx, nx], [sy, ny], color="#606060", lw=1.0, zorder=7)
-            # Add picker=5 for easy selection
-            circ = mpatches.Circle((sx, sy), 0.18, color=color, zorder=8, picker=True)
-            ax.add_patch(circ)
-            txt = ax.text(sx, sy, char, color="black" if color in ["#FFFFFF", "#FFFF00"] else "white", 
-                          ha="center", va="center", fontsize=9, fontweight="bold", zorder=9)
-                          
-            sign_artists[f"{stype}_{i}"] = {
-                "circ": circ, "txt": txt, "line": line, "type": stype, "idx": i, 
-                "color": color, "char": char, "nx": nx, "ny": ny
-            }
-            
-    # CRITICAL — equal aspect, invert Y
-    xs = [p[0] for p in pos.values()]
-    ys = [p[1] for p in pos.values()]
-    pad = 1.0
-    ax.set_xlim(min(xs) - pad, max(xs) + pad)
-    ax.set_ylim(min(ys) - pad, max(ys) + pad)
-    ax.set_aspect("equal", adjustable="box")
-    ax.invert_yaxis()
-    
-    ax.set_xlabel("X (m)", color="#787880", fontsize=8)
-    ax.set_ylabel("Y (m)", color="#787880", fontsize=8)
-    ax.tick_params(colors="#505058", labelsize=7)
-    for s in ax.spines.values(): s.set_color("#303038")
-
-    return sign_artists
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STARTUP LOCALIZATION WIZARD
-# ══════════════════════════════════════════════════════════════════════════════
-class StartupOverlay(tk.Frame):
-    """
-    Full-screen overlay shown BEFORE the pilot loop starts.
-    User must:
-      1. Click a node to set START position (where the car physically is).
-      2. Click a node to set TARGET (where A* should route to).
-    Both selections are required before dismissing.
-    """
-
-    def __init__(self, parent, planner: "PathPlanner", on_confirm_callback):
-        super().__init__(parent, bg="#0C0C0C")
-        self.win = self  # Alias for straightforward UI initialization updates
-        self.planner = planner
-        self.on_confirm_callback = on_confirm_callback
-        self.start_node = None
-        self.target_node = None
-        self.phase = "START"   # "START" → "TARGET" → "DONE"
-
-        self._build_ui()
-        self._draw_map()
-
-    # ── Build wizard UI ────────────────────────────────────────────────────────
-    def _build_ui(self):
-        # Top instruction bar
-        self.frm_top = tk.Frame(self.win, bg="#161618", height=60)
-        self.frm_top.pack(fill=tk.X, padx=0, pady=0)
-
-        self.lbl_phase = tk.Label(
-            self.frm_top,
-            text="STEP 1 / 2 — Click the node where your car is physically placed",
-            font=("Courier", 14, "bold"), fg="#00C8FF", bg="#161618"
-        )
-        self.lbl_phase.pack(side=tk.LEFT, padx=20, pady=15)
-
-        self.lbl_sel = tk.Label(
-            self.frm_top, text="START: —    TARGET: —",
-            font=("Courier", 12), fg="#FFE000", bg="#161618"
-        )
-        self.lbl_sel.pack(side=tk.RIGHT, padx=20, pady=15)
-
-        # Manual entry row
-        frm_entry = tk.Frame(self.win, bg="#0C0C0C")
-        frm_entry.pack(fill=tk.X, padx=10, pady=4)
-
-        tk.Label(frm_entry, text="Or type node ID — Start:", font=("Courier", 11),
-                 fg="#787880", bg="#0C0C0C").pack(side=tk.LEFT, padx=6)
-        self.ent_start = tk.Entry(frm_entry, width=8, font=("Courier", 11),
-                                  bg="#222226", fg="white", insertbackground="white")
-        self.ent_start.pack(side=tk.LEFT, padx=4)
-
-        tk.Label(frm_entry, text="Target:", font=("Courier", 11),
-                 fg="#787880", bg="#0C0C0C").pack(side=tk.LEFT, padx=6)
-        self.ent_target = tk.Entry(frm_entry, width=8, font=("Courier", 11),
-                                   bg="#222226", fg="white", insertbackground="white")
-        self.ent_target.pack(side=tk.LEFT, padx=4)
-
-        tk.Button(frm_entry, text="Apply", font=("Courier", 11, "bold"),
-                  bg="#00C8FF", fg="black",
-                  command=self._apply_manual_entry).pack(side=tk.LEFT, padx=10)
-
-        # Map canvas
-        self.fig, self.ax = plt.subplots(figsize=(11.5, 6.8), facecolor="#0C0C0C")
-        self.ax.set_facecolor("#0C0C0C")
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.win)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
-        
-        self._dragging_sign = None
-        self._hover_ann = None
-        self.canvas.mpl_connect("button_press_event", self._on_press)
-        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.canvas.mpl_connect("button_release_event", self._on_release)
-
-        # Bottom confirm button (disabled until both are set)
-        self.btn_confirm = tk.Button(
-            self.win, text="▶  CONFIRM & LAUNCH CALIBRATION",
-            font=("Courier", 13, "bold"), bg="#1A3A1A", fg="#64DC64",
-            state=tk.DISABLED, command=self._confirm
-        )
-        self.btn_confirm.pack(fill=tk.X, padx=10, pady=8)
-
-        # Artist handles updated during selection
-        self._start_dot = None
-        self._target_dot = None
-        self._ann_start = None
-        self._ann_target = None
-        self._hover_dot = None
-
-    # ── Draw the exact track map ───────────────────────────────────────────────
-    def _draw_map(self):
-        G = self.planner.graph
-        pos = self.planner.node_positions
-
-        self.ax.clear()
-        self.ax.set_facecolor("#0C0C0C")
-
-        # ── Edges ─────────────────────────────────────────────────────────────
-        for u, v, d in G.edges(data=True):
-            pu, pv = pos.get(u), pos.get(v)
-            if pu is None or pv is None:
-                continue
-            is_dotted = d.get("dotted", False)
-            if isinstance(is_dotted, str):
-                is_dotted = is_dotted.lower() == "true"
-            style = {"color": "#4A4A56", "lw": 1.0, "ls": "--", "dashes": (4, 3)} \
-                    if is_dotted else \
-                    {"color": "#5A5A68", "lw": 1.4, "ls": "-"}
-            self.ax.plot([pu[0], pv[0]], [pu[1], pv[1]], **style,
-                         solid_capstyle="round", zorder=2)
-
-        # ── All nodes (small, subtle) ─────────────────────────────────────────
-        for node, (x, y) in pos.items():
-            self.ax.plot(x, y, "o", color="#303038", ms=3, zorder=3)
-
-        # ── Roundabout markers ─────────────────────────────────────────────────
-        rbt_clusters = [
-            ("RBT-A", 4.94, 6.71), ("RBT-B", 2.70, 6.70),
-            ("RBT-C", 2.70, 3.84), ("RBT-D", 4.94, 3.83),
-            ("RBT-E", 15.48, 3.83),
-        ]
-        for name, cx, cy in rbt_clusters:
-            circle = plt.Circle((cx, cy), 0.30, color="#FF6600",
-                                 fill=False, lw=1.5, linestyle="-", zorder=4, alpha=0.7)
-            self.ax.add_patch(circle)
-            self.ax.text(cx, cy - 0.45, name, color="#FF8030",
-                         fontsize=7, ha="center", zorder=5,
-                         fontfamily="monospace")
-
-        # ── Axes: CRITICAL — equal aspect, invert Y so map-north is up ────────
-        xs = [p[0] for p in pos.values()]
-        ys = [p[1] for p in pos.values()]
-        pad = 0.8
-        self.ax.set_xlim(min(xs) - pad, max(xs) + pad)
-        self.ax.set_ylim(min(ys) - pad, max(ys) + pad)
-        self.ax.set_aspect("equal", adjustable="box")   # ← prevents distortion
-        self.ax.invert_yaxis()                           # ← Y=0 is physical top
-
-        self.ax.set_xlabel("X (metres)", color="#606068", fontsize=9)
-        self.ax.set_ylabel("Y (metres)", color="#606068", fontsize=9)
-        self.ax.tick_params(colors="#505058", labelsize=8)
-        for spine in self.ax.spines.values():
-            spine.set_color("#303038")
-
-        # Legend
-        legend_elements = [
-            Line2D([0], [0], color="#5A5A68", lw=1.4, label="Track lane"),
-            Line2D([0], [0], color="#4A4A56", lw=1.0, ls="--", dashes=(4, 3), label="Dashed (junction)"),
-            Line2D([0], [0], marker="o", color="w", ms=8, markerfacecolor="#00FF80", label="START node"),
-            Line2D([0], [0], marker="o", color="w", ms=8, markerfacecolor="#FF4040", label="TARGET node"),
-        ]
-        self.ax.legend(handles=legend_elements, loc="upper right",
-                       facecolor="#161618", edgecolor="#303038",
-                       labelcolor="white", fontsize=8)
-
-        self.ax.set_title("Click to place car (START), then click TARGET",
-                          color="#787880", fontsize=10, pad=8)
-        self.canvas.draw()
-
-    # ── Interaction handlers ──────────────────────────────────────────────────
-    def _on_press(self, event):
-        if event.xdata is None or event.ydata is None:
-            return
-            
-        # Check if clicking a sign
-        if hasattr(self, '_sign_artists'):
-            for key, artist in self._sign_artists.items():
-                contains, _ = artist["circ"].contains(event)
-                if contains:
-                    self._dragging_sign = key
-                    return
-                
-        # Existing node click logic
-        nearest = self.planner.get_nearest_node(event.xdata, event.ydata)
-        if nearest is None: return
-
-        if self.phase == "START":
-            self._set_start(nearest)
-        elif self.phase == "TARGET":
-            self._set_target(nearest)
-
-    def _on_motion(self, event):
-        if event.xdata is None or event.ydata is None:
-            if self._hover_ann:
-                self._hover_ann.set_visible(False)
-                self.canvas.draw_idle()
-            return
-            
-        # Handle dragging
-        if self._dragging_sign:
-            key = self._dragging_sign
-            artist = self._sign_artists[key]
-            
-            # Update circle and text
-            artist["circ"].center = (event.xdata, event.ydata)
-            artist["txt"].set_position((event.xdata, event.ydata))
-            
-            # Find nearest node to update snap line
-            min_d, nx, ny = float('inf'), event.xdata, event.ydata
-            for nid, (px, py) in self.planner.node_positions.items():
-                d = math.hypot(px-event.xdata, py-event.ydata)
-                if d < min_d: min_d, nx, ny = d, px, py
-                
-            artist["line"].set_data([event.xdata, nx], [event.ydata, ny])
-            artist["nx"], artist["ny"] = nx, ny
-            self.canvas.draw_idle()
-            return
-            
-        # Handle tooltip hover
-        hovered = False
-        if hasattr(self, '_sign_artists'):
-            for key, artist in self._sign_artists.items():
-                contains, _ = artist["circ"].contains(event)
-                if contains:
-                    if not self._hover_ann:
-                        self._hover_ann = self.ax.annotate("", xy=(0,0), xytext=(10,10),
-                                                           textcoords="offset points",
-                                                           bbox=dict(boxstyle="round", fc="#2A2A38", ec="#505058"),
-                                                           color="white", fontsize=9, zorder=20)
-                    self._hover_ann.set_text(artist["type"])
-                    self._hover_ann.xy = artist["circ"].center
-                    self._hover_ann.set_visible(True)
-                    self.canvas.draw_idle()
-                    hovered = True
-                    break
-                
-        if not hovered and self._hover_ann and self._hover_ann.get_visible():
-            self._hover_ann.set_visible(False)
-            self.canvas.draw_idle()
-
-    def _on_release(self, event):
-        if self._dragging_sign:
-            key = self._dragging_sign
-            artist = self._sign_artists[key]
-            stype, idx = artist["type"], artist["idx"]
-            
-            cx, cy = artist["circ"].center
-            # Update global BFMC_SIGNS format: (x, y, char, color)
-            old_curr = BFMC_SIGNS[stype][idx]
-            if len(old_curr) == 4:
-                char, color = old_curr[2], old_curr[3]
-            else:
-                char, color = old_curr[0][2], old_curr[0][3]
-            BFMC_SIGNS[stype][idx] = (cx, cy, char, color)
-            
-            self._dragging_sign = None
-            self.canvas.draw_idle()
-
-    def _set_start(self, node_id):
-        pos = self.planner.node_positions[node_id]
-        if self._start_dot:
-            self._start_dot.remove()
-        if self._ann_start:
-            self._ann_start.remove()
-        self._start_dot, = self.ax.plot(pos[0], pos[1], "o",
-                                         color="#00FF80", ms=14, zorder=10,
-                                         markeredgecolor="white", markeredgewidth=1.5)
-        self._ann_start = self.ax.annotate(
-            f"START\nNode {node_id}\n({pos[0]:.2f},{pos[1]:.2f})",
-            pos, xytext=(12, 12), textcoords="offset points",
-            color="#00FF80", fontsize=8, fontfamily="monospace",
-            bbox=dict(boxstyle="round,pad=0.3", fc="#0A200A", ec="#00FF80", lw=1),
-            zorder=11
-        )
-        self.start_node = node_id
-        self.phase = "TARGET"
-        self.lbl_phase.config(
-            text="STEP 2 / 2 — Now click your TARGET (destination) node",
-            fg="#FFE000"
-        )
-        self._update_sel_label()
-        self.canvas.draw_idle()
-
-    def _set_target(self, node_id):
-        if node_id == self.start_node:
-            messagebox.showwarning("Same node", "Target must differ from Start.", parent=self.win)
-            return
-            
-        # Validate reachability before accepting
-        if self.start_node:
-            test_path = self.planner.plan_route(self.start_node, node_id)
-            if not test_path:
-                messagebox.showerror("Unreachable",
-                    f"Node {node_id} cannot be reached from node {self.start_node}.\n"
-                    "Choose a different target.", parent=self.win)
-                return
-                
-        pos = self.planner.node_positions[node_id]
-        if self._target_dot:
-            self._target_dot.remove()
-        if self._ann_target:
-            self._ann_target.remove()
-        self._target_dot, = self.ax.plot(pos[0], pos[1], "o",
-                                          color="#FF4040", ms=14, zorder=10,
-                                          markeredgecolor="white", markeredgewidth=1.5)
-        self._ann_target = self.ax.annotate(
-            f"TARGET\nNode {node_id}\n({pos[0]:.2f},{pos[1]:.2f})",
-            pos, xytext=(12, -28), textcoords="offset points",
-            color="#FF4040", fontsize=8, fontfamily="monospace",
-            bbox=dict(boxstyle="round,pad=0.3", fc="#200A0A", ec="#FF4040", lw=1),
-            zorder=11
-        )
-        self.target_node = node_id
-        self.phase = "DONE"
-        self.lbl_phase.config(
-            text="✓  Both nodes set — press CONFIRM to begin",
-            fg="#64DC64"
-        )
-        self.btn_confirm.config(state=tk.NORMAL, bg="#163A16")
-        self._update_sel_label()
-        self.canvas.draw_idle()
-
-    def _apply_manual_entry(self):
-        s = self.ent_start.get().strip()
-        t = self.ent_target.get().strip()
-        if s and s in self.planner.node_positions:
-            self._set_start(s)
-        if t and t in self.planner.node_positions:
-            if self.phase in ("TARGET", "DONE"):
-                self._set_target(t)
-
-    def _update_sel_label(self):
-        sn = f"Node {self.start_node}" if self.start_node else "—"
-        tn = f"Node {self.target_node}" if self.target_node else "—"
-        self.lbl_sel.config(text=f"START: {sn}    TARGET: {tn}")
-
-    def _confirm(self):
-        if self.start_node and self.target_node:
-            self.on_confirm_callback(self.start_node, self.target_node)
-            self.place_forget()
-            self.destroy()
-
-    def _on_force_close(self):
-        if not (self.start_node and self.target_node):
-            messagebox.showwarning(
-                "Selection Required",
-                "You must select both START and TARGET before continuing.",
-                parent=self.win
-            )
-        else:
-            self._confirm()
-
-    def wait_for_result(self):
-        """Block (in Tk mainloop) until user confirms. Call from main thread."""
-        self.win.wait_window()
-        return self.start_node, self.target_node
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
-from matplotlib.patches import FancyArrow
-
-class DashboardApp:
-    """
-    4-panel live dashboard.  Runs entirely on the Tk main thread.
-    Pilot thread pushes telemetry via telem_q (maxsize=2, non-blocking).
-    """
-
-    # Colour palette
-    BG        = "#0C0C0C"
-    PANEL_BG  = "#161618"
-    CYAN      = "#00C8FF"
-    AMBER     = "#FF8C00"
-    RED_C     = "#F03030"
-    GREEN_C   = "#64DC64"
-    MUTED     = "#787880"
-    WHITE     = "#F5F5FA"
-    YELLOW    = "#FFE000"
-
-    def __init__(self, root, orchestrator: "Orchestrator"):
-        self.root = root
-        self.orch = orchestrator
-        self.telem_q: queue.Queue = queue.Queue(maxsize=2)
-
-        self.root.title("BFMC Autonomous Pilot V4 — Live Dashboard")
-        self.root.geometry("1920x760")
-        self.root.configure(bg=self.BG)
-
-        # Map artist handles (updated without full redraw)
-        self._car_dot = None
-        self._la_dot = None
-        self._route_line = None
-        self._calib_text = None
-
-        # Steering history
-        self._steer_hist: list[float] = []
-        self._steer_line = None
-
-        # Photo image references (prevent GC)
-        self._yolo_img = None
-        self._bev_img = None
-
-        self._build_layout()
-
-    # ── Build 3-panel layout ───────────────────────────────────────────────────
-    def _build_layout(self):
-        root = self.root
-
-        # ── LEFT panel: Status ────────────────────────────────────────────────
-        pnl_stat = tk.Frame(root, bg=self.PANEL_BG, width=320)
-        pnl_stat.pack(side=tk.LEFT, fill=tk.Y, padx=(8, 4), pady=8)
-        pnl_stat.pack_propagate(False)
-
-        tk.Label(pnl_stat, text="SYSTEM STATUS", font=("Courier", 10),
-                 fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(16, 2))
-
-        self.lbl_traffic = tk.Label(pnl_stat, text="WAITING",
-                                    font=("Courier", 26, "bold"),
-                                    fg=self.YELLOW, bg=self.PANEL_BG)
-        self.lbl_traffic.pack(pady=4)
-
-        self.lbl_reason = tk.Label(pnl_stat, text="—",
-                                   font=("Courier", 10),
-                                   fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_reason.pack(pady=2)
-
-        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=6)
-
-        # ── IMU INSTRUMENT PANEL ────────────────────────────────────────────────
-        tk.Label(pnl_stat, text="IMU INSTRUMENTS", font=("Courier", 9),
-                 fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(2, 0))
-
-        # ── NAV MODE indicator ───────────────────────────────────────────
-        frm_mode = tk.Frame(pnl_stat, bg=self.PANEL_BG)
-        frm_mode.pack(fill=tk.X, padx=10, pady=(4, 2))
-        tk.Label(frm_mode, text="NAV MODE:", font=("Courier", 9),
-                 fg=self.MUTED, bg=self.PANEL_BG).pack(side=tk.LEFT, padx=4)
-        self.lbl_navmode = tk.Label(frm_mode, text="CALIBRATING",
-                                    font=("Courier", 11, "bold"),
-                                    fg=self.CYAN, bg=self.PANEL_BG)
-        self.lbl_navmode.pack(side=tk.LEFT, padx=4)
-
-        self._imu_fig, (self._ax_car, self._ax_speed) = plt.subplots(
-            1, 2, figsize=(2.9, 1.75), facecolor=self.PANEL_BG)
-        self._imu_fig.subplots_adjust(left=0.02, right=0.98,
-                                      top=0.90, bottom=0.06, wspace=0.10)
-
-        # ── Top-down 2D car model ─────────────────────────────────────────────
-        # The car is always drawn centred at (0,0).
-        # The WHOLE model rotates with IMU yaw → front wheels also steer.
-        # "North" (map-up) is the +Y axis of this axes.
-        ax = self._ax_car
-        ax.set_facecolor("#080810")
-        ax.set_xlim(-1.1, 1.1);  ax.set_ylim(-1.2, 1.2)
-        ax.set_aspect("equal");  ax.axis("off")
-
-        # Compass ring + cardinal letters (static, world frame)
-        ax.add_patch(plt.Circle((0, 0), 1.05, color="#1A1A28",
-                                fill=True, zorder=1))
-        ax.add_patch(plt.Circle((0, 0), 1.05, color="#3A3A4A",
-                                fill=False, lw=1.0, zorder=2))
-        _CARDS = [("N", 90, "#FF4040"), ("E", 0, "#606068"),
-                  ("S", 270, "#606068"), ("W", 180, "#606068")]
-        for lbl, deg, col in _CARDS:
-            r = math.radians(deg)
-            ax.text(0.88*math.cos(r), 0.88*math.sin(r), lbl,
-                    color=col, ha="center", va="center",
-                    fontsize=6, fontweight="bold", zorder=3)
-
-        # Heading arc ticks every 30°
-        for deg in range(0, 360, 30):
-            r = math.radians(deg)
-            is_card = (deg % 90 == 0)
-            ax.plot([0.93*math.cos(r), 1.02*math.cos(r)],
-                    [0.93*math.sin(r), 1.02*math.sin(r)],
-                    color="#303040" if not is_card else "#504050",
-                    lw=1.0 if is_card else 0.5, zorder=2)
-
-        # Ground shadow under car (static circle, for depth)
-        ax.add_patch(plt.Circle((0, 0), 0.38, color="#111118",
-                                fill=True, zorder=3))
-
-        # ── Pre-create all car body patches ───────────────────────────────────
-        # All patches live in data coords; we update set_xy() every frame.
-        # Car geometry (local frame, +Y = forward = car nose):
-        #   body:       rect  W=0.52  L=0.76  (display units, ~0.23m scale)
-        #   windshield: rect  top third of body, cyan tint
-        #   bonnet line: separator stripe
-        #   4 wheels:   small rects at corners; front pair rotate with steer
-        _car_col     = "#1E3A5A"     # body blue
-        _wind_col    = "#0A5A60"     # windshield teal
-        _stripe_col  = "#0A2030"     # bonnet divider
-        _whl_col     = "#CCCCCC"     # wheel light grey
-        _whl_rim_col = "#888888"     # wheel rim
-
-        dummy4 = np.zeros((4, 2))
-
-        # Body
-        self._cp_body  = mpatches.Polygon(dummy4, closed=True,
-                                          fc=_car_col, ec="#4A8AAA", lw=1.0, zorder=5)
-        ax.add_patch(self._cp_body)
-        # Windshield
-        self._cp_wind  = mpatches.Polygon(dummy4, closed=True,
-                                          fc=_wind_col, ec="#0AFFFF", lw=0.5, zorder=6)
-        ax.add_patch(self._cp_wind)
-        # Bonnet stripe
-        self._cp_hood  = mpatches.Polygon(np.zeros((4,2)), closed=True,
-                                          fc=_stripe_col, ec="none", zorder=6)
-        ax.add_patch(self._cp_hood)
-        # 4 wheels (FL, FR, RL, RR)
-        self._cp_wheels = []
-        for _ in range(4):
-            p = mpatches.Polygon(dummy4, closed=True,
-                                 fc=_whl_col, ec="#404040", lw=0.4, zorder=7)
-            ax.add_patch(p)
-            self._cp_wheels.append(p)
-        # Wheel rim dots (one per wheel for detail) — drawn as small circles via scatter
-        self._wheel_rim_sc = ax.scatter([], [], s=6, c=_whl_rim_col,
-                                        zorder=8, edgecolors="none")
-
-        # Forward velocity arrow (shows how fast / which direction)
-        self._car_vel_arrow, = ax.plot([], [], color=self.CYAN,
-                                       lw=1.5, solid_capstyle="round",
-                                       zorder=8, alpha=0.85)
-        # Heading text
-        self._car_hdg_txt = ax.text(0, -1.10, "HDG  0.0°", color=self.CYAN,
-                                    ha="center", va="center",
-                                    fontsize=6.5, fontfamily="monospace", zorder=9)
-        ax.set_title("CAR MODEL  (IMU)", color=self.MUTED, fontsize=6, pad=2)
-
-        # Store geometry constants used in update
-        # Scale: 1 display-unit ≈ 0.115 m  → scale=3.5 gives 0.23m wb = 0.8 du
-        self._CAR_SCALE   = 3.5
-        self._CAR_BW      = 0.115   # half-body-width  m
-        self._CAR_BL      = 0.115   # half-body-length m
-        self._CAR_WHL_W   = 0.032   # wheel half-width  m
-        self._CAR_WHL_L   = 0.055   # wheel half-length m
-        self._CAR_FRONT_Y = 0.085   # front axle offset m
-        self._CAR_REAR_Y  = -0.085  # rear axle offset  m
-        self._CAR_TRACK   = 0.072   # half track width  m
-
-        # ── Speedometer arc ──────────────────────────────────────────────────
-        ax2 = self._ax_speed
-        ax2.set_facecolor("#0E0E14")
-        ax2.set_xlim(-1.3, 1.3);  ax2.set_ylim(-0.55, 1.25)
-        ax2.set_aspect("equal");   ax2.axis("off")
-
-        _SPEED_MAX = 1.0
-        _ARC_START = 225
-        _ARC_END   = -45
-        self._speed_max  = _SPEED_MAX
-        self._arc_start  = _ARC_START
-        self._arc_end    = _ARC_END
-
-        from matplotlib.patches import Arc as _Arc
-        ax2.add_patch(_Arc((0,0), 2.0, 2.0, angle=0,
-                           theta1=_ARC_END, theta2=_ARC_START,
-                           color="#2A2A38", lw=10, zorder=1))
-        def _arc_seg(v0, v1, col):
-            def _v2t(v):
-                return _ARC_START - min(max(v/_SPEED_MAX,0),1)*(_ARC_START-_ARC_END)
-            ax2.add_patch(_Arc((0,0), 2.0, 2.0, angle=0,
-                               theta1=_v2t(v1), theta2=_v2t(v0),
-                               color=col, lw=9, zorder=2))
-        _arc_seg(0.0,  0.5,  "#1A6A1A")
-        _arc_seg(0.5,  0.8,  "#8A5A00")
-        _arc_seg(0.8,  1.01, "#8A1A1A")
-        for v_tick in [0, 0.25, 0.5, 0.75, 1.0]:
-            frac = v_tick / _SPEED_MAX
-            theta = math.radians(_ARC_START - frac*(_ARC_START-_ARC_END))
-            ax2.plot([0.82*math.cos(theta), 1.02*math.cos(theta)],
-                     [0.82*math.sin(theta), 1.02*math.sin(theta)],
-                     color="#606070", lw=1.2, zorder=3)
-            ax2.text(0.66*math.cos(theta), 0.66*math.sin(theta),
-                     f"{v_tick:.2g}", color="#808090",
-                     ha="center", va="center", fontsize=5.5, zorder=4)
-        self._speed_needle, = ax2.plot([0, 0], [0, 0], color=self.AMBER,
-                                       lw=2.5, solid_capstyle="round", zorder=5)
-        ax2.add_patch(plt.Circle((0, 0), 0.07, color=self.AMBER, zorder=6))
-        self._speed_txt = ax2.text(0, -0.42, "0.000 m/s", color=self.AMBER,
-                                   ha="center", va="center",
-                                   fontsize=7, fontfamily="monospace", zorder=6)
-        ax2.set_title("SPEED", color=self.MUTED, fontsize=6, pad=2)
-
-        self._imu_canvas = FigureCanvasTkAgg(self._imu_fig, master=pnl_stat)
-        self._imu_canvas.get_tk_widget().pack(pady=2)
-
-        # ── Camera Confidence Indicators (replaces IMU calib LEDs) ──────────
-        frm_leds = tk.Frame(pnl_stat, bg=self.PANEL_BG)
-        frm_leds.pack(pady=(0, 4))
-        self._calib_leds = []
-        _LED_NAMES = ["L-LANE", "R-LANE", "MEAN", "BEV-CAL"]
-        for name in _LED_NAMES:
-            cell = tk.Frame(frm_leds, bg=self.PANEL_BG)
-            cell.pack(side=tk.LEFT, padx=6)
-            tk.Label(cell, text=name, font=("Courier", 7),
-                     fg=self.MUTED, bg=self.PANEL_BG).pack()
-            led = tk.Label(cell, text="\u25cf", font=("Courier", 12),
-                           fg="#1A1A2A", bg=self.PANEL_BG)
-            led.pack()
-            self._calib_leds.append(led)
-
-        # ── Compact numeric readouts ─────────────────────────────────────────
-        self.lbl_speed = tk.Label(pnl_stat, text="PWM: 0.0 %",
-                                  font=("Courier", 11), fg=self.CYAN, bg=self.PANEL_BG)
-        self.lbl_speed.pack(pady=1)
-
-        self.lbl_steer = tk.Label(pnl_stat, text="Steer: 0.0°",
-                                  font=("Courier", 11), fg=self.YELLOW, bg=self.PANEL_BG)
-        self.lbl_steer.pack(pady=1)
-
-        self.lbl_pose = tk.Label(pnl_stat, text="Pose: x=0.00  y=0.00  ψ=0°",
-                                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_pose.pack(pady=2)
-
-        self.lbl_anchor = tk.Label(pnl_stat, text="Anchor: —",
-                                   font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_anchor.pack(pady=1)
-
-        self.lbl_node = tk.Label(pnl_stat, text="Nearest Node: —",
-                                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_node.pack(pady=1)
-
-        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=6)
-
-        # Calibration countdown
-        self.lbl_calib = tk.Label(pnl_stat, text="CALIBRATING\n6.0 s",
-                                  font=("Courier", 18, "bold"),
-                                  fg=self.RED_C, bg=self.PANEL_BG)
-        self.lbl_calib.pack(pady=6)
-
-        # FPS
-        self.lbl_fps = tk.Label(pnl_stat, text="FPS: —",
-                                font=("Courier", 10), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_fps.pack(pady=2)
-
-        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=8)
-
-        # Steering graph
-        tk.Label(pnl_stat, text="STEERING HISTORY", font=("Courier", 9),
-                 fg=self.MUTED, bg=self.PANEL_BG).pack()
-
-        self.fig_steer, self.ax_steer = plt.subplots(figsize=(2.8, 1.4),
-                                                      facecolor=self.PANEL_BG)
-        self.ax_steer.set_facecolor(self.PANEL_BG)
-        self.ax_steer.axhline(0, color="#404048", lw=0.8)
-        self.ax_steer.set_ylim(-45, 45)
-        self.ax_steer.set_xlim(0, 120)
-        self.ax_steer.tick_params(colors=self.MUTED, labelsize=7)
-        self.ax_steer.spines[:].set_color("#303038")
-        self._steer_line, = self.ax_steer.plot([], [], color=self.CYAN, lw=1.5)
-        self.fig_steer.tight_layout(pad=0.3)
-
-        self.canvas_steer = FigureCanvasTkAgg(self.fig_steer, master=pnl_stat)
-        self.canvas_steer.get_tk_widget().pack(pady=4)
-
-        tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=6)
-
-        # Control buttons
-        self.btn_estop = tk.Button(pnl_stat, text="⛔  E-STOP",
-                              font=("Courier", 13, "bold"),
-                              bg=self.RED_C, fg="white", activebackground="#A01010",
-                              command=self._trigger_estop)
-        self.btn_estop.pack(fill=tk.X, padx=16, pady=4)
-
-        self.btn_pause = tk.Button(pnl_stat, text="⏸  PAUSE",
-                                   font=("Courier", 11, "bold"),
-                                   bg="#2A2A2E", fg=self.WHITE,
-                                   command=self._toggle_pause)
-        self.btn_pause.pack(fill=tk.X, padx=16, pady=4)
-
-        btn_reroute = tk.Button(pnl_stat, text="🗺  RE-ROUTE",
-                                font=("Courier", 11, "bold"),
-                                bg="#2A2A2E", fg=self.CYAN,
-                                command=self._reroute_dialog)
-        btn_reroute.pack(fill=tk.X, padx=16, pady=4)
-
-        btn_locate = tk.Button(pnl_stat, text="📍  RE-LOCALIZE",
-                               font=("Courier", 11, "bold"),
-                               bg="#2A2A2E", fg=self.AMBER,
-                               command=self._relocalize_dialog)
-        btn_locate.pack(fill=tk.X, padx=16, pady=4)
-
-        # ── CENTRE panel: Map ────────────────────────────────────────────────
-        pnl_map = tk.Frame(root, bg=self.PANEL_BG)
-        pnl_map.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=8)
-
-        tk.Label(pnl_map, text="COMPETITION TRACK MAP",
-                 font=("Courier", 10), fg=self.MUTED,
-                 bg=self.PANEL_BG).pack(pady=(8, 2))
-
-        # Map figure — sized to fill available space
-        self.fig_map, self.ax_map = plt.subplots(figsize=(9, 7),
-                                                  facecolor=self.PANEL_BG)
-        self.ax_map.set_facecolor("#0C0C0C")
-        self.canvas_map = FigureCanvasTkAgg(self.fig_map, master=pnl_map)
-        self.canvas_map.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-        self.canvas_map.mpl_connect("button_press_event", self._on_map_click)
-
-        self._draw_static_map()
-
-        # Waypoint readout
-        self.lbl_wp = tk.Label(pnl_map, text="Next waypoints: —",
-                               font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_wp.pack(pady=2)
-
-        # ── RIGHT panel: Camera + BEV ─────────────────────────────────────────
-        pnl_cam = tk.Frame(root, bg=self.PANEL_BG, width=480)
-        pnl_cam.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 8), pady=8)
-        pnl_cam.pack_propagate(False)
-
-        tk.Label(pnl_cam, text="YOLO CAMERA FEED",
-                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(10, 2))
-
-        # YOLO model status line — shows path or "NO MODEL" warning
-        yolo_status = "NO MODEL — traffic detection disabled"
-        yolo_status_col = self.RED_C
-        if hasattr(self.orch, 'yolo_worker') and self.orch.yolo_worker.yolo_ok:
-            yolo_status = f"✓ {self.orch.yolo_worker.model_path_used}"
-            yolo_status_col = self.GREEN_C
-        self.lbl_yolo_status = tk.Label(pnl_cam, text=yolo_status,
-                                        font=("Courier", 8), fg=yolo_status_col,
-                                        bg=self.PANEL_BG, wraplength=440)
-        self.lbl_yolo_status.pack(pady=(0, 2))
-
-        self.lbl_yolo = tk.Label(pnl_cam, bg="black")
-        self.lbl_yolo.pack(pady=2)
-
-        tk.Label(pnl_cam, text="BEV LANE TRACKER",
-                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(8, 2))
-        self.lbl_bev = tk.Label(pnl_cam, bg="black")
-        self.lbl_bev.pack(pady=2)
-
-        # ── 3-D Dead-Reckoning Visualiser ─────────────────────────────────────
-        # Shows car body (Poly3DCollection), fading yellow trajectory trail,
-        # floor grid, and live data overlays — all from fused IMU + encoder data.
-        tk.Label(pnl_cam, text="DEAD-RECKONING  (CAMERA + ENCODER)",
-                 font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(6, 0))
-
-        self._dr_fig = plt.figure(figsize=(4.5, 2.6), facecolor=self.PANEL_BG)
-        self._ax3d = self._dr_fig.add_subplot(111, projection="3d")
-        ax3 = self._ax3d
-
-        # ── Floor grid (static — drawn once) ─────────────────────────────────
-        GRID_R  = 2.0          # metres around car
-        GRID_N  = 9            # number of lines each direction
-        _gc     = "#1C1C28"    # grid line colour
-        _ticks  = np.linspace(-GRID_R, GRID_R, GRID_N)
-        for v in _ticks:
-            ax3.plot([v, v],  [-GRID_R, GRID_R], [0, 0], color=_gc, lw=0.5, zorder=1)
-            ax3.plot([-GRID_R, GRID_R], [v, v],  [0, 0], color=_gc, lw=0.5, zorder=1)
-
-        # Floor fill (very dark rectangle so grid pops)
-        _fr = GRID_R
-        _floor_verts = [[ (-_fr,-_fr,0), (_fr,-_fr,0),
-                           (_fr, _fr,0), (-_fr, _fr,0) ]]
-        floor_col = Poly3DCollection(_floor_verts, facecolors=["#0A0A14"],
-                                      edgecolors="none", zorder=0, alpha=1.0)
-        ax3.add_collection3d(floor_col)
-
-        # ── Car body (Poly3DCollection — set_verts each frame) ───────────────
-        # Local frame vertices:  +X=right, +Y=forward, +Z=up.  Dimensions in metres.
-        _CL, _CW, _CH = 0.23, 0.135, 0.07   # length (front to rear), width, height
-        _CF = _CL * 0.55                     # forward half (nose heavier)
-        _CR = _CL * 0.45                     # rear half
-        # 8 corners of the car box in local frame
-        self._car3d_local = np.array([
-            [-_CW/2, -_CR, 0.0],  # 0 rear-left  bottom
-            [ _CW/2, -_CR, 0.0],  # 1 rear-right bottom
-            [ _CW/2,  _CF, 0.0],  # 2 front-right bottom
-            [-_CW/2,  _CF, 0.0],  # 3 front-left  bottom
-            [-_CW/2, -_CR, _CH],  # 4 rear-left  top
-            [ _CW/2, -_CR, _CH],  # 5 rear-right top
-            [ _CW/2,  _CF, _CH],  # 6 front-right top
-            [-_CW/2,  _CF, _CH],  # 7 front-left  top
-        ])
-        # 6 faces: bottom, top, front, rear, left, right
-        _car_faces_idx = [
-            [0,1,2,3],   # bottom
-            [4,5,6,7],   # top  (roof)
-            [3,2,6,7],   # front (nose)
-            [0,1,5,4],   # rear
-            [0,3,7,4],   # left
-            [1,2,6,5],   # right
-        ]
-        _car_face_cols = [
-            "#0A2040",   # bottom     — dark
-            "#1E5090",   # roof       — bright blue
-            "#2878C8",   # nose       — brightest (facing viewer)
-            "#0D3060",   # rear       — medium
-            "#1050A0",   # left side  — medium
-            "#1050A0",   # right side — medium
-        ]
-        # Wind-shield tint on top face
-        _wind_face_cols = list(_car_face_cols)
-
-        # Build initial faces (all at origin, updated per frame)
-        _dummy_verts = [np.zeros((4, 3)) for _ in _car_faces_idx]
-        self._car3d_col = Poly3DCollection(
-            _dummy_verts,
-            facecolors=_car_face_cols,
-            edgecolors="#3AAFFF",
-            linewidths=0.6,
-            zorder=5,
-            zsort="average",
-        )
-        ax3.add_collection3d(self._car3d_col)
-
-        # Windshield overlay (front top edge — separate semi-transparent quad)
-        _ws_dummy = [np.zeros((4, 3))]
-        self._car3d_ws = Poly3DCollection(_ws_dummy,
-                                           facecolors=["#00CCDD"],
-                                           edgecolors="#00FFFF",
-                                           linewidths=0.5,
-                                           alpha=0.55, zorder=6)
-        ax3.add_collection3d(self._car3d_ws)
-
-        # Heading arrow (nose direction)
-        self._dr_arrow, = ax3.plot([], [], [], color=self.CYAN,
-                                    lw=2.0, solid_capstyle="round", zorder=7)
-
-        # ── Trail (fading yellow line — last 400 world positions) ─────────────
-        from collections import deque
-        self._dr_trail_x = deque(maxlen=400)
-        self._dr_trail_y = deque(maxlen=400)
-        self._dr_trail_line, = ax3.plot([], [], [], color=self.AMBER,
-                                         lw=1.8, alpha=0.85, zorder=4)
-
-        # ── Data overlay text (top-left of axes) ─────────────────────────────
-        _tof = dict(fontfamily="monospace", fontsize=6.5, color=self.CYAN,
-                    transform=ax3.transAxes, zorder=10)
-        self._dr_txt_yaw = ax3.text2D(0.02, 0.95, "YAW   0.0°", **_tof)
-        self._dr_txt_x   = ax3.text2D(0.02, 0.85, "X   0.000 m", **_tof)
-        self._dr_txt_y   = ax3.text2D(0.02, 0.75, "Y   0.000 m", **_tof)
-        self._dr_txt_spd = ax3.text2D(0.02, 0.65, "V   0.000 m/s",
-                                       color=self.AMBER, fontfamily="monospace",
-                                       fontsize=6.5, transform=ax3.transAxes, zorder=10)
-        self._dr_txt_nav = ax3.text2D(0.50, 0.95, "NAV  —",
-                                       color=self.YELLOW, fontfamily="monospace",
-                                       fontsize=6.5, transform=ax3.transAxes,
-                                       ha="center", zorder=10)
-
-        # ── Axes cosmetics ────────────────────────────────────────────────────
-        ax3.set_facecolor("#080810")
-        self._dr_fig.patch.set_facecolor(self.PANEL_BG)
-        ax3.xaxis.pane.fill = False;  ax3.yaxis.pane.fill = False;  ax3.zaxis.pane.fill = False
-        ax3.xaxis.pane.set_edgecolor("#1A1A28")
-        ax3.yaxis.pane.set_edgecolor("#1A1A28")
-        ax3.zaxis.pane.set_edgecolor("#1A1A28")
-        ax3.tick_params(colors=self.MUTED, labelsize=5.5)
-        ax3.set_xlabel("X (m)", color=self.MUTED, fontsize=5.5, labelpad=1)
-        ax3.set_ylabel("Y (m)", color=self.MUTED, fontsize=5.5, labelpad=1)
-        ax3.set_zlabel("Z",     color=self.MUTED, fontsize=5.5, labelpad=1)
-        ax3.set_zlim(0, 0.25)
-        ax3.view_init(elev=28, azim=-55)  # slight isometric elevation
-
-        self._dr_canvas = FigureCanvasTkAgg(self._dr_fig, master=pnl_cam)
-        self._dr_canvas.get_tk_widget().pack(pady=2, padx=4)
-
-        # ── Traffic / NAV compact labels below the 3D view ───────────────────
-        frm_nav = tk.Frame(pnl_cam, bg=self.PANEL_BG)
-        frm_nav.pack(fill=tk.X, padx=8, pady=1)
-        self.lbl_nav = tk.Label(frm_nav, text="NAV: —",
-                                font=("Courier", 10, "bold"),
-                                fg=self.CYAN, bg=self.PANEL_BG)
-        self.lbl_nav.pack(side=tk.LEFT, padx=6)
-        self.lbl_light = tk.Label(frm_nav, text="LIGHT: NONE",
-                                  font=("Courier", 10),
-                                  fg=self.MUTED, bg=self.PANEL_BG)
-        self.lbl_light.pack(side=tk.LEFT, padx=6)
-
-        self.lbl_labels = tk.Label(pnl_cam, text="Detections: —",
-                                   font=("Courier", 8),
-                                   fg=self.MUTED, bg=self.PANEL_BG,
-                                   wraplength=440, justify=tk.LEFT)
-        self.lbl_labels.pack(pady=1, padx=8)
-
-        # Store face indices and car geometry for the update method
-        self._car3d_faces_idx = _car_faces_idx
-        self._GRID_R = GRID_R
-
-        # ── Schedule GUI update loop ───────────────────────────────────────────
-        self.root.after(33, self._update_gui)
-
-    # ── Draw static map elements (once at startup) ─────────────────────────────
-    def _draw_static_map(self):
-        self._sign_artists = draw_rich_map(self.ax_map, self.orch.planner, BFMC_SIGNS)
-        
-        # Cache limits for potential runtime viewport resets
-        pos = self.orch.planner.node_positions
-        xs = [p[0] for p in pos.values()]
-        ys = [p[1] for p in pos.values()]
-        pad = 1.0
-        self._map_xlim = (min(xs) - pad, max(xs) + pad)
-        self._map_ylim = (min(ys) - pad, max(ys) + pad)
-
-        # Initialise dynamic artists (car dot, route overlay)
-        # 2.11 Car polygon
-        self._car_poly = mpatches.Polygon(np.zeros((5, 2)), closed=True, color=self.YELLOW, zorder=12)
-        self.ax_map.add_patch(self._car_poly)
-        
-        self._ghost_x = []
-        self._ghost_y = []
-        self._ghost_scatter = self.ax_map.scatter([], [], c=[], s=8, zorder=9, edgecolors='none')
-        
-        # Heading arrow patch
-        self._heading_patch = FancyArrow(0, 0, 0, 0, width=0.1, color=self.YELLOW, zorder=13)
-        self.ax_map.add_patch(self._heading_patch)
-
-        # 2.10 Glowing route line
-        self._route_outer, = self.ax_map.plot([], [], color="#00FFFF", lw=6, zorder=6, alpha=0.2)
-        self._route_mid, = self.ax_map.plot([], [], color="#00FFFF", lw=3, zorder=7, alpha=0.5)
-        self._route_inner, = self.ax_map.plot([], [], color="#FFFFFF", lw=1.5, zorder=8, alpha=0.9)
-        self._route_done, = self.ax_map.plot([], [], color="#404048", lw=3, zorder=9, alpha=0.8)
-
-        self._la_dot, = self.ax_map.plot([], [], "o", color="#FF00FF",
-                                ms=6, zorder=10, alpha=0.8)
-
-        # 2.9 Start / target markers
-        self._start_flag = self.ax_map.text(0, 0, "", color="#00FF80", fontsize=18, ha="center", va="bottom", zorder=14)
-        self._start_pulse = mpatches.Circle((0, 0), 0.2, color="#00FF80", fill=False, lw=1.5, zorder=11, alpha=0.8)
-        self._start_pulse.set_visible(False)
-        self.ax_map.add_patch(self._start_pulse)
-        self._pulse_phase = 0.0
-
-        self._target_flag = self.ax_map.text(0, 0, "", color="#FF4040", fontsize=18, ha="center", va="bottom", zorder=14)
-        self._target_ring = mpatches.Circle((0, 0), 0.3, color="#FF4040", fill=False, lw=1.5, ls="--", zorder=11)
-        self._target_ring.set_visible(False)
-        self.ax_map.add_patch(self._target_ring)
-
-        self._hint_line, = self.ax_map.plot([], [], color="#00FFFF", lw=1.0, ls="--", alpha=0.5, zorder=5)
-
-        self.fig_map.tight_layout(pad=0.4)
-        self.canvas_map.draw()
-
-    def draw_route_on_map(self, path, start_node, target_node):
-        """Called once after A* is computed. Draws the planned route."""
-        pos = self.orch.planner.node_positions
-        if path:
-            rx = [pos[n][0] for n in path if n in pos]
-            ry = [pos[n][1] for n in path if n in pos]
-            self._route_outer.set_data(rx, ry)
-            self._route_mid.set_data(rx, ry)
-            self._route_inner.set_data(rx, ry)
-            self._route_done.set_data(rx[:1], ry[:1])
-
-        sp, tp = None, None
-        if start_node and start_node in pos:
-            sp = pos[start_node]
-            self._start_flag.set_position((sp[0], sp[1]))
-            self._start_flag.set_text("⚑")
-            self._start_pulse.center = (sp[0], sp[1])
-            self._start_pulse.set_visible(True)
-
-        if target_node and target_node in pos:
-            tp = pos[target_node]
-            self._target_flag.set_position((tp[0], tp[1]))
-            self._target_flag.set_text("⚑")
-            self._target_ring.center = (tp[0], tp[1])
-            self._target_ring.set_visible(True)
-
-        if sp and tp:
-            self._hint_line.set_data([sp[0], tp[0]], [sp[1], tp[1]])
-
-        self.canvas_map.draw_idle()
-
-    # ── GUI update loop (33 ms = ~30 Hz) ──────────────────────────────────────
-    def _update_gui(self):
+        if self.imu.is_connected:
+            self.imu.stop()
+        if self._threaded_yolo:
+            self._threaded_yolo.stop()
+        self.hw.close()
+        if hasattr(self, '_root'):
+            self._root.destroy()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # GUI refresh  (main thread, 30 Hz)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _gui_update(self):
         try:
-            telem = self.telem_q.get_nowait()
-            self._apply_telemetry(telem)
-        except queue.Empty:
-            pass
-        self.root.after(33, self._update_gui)
+            # ── SVG map with car dot ──────────────────────────────────────────
+            map_img = self._svg_base.copy()
+            if self.localizer.is_initialized():
+                x, y, yaw = self.localizer.get_pose()
+                px, py = map_to_pixel(x, y, self.MAP_W, self.MAP_H)
+                # Car dot
+                cv2.circle(map_img, (px, py), 8,  (0, 230, 255), -1, cv2.LINE_AA)
+                cv2.circle(map_img, (px, py), 12, (0, 230, 255, 80), 1, cv2.LINE_AA)
+                # Heading arrow
+                hx = px + int(math.cos(yaw) * 18)
+                hy = py + int(math.sin(yaw) * 18)
+                cv2.arrowedLine(map_img, (px, py), (hx, hy),
+                                (255, 255, 255), 2, tipLength=0.35,
+                                line_type=cv2.LINE_AA)
+                # Pose text
+                self._sv_pose.set(f"x={x:.1f}m y={y:.1f}m yaw={math.degrees(yaw):.0f}°")
 
-    def _apply_telemetry(self, t: dict):
-        speed   = t.get("speed", 0.0)
-        steer   = t.get("steer", 0.0)
-        nav_st  = t.get("nav_state", "—")
-        trf_st  = t.get("traffic", "SYS_GO")
-        reason  = t.get("reason", "—")
-        x, y, yaw = t.get("x", 0), t.get("y", 0), t.get("yaw", 0)
-        fps     = t.get("fps", 0.0)
-        anchor  = t.get("anchor", "—")
-        nearest = t.get("nearest_node", "—")
-        calib_remain = t.get("calib_remain", -1.0)
-        light_st = t.get("light_status", "NONE")
-        act_lbl  = t.get("active_labels", [])
-        waypoints = t.get("waypoints", [])
-        yolo_frame = t.get("yolo_frame")
-        bev_frame  = t.get("bev_frame")
-        cam_heading_deg = t.get("cam_heading_deg", 0.0)
-        velocity_ms = t.get("velocity_ms", 0.0)
-        l_conf = t.get("lane_l_conf", 0.0) if "lane_l_conf" in t else 0.0
-        r_conf = t.get("lane_r_conf", 0.0) if "lane_r_conf" in t else 0.0
+            self._map_ph = ImageTk.PhotoImage(
+                Image.fromarray(cv2.cvtColor(map_img, cv2.COLOR_BGR2RGB)))
+            self._map_label.config(image=self._map_ph)
 
-        # ── Status labels ──────────────────────────────────────────────────────
-        short = trf_st.replace("SYS_", "")
-        colour = self.GREEN_C if "GO" in short else \
-                 self.RED_C   if "STOP" in short else self.AMBER
-        self.lbl_traffic.config(text=short, fg=colour)
-        self.lbl_reason.config(text=reason[:40])
-        self.lbl_speed.config(text=f"PWM: {speed:.1f} %   {velocity_ms:.3f} m/s")
-        self.lbl_steer.config(text=f"Steer: {steer:+.1f}°")
-        yaw_deg = math.degrees(yaw) if abs(yaw) < 10 else yaw
-        self.lbl_pose.config(text=f"Pose: x={x:.2f}  y={y:.2f}  ψ={yaw_deg:.1f}°")
-        self.lbl_anchor.config(text=f"Anchor: {anchor}")
-        self.lbl_node.config(text=f"Nearest Node: {nearest}")
-        self.lbl_fps.config(text=f"FPS: {fps:.1f}")
-        self.lbl_nav.config(text=f"NAV: {nav_st}")
-        lc = self.GREEN_C if "GREEN" in light_st else \
-             self.RED_C   if "RED" in light_st else self.MUTED
-        self.lbl_light.config(text=f"LIGHT: {light_st}", fg=lc)
-        lbl_str = "  ".join(act_lbl[:6]) if act_lbl else "—"
-        self.lbl_labels.config(text=f"Detections: {lbl_str}")
+            # ── YOLO frame ────────────────────────────────────────────────────
+            try:
+                yolo_img = self._q_yolo.get_nowait()
+                yolo_img = cv2.resize(yolo_img, (self.CAM_W, self.CAM_H))
+                self._yolo_ph = ImageTk.PhotoImage(
+                    Image.fromarray(cv2.cvtColor(yolo_img, cv2.COLOR_BGR2RGB)))
+                self._yolo_label.config(image=self._yolo_ph)
+            except queue.Empty:
+                pass
 
-        # ── Camera confidence instruments (car model + speed + cam LEDs) ───
-        mean_conf = (l_conf + r_conf) / 2.0
-        bev_cal   = 3 if (hasattr(self.orch, 'vision') and self.orch.vision.bev_calibrated) else 0
-        cam_led_vals = (
-            int(round(l_conf * 3)),
-            int(round(r_conf * 3)),
-            int(round(mean_conf * 3)),
-            bev_cal
-        )
-        self._update_imu_instruments(cam_heading_deg, velocity_ms, cam_led_vals, steer)
+            # ── BEV lane frame ────────────────────────────────────────────────
+            try:
+                bev_img = self._q_bev.get_nowait()
+                bev_img = cv2.resize(bev_img, (480, 360))
+                self._bev_ph = ImageTk.PhotoImage(
+                    Image.fromarray(cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)))
+                self._bev_label.config(image=self._bev_ph)
+            except queue.Empty:
+                pass
 
-        # ── Nav mode label ──────────────────────────────────────────────
-        nav_mode_t = t.get("nav_mode", "BASIC")
-        _MODE_COLORS = {
-            "BASIC":        self.CYAN,
-            "INTERSECTION": self.YELLOW,
-            "AEB":          self.RED_C,
-            "HIGHWAY":      self.GREEN_C,
-            "CALIBRATING":  self.AMBER,
-        }
-        mode_color = _MODE_COLORS.get(nav_mode_t, self.MUTED)
-        self.lbl_navmode.config(text=nav_mode_t, fg=mode_color)
+            # ── Status strings ────────────────────────────────────────────────
+            ctrl = self._last_ctrl
+            self._sv_speed.set( f"Speed: {ctrl.speed_pwm:5.1f} PWM")
+            self._sv_steer.set( f"Steer: {ctrl.steer_angle_deg:+5.1f}°")
+            self._sv_anchor.set(f"Anchor: {ctrl.anchor}")
+            self._sv_nav.set(   f"Nav: {self._nav_state}")
+            self._sv_fps.set(   f"FPS: {self._fps:.1f}")
 
-        # ── 3D Dead-Reckoning visualiser ──────────────────────────────────────
-        self._update_dr_view(x, y, cam_heading_deg, velocity_ms, nav_st)
-
-        # Calibration overlay
-        if calib_remain > 0:
-            self.lbl_calib.config(
-                text=f"CALIBRATING\n{calib_remain:.1f} s", fg=self.RED_C
-            )
-        else:
-            self.lbl_calib.config(text="RUNNING ✓", fg=self.GREEN_C)
-
-        # Waypoints readout
-        if waypoints:
-            wp_str = "  ".join([f"({w[0]:.1f},{w[1]:.1f})" for w in waypoints[:4]])
-            self.lbl_wp.config(text=f"→ {wp_str}")
-
-        # ── YOLO Camera + BEV image feeds ────────────────────────────────────────────
-        cam_frame = t.get("camera_frame")
-        bev_frame2 = t.get("bev_frame")
-
-        # Top camera panel: show YOLO annotated frame if available, else raw camera
-        cam_src = yolo_frame if (yolo_frame is not None and isinstance(yolo_frame, np.ndarray)) else cam_frame
-        self._photo_yolo = self._cv2tk(cam_src, 420, 240)
-        if self._photo_yolo:
-            self.lbl_yolo.config(image=self._photo_yolo)
-
-        # BEV lane debug (colourised sliding-window / poly-track image)
-        self._photo_bev = self._cv2tk(bev_frame2, 420, 240)
-        if self._photo_bev:
-            self.lbl_bev.config(image=self._photo_bev)
-        self._steer_hist.append(steer)
-        if len(self._steer_hist) > 120:
-            self._steer_hist.pop(0)
-        xs_h = list(range(len(self._steer_hist)))
-        self._steer_line.set_data(xs_h, self._steer_hist)
-        self.ax_steer.set_xlim(0, max(120, len(self._steer_hist)))
-        self.canvas_steer.draw_idle()
-
-        # ── Map: car poly + heading arrow + ghost trail ────────────────────────
-        short_state = trf_st.replace("SYS_", "")
-        car_color = self.GREEN_C if "GO" in short_state else self.RED_C if "STOP" in short_state else self.AMBER
-        self._car_poly.set_facecolor(car_color)
-        
-        yaw_r = yaw if abs(yaw) < 10 else math.radians(yaw)
-        L, W = 0.28, 0.14
-        pts_local = np.array([[L/2, 0], [L/4, W/2], [-L/2, W/2], [-L/2, -W/2], [L/4, -W/2]])
-        c_rot, s_rot = math.cos(yaw_r), math.sin(yaw_r)
-        R_mat = np.array([[c_rot, -s_rot], [s_rot, c_rot]])
-        pts_global = np.dot(pts_local, R_mat.T) + np.array([x, y])
-        self._car_poly.set_xy(pts_global)
-
-        # Update heading arrow
-        arr_dx = 0.35 * math.cos(yaw_r)
-        arr_dy = 0.35 * math.sin(yaw_r)
-        self._heading_patch.set_data(x=x, y=y, dx=arr_dx, dy=-arr_dy)
-
-        # Ghost trail
-        self._ghost_x.append(x)
-        self._ghost_y.append(y)
-        if len(self._ghost_x) > 30:
-            self._ghost_x.pop(0)
-            self._ghost_y.pop(0)
-        colors = np.zeros((len(self._ghost_x), 4))
-        for i in range(len(self._ghost_x)):
-            alpha = 0.6 * (i / 30.0)
-            colors[i] = (1.0, 1.0, 0.0, alpha)
-        self._ghost_scatter.set_offsets(np.c_[self._ghost_x, self._ghost_y])
-        self._ghost_scatter.set_facecolors(colors)
-
-        # 2.9 Pulse effect
-        self._pulse_phase += 0.2
-        self._start_pulse.set_radius(0.2 + 0.1 * math.sin(self._pulse_phase))
-
-        # 2.10 Route done (grey out path)
-        rx = self._route_outer.get_xdata()
-        ry = self._route_outer.get_ydata()
-        if len(rx) > 0 and nearest in self.orch.planner.node_positions:
-            px, py = self.orch.planner.node_positions[nearest]
-            for idx, (px_r, py_r) in enumerate(zip(rx, ry)):
-                if abs(px - px_r) < 0.05 and abs(py - py_r) < 0.05:
-                    self._route_done.set_data(rx[:idx+1], ry[:idx+1])
-                    break
-
-        # Lookahead dot (first waypoint)
-        if waypoints:
-            wx, wy = waypoints[0]
-            self._la_dot.set_data([wx], [wy])
-        else:
-            self._la_dot.set_data([], [])
-
-        self.canvas_map.draw_idle()
-
-        # ── Camera feeds ────────────────────────────────────────────────────────
-        # Always render — _cv2tk shows "NO FEED" placeholder when frame is None
-        self._yolo_img = self._cv2tk(yolo_frame, 460, 280)
-        self.lbl_yolo.config(image=self._yolo_img)
-
-        self._bev_img = self._cv2tk(bev_frame, 460, 240)
-        self.lbl_bev.config(image=self._bev_img)
-
-    def _update_dr_view(self, x, y, yaw_deg, velocity_ms, nav_state):
-        """
-        Updates the 3D dead-reckoning visualiser each frame.
-
-        The scene is WORLD-CENTRED on the car's current position — the car body
-        stays centred, the grid and trail scroll behind it.  This way you always
-        see the immediate surroundings regardless of total displacement.
-
-        Car local frame:
-            +Y = forward (nose)   +X = right   +Z = up
-        World rotation: yaw_deg (CCW from East, standard math convention).
-        """
-        ax3 = self._ax3d
-
-        # ── Trail: append world position ──────────────────────────────────────
-        self._dr_trail_x.append(x)
-        self._dr_trail_y.append(y)
-
-        # Convert trail to car-relative coordinates (scroll the world)
-        tx = np.array(self._dr_trail_x) - x
-        ty = np.array(self._dr_trail_y) - y
-        tz = np.zeros(len(tx))
-        self._dr_trail_line.set_data_3d(tx, ty, tz)
-
-        # Fade alpha: oldest point transparent, newest opaque
-        # (matplotlib Line3D doesn't support per-vertex alpha, so we control
-        #  global alpha and colour only — gradient is handled by trail length)
-        n = len(tx)
-        self._dr_trail_line.set_alpha(0.9 if n > 5 else 0.3)
-
-        # ── Car body: rotate local vertices by yaw, translate to (0,0,0) ─────
-        def _Rz(deg):
-            r = math.radians(deg)
-            c, s = math.cos(r), math.sin(r)
-            return np.array([[c, -s, 0],
-                             [s,  c, 0],
-                             [0,  0, 1]])
-
-        R      = _Rz(yaw_deg)
-        verts  = self._car3d_local @ R.T   # rotate all 8 corners
-        # Build face vertex arrays
-        faces  = [verts[idx] for idx in self._car3d_faces_idx]
-        self._car3d_col.set_verts(faces)
-
-        # Windshield: top-front edge quad (slightly inset)
-        _CW = self._car3d_local[1, 0] * 2  # width from stored verts
-        ws_local = np.array([
-            [-_CW*0.38,  self._car3d_local[2, 1], self._car3d_local[6, 2]],
-            [ _CW*0.38,  self._car3d_local[2, 1], self._car3d_local[6, 2]],
-            [ _CW*0.38,  self._car3d_local[2, 1] * 0.55, self._car3d_local[6, 2]],
-            [-_CW*0.38,  self._car3d_local[2, 1] * 0.55, self._car3d_local[6, 2]],
-        ])
-        ws_world = ws_local @ R.T
-        self._car3d_ws.set_verts([ws_world])
-
-        # ── Heading arrow (nose direction, length ∝ speed) ───────────────────
-        arrow_len = max(0.05, min(velocity_ms * 0.5, 0.5))
-        nose_local = np.array([[0, self._car3d_local[2, 1], self._car3d_local[6, 2] * 0.5]])
-        tip_local  = np.array([[0, self._car3d_local[2, 1] + arrow_len, self._car3d_local[6, 2] * 0.5]])
-        nose_w = (nose_local @ R.T)[0]
-        tip_w  = (tip_local  @ R.T)[0]
-        self._dr_arrow.set_data_3d([nose_w[0], tip_w[0]],
-                                    [nose_w[1], tip_w[1]],
-                                    [nose_w[2], tip_w[2]])
-
-        # ── Axis limits (car-centred, fixed window) ───────────────────────────
-        gr = self._GRID_R
-        ax3.set_xlim(-gr, gr)
-        ax3.set_ylim(-gr, gr)
-
-        # ── Data overlays ─────────────────────────────────────────────────────
-        card = ["E","NE","N","NW","W","SW","S","SE"][
-            int(((90 - yaw_deg) % 360 + 22.5) / 45) % 8]
-        self._dr_txt_yaw.set_text(f"YAW  {yaw_deg % 360:6.1f}°  {card}")
-        self._dr_txt_x.set_text(  f"X    {x:+8.3f} m")
-        self._dr_txt_y.set_text(  f"Y    {y:+8.3f} m")
-        self._dr_txt_spd.set_text(f"V    {velocity_ms:.3f} m/s")
-        self._dr_txt_nav.set_text(nav_state)
-
-        # Nav state colour
-        _nav_col = (self.GREEN_C if nav_state == "DRIVING"
-                    else self.RED_C if "STOP" in nav_state or "ESTOP" in nav_state
-                    else self.AMBER if "SLOW" in nav_state or "CALIB" in nav_state
-                    else self.CYAN)
-        self._dr_txt_nav.set_color(_nav_col)
-
-        self._dr_canvas.draw_idle()
-
-    def _update_imu_instruments(self, yaw_deg, velocity_ms, cam_conf_vals, steer_deg=0.0):
-        """
-        Redraws the top-down car model and speedometer each frame.
-
-        Car geometry (local frame, before world rotation):
-          +Y  = car forward (nose)
-          +X  = car right
-          Origin = car centre
-
-        The whole car group is then rotated by imu_yaw_deg so it faces the
-        correct direction in the world frame (North = +Y in axes coords).
-
-        Front wheels are steered by steer_deg ON TOP of the world rotation.
-        """
-
-        # ── Helper: rotate a list of (x,y) points around origin ──────────────
-        def _rot(pts, angle_deg):
-            r = math.radians(angle_deg)
-            c, s = math.cos(r), math.sin(r)
-            return [(c*x - s*y, s*x + c*y) for x, y in pts]
-
-        # ── Helper: rect of half-width hw, half-length hl, centred at (cx,cy) ─
-        def _rect(cx, cy, hw, hl):
-            return [( cx-hw, cy-hl), (cx+hw, cy-hl),
-                    (cx+hw, cy+hl), (cx-hw, cy+hl)]
-
-        S   = self._CAR_SCALE          # display-unit per metre
-        BW  = self._CAR_BW  * S        # body half-width   du
-        BL  = self._CAR_BL  * S        # body half-length  du
-        WW  = self._CAR_WHL_W * S      # wheel half-width
-        WL  = self._CAR_WHL_L * S      # wheel half-length
-        FY  = self._CAR_FRONT_Y * S    # front axle Y
-        RY  = self._CAR_REAR_Y  * S    # rear axle Y
-        TR  = self._CAR_TRACK   * S    # half-track
-
-        # BNO055 yaw convention:  0° = East, CCW positive (standard math).
-        # Our axes: East = +X, North = +Y.
-        # Car forward in local frame = +Y.
-        # World rotation = yaw_deg (rotate local +Y to map heading).
-        world_yaw = yaw_deg   # degrees, CCW from East
-
-        # ── 1. Body ──────────────────────────────────────────────────────────
-        body_local = _rect(0, 0, BW, BL)
-        body_world = _rot(body_local, world_yaw)
-        self._cp_body.set_xy(np.array(body_world))
-
-        # ── 2. Windshield (top 35% of body, slightly inset) ──────────────────
-        wind_local = _rect(0, BL * 0.35, BW * 0.82, BL * 0.30)
-        wind_world = _rot(wind_local, world_yaw)
-        self._cp_wind.set_xy(np.array(wind_world))
-
-        # ── 3. Bonnet / hood divider stripe ──────────────────────────────────
-        hood_local = _rect(0, BL * 0.02, BW * 0.90, BL * 0.05)
-        hood_world = _rot(hood_local, world_yaw)
-        self._cp_hood.set_xy(np.array(hood_world))
-
-        # ── 4. Wheels ────────────────────────────────────────────────────────
-        # Rear wheels: rotated only by world yaw (they don't steer)
-        # Front wheels: rotated by world_yaw + steer_deg
-        wheel_configs = [
-            # (cx_local, cy_local, steer?)
-            (-TR,  FY, True),   # Front-Left
-            ( TR,  FY, True),   # Front-Right
-            (-TR,  RY, False),  # Rear-Left
-            ( TR,  RY, False),  # Rear-Right
-        ]
-        for i, (cx, cy, steers) in enumerate(wheel_configs):
-            whl_local = _rect(0, 0, WW, WL)
-            # rotate wheel in its own local frame
-            rot_angle = world_yaw + (steer_deg if steers else 0.0)
-            whl_world = _rot(whl_local, rot_angle)
-            # translate to axle position (also world-rotated)
-            axle = _rot([(cx, cy)], world_yaw)[0]
-            whl_final = [(p[0] + axle[0], p[1] + axle[1]) for p in whl_world]
-            self._cp_wheels[i].set_xy(np.array(whl_final))
-
-        # Wheel rim centre dots
-        rim_xs, rim_ys = [], []
-        for cx, cy, _ in wheel_configs:
-            ax_pt = _rot([(cx, cy)], world_yaw)[0]
-            rim_xs.append(ax_pt[0])
-            rim_ys.append(ax_pt[1])
-        self._wheel_rim_sc.set_offsets(np.c_[rim_xs, rim_ys])
-
-        # ── 5. Velocity arrow (forward from centre, length ∝ speed) ──────────
-        arrow_len = min(velocity_ms * 0.6, 0.55)   # max 0.55 du at 1 m/s
-        tip = _rot([(0, arrow_len)], world_yaw)[0]
-        self._car_vel_arrow.set_data([0, tip[0]], [0, tip[1]])
-        # colour by speed
-        if velocity_ms < 0.1:
-            arr_col = "#444455"
-        elif velocity_ms < 0.5:
-            arr_col = self.CYAN
-        else:
-            arr_col = self.GREEN_C
-        self._car_vel_arrow.set_color(arr_col)
-
-        # ── 6. Heading text ───────────────────────────────────────────────────
-        card = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"][
-            int(((90 - yaw_deg) % 360 + 22.5) / 45) % 8]
-        self._car_hdg_txt.set_text(f"{yaw_deg % 360:.1f}°  {card}")
-
-        # ── 7. Speedometer ────────────────────────────────────────────────────
-        frac = min(max(velocity_ms / self._speed_max, 0.0), 1.0)
-        theta_rad = math.radians(
-            self._arc_start - frac * (self._arc_start - self._arc_end))
-        self._speed_needle.set_data([0, 0.88*math.cos(theta_rad)],
-                                    [0, 0.88*math.sin(theta_rad)])
-        self._speed_txt.set_text(f"{velocity_ms:.3f} m/s")
-        s_col = self.GREEN_C if frac < 0.5 else (self.AMBER if frac < 0.8 else self.RED_C)
-        self._speed_needle.set_color(s_col)
-        self._speed_txt.set_color(s_col)
-
-        # ── 8. Calibration LEDs ───────────────────────────────────────────────
-        _LED_COLS = ["#5A1010", "#AA5500", "#AAAA00", "#00CC44"]
-        for i, val in enumerate(cam_conf_vals[:4]):
-            self._calib_leds[i].config(fg=_LED_COLS[max(0, min(3, int(val)))])
-
-        self._imu_canvas.draw_idle()
-
-    def _cv2tk(self, cv_img, w: int, h: int):
-        """Convert a cv2 BGR/BGRA frame to a Tkinter PhotoImage safely."""
-        from PIL import Image, ImageTk, ImageDraw, ImageFont
-        try:
-            if cv_img is None:
-                raise ValueError("None frame")
-
-            # Ensure we have a proper uint8 numpy array
-            if not isinstance(cv_img, np.ndarray):
-                raise ValueError("Not ndarray")
-
-            # Normalise channel count → BGR
-            if cv_img.ndim == 2:
-                cv_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
-            elif cv_img.shape[2] == 4:
-                cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGRA2BGR)
-            elif cv_img.shape[2] != 3:
-                raise ValueError(f"Unexpected channels: {cv_img.shape[2]}")
-
-            cv_img = cv2.resize(cv_img, (w, h))
-            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-
-            # If the frame is near-black (sim / no-video mode), draw a label so it
-            # doesn't look like "nothing is there"
-            mean_brightness = cv_img.mean()
-            if mean_brightness < 5.0:
-                pil_img = Image.fromarray(cv_img)
-                draw = ImageDraw.Draw(pil_img)
-                draw.rectangle([0, 0, w - 1, h - 1], outline=(50, 50, 60), width=2)
-                draw.text((w // 2, h // 2), "NO SIGNAL", fill=(80, 80, 90), anchor="mm")
-                return ImageTk.PhotoImage(pil_img)
-
-            return ImageTk.PhotoImage(Image.fromarray(cv_img))
+            imu_y, imu_r = self.imu.get_yaw_data()
+            if imu_y is not None:
+                self._sv_imu.set(
+                    f"IMU yaw={math.degrees(imu_y):.0f}° gz={math.degrees(imu_r):.1f}°/s")
+            else:
+                self._sv_imu.set("IMU: not connected")
 
         except Exception as e:
-            # Render a visible placeholder so the panel is never invisibly blank
-            img = Image.new("RGB", (w, h), (18, 18, 22))
-            draw = ImageDraw.Draw(img)
-            draw.rectangle([2, 2, w - 3, h - 3], outline=(60, 60, 75), width=1)
-            draw.text((w // 2, h // 2 - 10), "NO FEED", fill=(100, 100, 120), anchor="mm")
-            draw.text((w // 2, h // 2 + 10), str(e)[:40], fill=(60, 60, 70), anchor="mm")
-            return ImageTk.PhotoImage(img)
+            log.debug(f"GUI update error: {e}")
 
-    # ── Map click → re-localize ────────────────────────────────────────────────
-    def _on_map_click(self, event):
-        if event.xdata is None or event.ydata is None:
-            return
-        nearest = self.orch.planner.get_nearest_node(event.xdata, event.ydata)
-        if nearest:
-            pos = self.orch.planner.node_positions[nearest]
-            self.orch.localizer.set_pose(pos[0], pos[1], self.orch.localizer.yaw)
-            log.info(f"MAP CLICK → Re-localized to node {nearest} @ {pos}")
+        if hasattr(self, '_root') and self._root.winfo_exists():
+            self._root.after(33, self._gui_update)  # ~30 Hz
 
-    # ── Button callbacks ───────────────────────────────────────────────────────
-    def _trigger_estop(self):
-        estop_event.set()
-        log.critical("E-STOP triggered from dashboard")
-
-    def _toggle_pause(self):
-        if hasattr(self.orch, "_paused") and self.orch._paused:
-            self.orch._paused = False
-            self.btn_pause.config(text="⏸  PAUSE")
-        else:
-            self.orch._paused = True
-            self.btn_pause.config(text="▶  RESUME")
-
-    def _reroute_dialog(self):
-        new_target = simpledialog.askstring(
-            "Re-Route", "Enter new TARGET node ID:",
-            parent=self.root
-        )
-        if new_target and new_target.strip() in self.orch.planner.node_positions:
-            new_target = new_target.strip()
-            nearest_start = self.orch.planner.get_nearest_node(
-                self.orch.localizer.x, self.orch.localizer.y
-            )
-            new_path = self.orch.planner.plan_route(nearest_start, new_target)
-            if new_path:
-                with self.orch.path_lock:
-                    self.orch.planned_path = new_path
-                    self.orch.target_node = new_target
-                self.draw_route_on_map(new_path, nearest_start, new_target)
-                log.info(f"Re-routed → target node {new_target}, path length {len(new_path)}")
-            else:
-                messagebox.showerror("No Path", f"Cannot reach node {new_target}.")
-        elif new_target:
-            messagebox.showerror("Invalid", f"Node '{new_target}' not found in map.")
-
-    def _relocalize_dialog(self):
-        node_id = simpledialog.askstring(
-            "Re-Localize", "Enter current node ID (or leave blank to click map):",
-            parent=self.root
-        )
-        if node_id and node_id.strip() in self.orch.planner.node_positions:
-            node_id = node_id.strip()
-            pos = self.orch.planner.node_positions[node_id]
-            self.orch.localizer.set_pose(pos[0], pos[1], self.orch.localizer.yaw)
-            log.info(f"Re-localized to node {node_id} @ {pos}")
-        elif node_id:
-            messagebox.showerror("Invalid", f"Node '{node_id}' not found.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ORCHESTRATOR (Pilot Thread)
-# ══════════════════════════════════════════════════════════════════════════════
-class Orchestrator:
-    CSV_SCHEMA_VER = 4
-    CSV_HEADER = [
-        "schema_ver", "timestamp", "fps", "yolo_ms", "vis_ms",
-        "speed_pwm", "velocity_ms", "steer_angle",
-        "nav_state", "traffic_state", "x_est", "y_est", "yaw_est",
-        "cam_heading_deg", "nearest_node", "curvature", "lane_l_conf", "lane_r_conf", "estop"
-    ]
-
-    def __init__(self, args):
-        self.args = args
-        self.planner   = PathPlanner("Competition_track_graph.graphml")
-        # ── IMPORTANT: IMU must be initialized BEFORE the camera.
-        # PiCamera2 background threads (IMX708 sensor via RP1 I2C) briefly
-        # stall I2C bus 1 during camera.start(), causing [Errno 110] on the
-        # MPU's first write. Initializing IMU first gives it a clean bus.
-        self.imu = MPU9250_Thread(bus=1, address=0x68)
-        if not args.sim:
-            self.imu.start()
-
-        self.hw        = HardwareIO(sim_mode=args.sim,
-                                     sim_video=getattr(args, "sim_video", None))
-        self.yolo_worker = ThreadedYOLODetector(model_path=getattr(args, "model", "best.pt"))
-        self.traffic   = TrafficDecisionEngine(self.yolo_worker)
-        self.vision    = VisionPipeline()
-        self.localizer = LocalizationEngine()
-        self.controller = Controller()
-        self.calibrator: VisualCalibrator = None  # instantiated after start_node is set
-        
-        self.path_lock = threading.Lock()
-        self.planned_path: list = []
-        self._path_cursor = 0
-        self.start_node:  str  = None
-        self.target_node: str  = None
-        self._paused = False
-
-        self.t0   = time.time()
-        self._dt  = 0.033
-        self._fps = 0.0
-        self._fps_alpha = 0.2
-
-        fname = f'bfmc_telemetry_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-        self.csv_file   = open(fname, "w", newline="")
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(self.CSV_HEADER)
-
-    # ── Main pilot loop (runs in daemon thread) ────────────────────────────────
-    def run_pilot_loop(self, dashboard: DashboardApp):
+    # ─────────────────────────────────────────────────────────────────────────
+    # Pilot loop  (background thread)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _pilot_loop(self):
         log.info("Pilot loop started")
-        frame_idx   = 0
-        self._last_nearest_node = None
-        speed  = 0.0
-        steer  = 0.0
-        anchor = "INIT"
-        waypoints = []
+        t_prev = time.time()
 
-        while True:
-            t_start  = time.time()
-            elapsed  = t_start - self.t0
-            calib_remain = max(0.0, 6.0 - elapsed)
-            
-            # Default tracking values for CSV / GUI
-            pose = None
-            nearest_node = "—"
-            yolo_ms = 0.0
-            vis_ms = 0.0
-            imu_yaw_deg = 0.0
+        while self.running:
+            t_start = time.time()
+            dt      = max(t_start - t_prev, 0.001)
+            t_prev  = t_start
+
+            # ── FPS ──────────────────────────────────────────────────────────
+            self._fps = 0.7 * self._fps + 0.3 * (1.0 / dt)
+
+            # ── E-STOP guard ─────────────────────────────────────────────────
+            if self._estop:
+                self.hw.set_speed(0)
+                self.hw.set_steering(0)
+                time.sleep(0.05)
+                continue
+
+            # ── 1. Capture frame ─────────────────────────────────────────────
+            raw_frame = self.hw.get_frame()
+            if raw_frame is None:
+                raw_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+            # ── 2. IMU data ──────────────────────────────────────────────────
+            imu_yaw_rad, imu_gz_rps = self.imu.get_yaw_data()
+            if imu_yaw_rad is None:
+                imu_yaw_rad = 0.0
+                imu_gz_rps  = 0.0
+
+            # ── 3. Hardware velocity ─────────────────────────────────────────
             velocity_ms = self.hw.get_velocity_ms()
-            v_res_curv = 0.0
-            l_conf = 0.0
-            r_conf = 0.0
-            anchor = "HOLD"
-            waypoints = []
-            # ── CRITICAL: initialize all variables used in CSV/telem BEFORE branching ──
-            # Without these, the ESTOP / PAUSED / CALIBRATING branches crash with NameError.
-            frame       = np.zeros((480, 640, 3), dtype=np.uint8)  # BUG 5 fix
-            speed       = 0.0
-            steer       = 0.0
-            yolo_frame  = None
-            bev_frame   = None
-            nav_state   = "INIT"
-            nav_mode    = "CALIBRATING"   # active navigation mode for this frame
-            traffic_str = "SYS_GO"
-            reason      = "—"
-            light_st    = "NONE"
-            act_lbl     = []
 
-            # ── E-STOP check ────────────────────────────────────────────────────
-            if estop_event.is_set():
-                self.hw.set_speed(0.0)
-                self.hw.set_steering(0.0)
-                nav_state  = "E-STOP"
-                trf_result = None
-                speed, steer = 0.0, 0.0
-                yolo_frame = bev_frame = None
-                traffic_str = "SYS_STOP"
-                reason = "E-STOP"
-                light_st = "NONE"
-                act_lbl  = []
-                nav_mode = "AEB"
-
-            elif self._paused:
-                self.hw.set_speed(0.0)
-                self.hw.set_steering(0.0)
-                nav_state = "PAUSED"
-                speed, steer = 0.0, 0.0
-                yolo_frame = bev_frame = None
-                traffic_str = "SYS_STOP"
-                reason = "PAUSED"
-                light_st = "NONE"
-                act_lbl  = []
-                nav_mode = "BASIC"
-
-            elif calib_remain > 0:
-                # ── Pre-flight: WAITING FOR START POSITION CONFIRMATION ────────
-                # The car must NOT move until:
-                #   (a) the user has clicked a node on the map (start_node is set), AND
-                #   (b) the 6-second visual calibration phase has completed.
-                self.hw.set_speed(0.0)
-                self.hw.set_steering(0.0)
-                nav_state   = "CALIBRATING"
-                traffic_str = "CALIBRATING"
-
-                # ── Gate A: start_node must be confirmed ──────────────────────
-                if self.start_node is None:
-                    reason = "⚠️  WAITING — Place car on map and CLICK start node"
-                    speed, steer = 0.0, 0.0
-                    light_st = "NONE"
-                    act_lbl  = []
-                    # Try to capture a frame for the live view only
-                    try:
-                        frame = self.hw.capture_frame()
-                        if frame is not None and frame.any():
-                            yolo_frame = frame.copy()
-                    except Exception:
-                        pass
-
-                else:
-                    # ── Gate B: visual calibration ──────────────────────────
-                    # Gate B: visual calibration
-                    # Use getattr(..., False) not hasattr() so that the reset
-                    # orch._calib_started = False in on_startup_confirmed() is
-                    # correctly seen as "not yet started" (hasattr would be True
-                    # because the attribute EXISTS even when its value is False).
-                    if not getattr(self, '_calib_started', False):
-                        self._calib_started = True
-                        self.calibrator = VisualCalibrator(
-                            self.planner, self.localizer, self.vision
-                        )
-                        log.info("=== PRE-FLIGHT VISUAL CALIBRATION STARTED ===")
-                        log.info(f"  Start node : {self.start_node}")
-                        imu_ok = self.imu.is_connected if hasattr(self.imu, 'is_connected') else False
-                        log.info(f"  IMU ready  : {'YES' if imu_ok else 'NO (yaw from camera only)'}")
-
-                    # Capture frame and warmup all pipelines during calibration
-                    try:
-                        frame = self.hw.capture_frame()
-                        if frame is not None and frame.any():
-                            if self.calibrator is not None:
-                                self.calibrator.add_frame(frame)
-                            t_warm = self.traffic.process(frame)
-                            v_warm = self.vision.process(frame)
-                            yolo_frame = t_warm.yolo_debug_frame if t_warm.yolo_debug_frame is not None else frame
-                            bev_frame  = v_warm.lane_dbg
-                        else:
-                            yolo_frame = None
-                            bev_frame  = None
-                    except Exception as e:
-                        log.warning(f"Calibration warmup frame error: {e}")
-                        yolo_frame = None
-                        bev_frame  = None
-
-                    # Finalize calibration at 3 s in (3 s of frames collected)
-                    if elapsed > 3.0 and not getattr(self, '_calib_applied', False):
-                        if self.calibrator is None:
-                            log.warning("Calibrator is None at finalize — skipping calibration")
-                            self._calib_applied = True
-                        else:
-                            cal_result = self.calibrator.finalize()
-                            if cal_result.src_pts is not None:
-                                self.vision.update_bev_transform(cal_result.src_pts)
-                            # Apply detected heading to localizer
-                            cx, cy, _ = self.localizer.get_pose()
-                            _cal_imu_yaw, _ = self.imu.get_yaw_data()
-                            self.localizer.set_pose(
-                                cx, cy,
-                                math.radians(cal_result.initial_heading_deg),
-                                imu_yaw_rad=_cal_imu_yaw
-                            )
-                            self._calib_applied = True
-                            log.info(f"=== CALIBRATION COMPLETE: {cal_result.status_msg} ===")
-                            log.info(f"  Initial heading : {cal_result.initial_heading_deg:.1f}°")
-                            log.info(f"  BEV calibrated  : {self.vision.bev_calibrated}")
-                            log.info(f"  Confidence      : {cal_result.confidence:.0%}")
-
-                    cal_msg = self.calibrator._result.status_msg if self.calibrator else "collecting..."
-                    reason  = f"CAL {calib_remain:.1f}s remaining  |  {cal_msg}"
-                    speed, steer = 0.0, 0.0
-                    light_st = "NONE"
-                    act_lbl  = []
-                    nav_mode = "CALIBRATING"
-
+            # ── 4. YOLO (traffic) ─────────────────────────────────────────────
+            if self.traffic_engine:
+                t_res = self.traffic_engine.process(raw_frame)
             else:
-                # ── Full autonomous driving ─────────────────────────────────────────
-                
-                # Degradation tracking flags
-                vision_ok = True
-                yolo_ok = True
-
-                # Edge-info defaults (used in step 2 and step 9; updated in step 4b)
-                _line_type     = "UNKNOWN"
-                _in_roundabout = False
-                _bus_lane      = False
-                _map_zone      = "CITY"
-                _zone_mode     = "CITY"
-
-                # 0. Query map edge properties using last-frame pose (O(1)).
-                # Done first so line_type is available for the YOLO call (step 2).
-                with self.path_lock:
-                    _early_path = list(self.planned_path)
-                _lx = self.localizer.x
-                _ly = self.localizer.y
-                edge_info = self.planner.get_current_edge_info(
-                    _lx, _ly, _early_path, cursor=self._path_cursor
+                from traffic_module import TrafficResult
+                t_res = TrafficResult(
+                    state="SYS_GO", reason="NO YOLO",
+                    speed_multiplier=1.0, zone_mode="CITY",
+                    parking_state="NONE", steer_bias=0.0,
+                    pedestrian_blocking=False, light_status="NONE",
+                    active_labels=[], yolo_debug_frame=raw_frame.copy()
                 )
-                _line_type     = "DASHED" if edge_info["dotted"] else "CONTINUOUS"
-                _in_roundabout = edge_info["in_roundabout"]
-                _bus_lane      = edge_info["bus_lane"]
-                _map_zone      = edge_info["zone"]
+            self._last_t_res = t_res
 
-                # 1. Capture raw frame
-                try:
-                    frame = self.hw.read_camera()
-                    if frame is None: raise ValueError("Empty frame")
-                except Exception as e:
-                    log.error(f"Camera failure: {e}")
-                    self.hw.set_speed(0.0)
-                    self.hw.set_steering(0.0)
-                    nav_state = "CAM_ERROR"
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            # ── 5. Lane perception (V3 VisionPipeline) ──────────────────────
+            extra_offset = 0.0
+            if t_res.state == "SYS_LANE_CHANGE_LEFT":
+                extra_offset = -80.0    # shift target left
 
-                # 2. Traffic YOLO (async) — pass line_type so engine can gate overtaking
-                yolo_t0 = time.time()
-                try:
-                    t_res = self.traffic.process(frame, line_type=_line_type)
-                except Exception as e:
-                    log.warning(f"YOLO failure: {e}")
-                    yolo_ok = False
-                    from traffic_module import TrafficResult
-                    t_res = TrafficResult("SYS_GO", "YOLO_DEAD", 0.5)
-                yolo_ms = (time.time() - yolo_t0) * 1000.0
+            perc = self.vision.process(
+                raw_frame,
+                extra_offset_px=extra_offset,
+                nav_state=self._nav_state
+            )
 
-                # Resolve zone: sign-based wins; map-based is the fallback so
-                # the car is in the correct mode even if it misses a sign.
-                _zone_mode = t_res.zone_mode
-                if _zone_mode == "CITY" and _map_zone == "HIGHWAY":
-                    _zone_mode = "HIGHWAY"   # map says highway even if sign missed
+            # ── 6. Junction detection ────────────────────────────────────────
+            self._nav_state = self.jct_detector.update(
+                perc.warped_binary,
+                perc.sl, perc.sr,
+                perc.lane_width_px,
+                t_res.active_labels
+            )
 
-                # 3. Vision / lane perception
-                vis_t0 = time.time()
-                try:
-                    v_res = self.vision.process(frame)
-                except Exception as e:
-                    log.warning(f"Vision failure: {e}")
-                    from perception import PerceptionResult
-                    v_res = PerceptionResult(
-                        warped_binary=None, lane_dbg=None,
-                        sl=None, sr=None, lateral_error_px=0.0,
-                        anchor="DEAD", confidence=0.0, lane_width_px=300.0,
-                        curvature=0.0, l_conf=0.0, r_conf=0.0
-                    )
-                    vision_ok = False
-                vis_ms = (time.time() - vis_t0) * 1000.0
-                
-                # Periodically log profiling metrics
-                if frame_idx % 30 == 0:
-                    log.info(f"Pipeline Profiling: YOLO={yolo_ms:.1f}ms, Vision={vis_ms:.1f}ms")
-                    
-                # 4. Camera-only heading signals (always computed — no IMU)
-                from perception import estimate_heading_from_lanes, estimate_camera_odometry
+            # ── 7. Camera heading for localizer ─────────────────────────────
+            cam_heading = estimate_heading_from_lanes(perc.sl, perc.sr)
 
-                # Assign visual confidences for the CSV later
-                v_res_curv = v_res.curvature
-                l_conf = v_res.l_conf
-                r_conf = v_res.r_conf
+            # ── 8. Localizer update ──────────────────────────────────────────
+            self.localizer.update(
+                velocity_ms       = velocity_ms,
+                imu_yaw_rate_rps  = imu_gz_rps,
+                dt                = dt,
+                camera_heading_rad= cam_heading,
+                camera_confidence = perc.confidence
+            )
 
-                cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
+            # ── 9. Controller ────────────────────────────────────────────────
+            ctrl = self.controller.compute(
+                perc_res      = perc,
+                nav_state     = self._nav_state,
+                traffic_state = t_res.state,
+                base_speed    = float(self.base_speed),
+                traffic_mult  = t_res.speed_multiplier,
+                zone_mode     = t_res.zone_mode,
+                parking_state = t_res.parking_state,
+                steer_bias    = t_res.steer_bias,
+                imu_yaw_rate_rps = imu_gz_rps,
+                velocity_ms   = velocity_ms,
+                dt            = dt,
+            )
+            self._last_ctrl = ctrl
 
-                _prev_sl = getattr(self, '_prev_sl', None)
-                _prev_sr = getattr(self, '_prev_sr', None)
+            # ── 10. PWM deadband guard (single place, after multiplier) ──────
+            speed = ctrl.speed_pwm
+            if 0.0 < speed < PWM_DEADBAND:
+                speed = PWM_DEADBAND
 
-                # FIX-9: while the lane is lost, invalidate cache to prevent
-                # spurious heading-rate spikes on recovery.
-                _dead_frames = getattr(self, '_dead_reckon_frames', 0)
-                if v_res.anchor == "DEAD_RECKONING":
-                    self._dead_reckon_frames = _dead_frames + 1
-                else:
-                    self._dead_reckon_frames = 0
+            # ── 11. Send commands ────────────────────────────────────────────
+            self.hw.set_speed(speed)
+            self.hw.set_steering(ctrl.steer_angle_deg)
 
-                if _dead_frames > 2:
-                    _prev_sl = None
-                    _prev_sr = None
+            # ── 12. Push frames to GUI queues ────────────────────────────────
+            if not self._q_yolo.full():
+                self._q_yolo.put(t_res.yolo_debug_frame)
+            if not self._q_bev.full():
+                self._q_bev.put(_annotate_bev(perc, ctrl))
 
-                cam_lat_vel, cam_heading_rate = estimate_camera_odometry(
-                    v_res.sl, v_res.sr, _prev_sl, _prev_sr, max(self._dt, 1e-4)
-                )
-                # Cache only valid (non-dead-reckoning) fits for next-frame use
-                self._prev_sl = v_res.sl if v_res.anchor != "DEAD_RECKONING" else None
-                self._prev_sr = v_res.sr if v_res.anchor != "DEAD_RECKONING" else None
+            # ── Frame rate throttle ──────────────────────────────────────────
+            elapsed = time.time() - t_start
+            sleep_t = FRAME_PERIOD - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
 
-                # Camera heading in degrees for telemetry / CSV
-                imu_yaw_deg = math.degrees(self.localizer.yaw)  # reuse CSV column name
-
-                # Snapshot the planned path to avoid mid-frame GUI mutations
-                with self.path_lock:
-                    current_path = list(self.planned_path)
-
-                # ─────────────────────────────────────────────────────────────
-                # ── NAV MODE DETERMINATION ─────────────────────────────────────
-                # Checked in priority order: AEB > INTERSECTION > HIGHWAY > BASIC
-                # ─────────────────────────────────────────────────────────────
-
-                # --- AEB detection ---------------------------------------------------
-                # Check YOLO results for a large pedestrian bounding box.
-                # If a person/obstacle occupies > AEB_PERSON_THRESH of image height
-                # AND we are NOT already stopped, trigger AEB immediately.
-                _aeb_trigger = False
-                if yolo_ok and hasattr(t_res, 'active_labels') and t_res.active_labels:
-                    for lbl in t_res.active_labels:
-                        if any(k in lbl.lower() for k in ("person", "pedestrian", "stop_sign")):
-                            _aeb_trigger = True
-                            break
-                # Also respect explicit YOLO STOP signal as AEB
-                if t_res.state == "SYS_STOP":
-                    _aeb_trigger = True
-
-                # --- AEB consecutive-frame counter -----------------------------------
-                if _aeb_trigger:
-                    self._aeb_frames = getattr(self, '_aeb_frames', 0) + 1
-                else:
-                    self._aeb_frames = 0
-
-                # --- Mode assignment -------------------------------------------------
-                nearest_node_for_mode = self.planner.get_nearest_node(
-                    self.localizer.x, self.localizer.y
-                )
-
-                if self._aeb_frames >= 1:   # instant stop on first detection
-                    nav_mode = "AEB"
-                elif _in_roundabout or (
-                    nearest_node_for_mode and
-                    self.planner.is_at_junction(nearest_node_for_mode)
-                ):
-                    nav_mode = "INTERSECTION"
-                elif _zone_mode == "HIGHWAY":
-                    nav_mode = "HIGHWAY"
-                else:
-                    nav_mode = "BASIC"
-
-                # Inform localizer so it can tune map-correction gains
-                self.localizer.set_nav_mode(nav_mode)
-
-                # ─────────────────────────────────────────────────────────────
-                # (steps 5-10 identical to before except nav_mode wiring)
-                # ─────────────────────────────────────────────────────────────
-
-                # 5. Map-matching correction
-                if current_path:   # Bug Fix 5: skip if A* gave no path
-                    self.localizer.fuse_map_correction(
-                        current_path,
-                        self.planner.node_positions,
-                        max_snap_m=0.38,
-                        lane_conf=v_res.confidence,
-                        cursor=self._path_cursor
-                    )
-                else:
-                    log.warning("No A* path — running vision-only (BASIC mode)")
-
-                # 6. Localizer update — fuses kinematics, camera, and IMU
-                imu_yaw_rad, imu_yaw_rate_rps = (
-                    self.imu.get_yaw_data() if hasattr(self, 'imu') else (None, None)
-                )
-                pose = self.localizer.update(
-                    velocity_ms              = velocity_ms,
-                    steer_angle_deg          = steer,
-                    lane_error_px            = v_res.lateral_error_px,
-                    lane_width_px            = v_res.lane_width_px,
-                    conf                     = v_res.confidence,
-                    dt                       = self._dt,
-                    camera_yaw_correction    = cam_yaw_corr,
-                    camera_lateral_vel_ms    = cam_lat_vel,
-                    camera_heading_rate_rps  = cam_heading_rate,
-                    imu_yaw_rate_rps         = imu_yaw_rate_rps,
-                    imu_yaw_rad              = imu_yaw_rad,   # FIX-10: absolute fusion
-                )
-
-                # 7. Lookahead waypoints from A* path
-                waypoints, new_cursor = self.planner.get_lookahead_waypoints(
-                    pose[0], pose[1], current_path, cursor=self._path_cursor,
-                    lookahead_m=0.8 if nav_mode != "HIGHWAY" else 1.4
-                )
-                # Never let cursor go backward
-                self._path_cursor = max(self._path_cursor, new_cursor)
-
-                # 8. Nearest node (for telemetry)
-                nearest_node = self.planner.get_nearest_node(pose[0], pose[1])
-                
-                # 8.1 Node Snap
-                # FIX-2: proximity guard — only snap when actually near the node.
-                #         The KDTree always returns *a* nearest node regardless of
-                #         distance; without the guard a 2 m off-track drift could
-                #         snap the localizer to the wrong lane.
-                # FIX-3: compute path tangent at the node and pass it so heading
-                #         is also corrected, not only position.
-                if nearest_node != self._last_nearest_node and nearest_node in self.planner.node_positions:
-                    node_pos  = self.planner.node_positions[nearest_node]
-                    node_dist = math.hypot(pose[0] - node_pos[0], pose[1] - node_pos[1])
-                    if node_dist < 0.40:                 # within 40 cm
-                        # Derive heading from the path segment leaving this node
-                        _node_yaw_target = None
-                        try:
-                            _ni = current_path.index(nearest_node)
-                            if _ni < len(current_path) - 1:
-                                _n2 = current_path[_ni + 1]
-                                if _n2 in self.planner.node_positions:
-                                    _p1 = node_pos
-                                    _p2 = self.planner.node_positions[_n2]
-                                    _node_yaw_target = math.atan2(
-                                        _p2[1] - _p1[1], _p2[0] - _p1[0]
-                                    )
-                        except (ValueError, IndexError):
-                            pass
-                        self.localizer.node_reset(
-                            node_pos[0], node_pos[1],
-                            yaw_target=_node_yaw_target    # FIX-3
-                        )
-                        self._last_nearest_node = nearest_node
-                
-                # 8a. Lap completion check
-                if nearest_node == self.target_node:
-                    self._at_target_frames = getattr(self, '_at_target_frames', 0) + 1
-                    if self._at_target_frames >= 15:  # ~0.5 seconds at target
-                        log.info("TARGET REACHED - halting.")
-                        self.hw.set_speed(0.0)
-                        self.hw.set_steering(0.0)
-                        estop_event.set()
-                else:
-                    self._at_target_frames = 0
-
-                # 8b. Junction map override logic
-                if self.planner.is_at_junction(nearest_node):
-                    next_node = self.planner.get_junction_branch(nearest_node, current_path, cursor=self._path_cursor)
-                    if next_node:
-                        next_pos = self.planner.node_positions[next_node]
-                        waypoints = [next_pos] + waypoints
-
-                # 8c. Lookahead map curvature
-                map_curv = self.planner.get_path_curvature(
-                    pose[0], pose[1], current_path, cursor=self._path_cursor, window_m=1.0
-                )
-
-                # 9. Control — full nav_mode context
-                nav_state = nav_mode   # dashboard shows active mode
-                ctrl = self.controller.compute(
-                    v_res, pose, waypoints, nav_state,
-                    t_res.state,
-                    base_speed    = 50.0,
-                    map_curvature = map_curv,
-                    velocity_ms   = velocity_ms,
-                    dt            = self._dt,
-                    zone_mode     = _zone_mode,
-                    line_type     = _line_type,
-                    parking_state = t_res.parking_state,
-                    steer_bias    = t_res.steer_bias,
-                    bus_lane      = _bus_lane,
-                    in_roundabout = _in_roundabout,
-                    nav_mode      = nav_mode,          # ← new
-                )
-
-                # Apply degradation speed overrides (with deadband-safe floor)
-                speed = ctrl.speed_pwm * t_res.speed_multiplier
-                if not yolo_ok:
-                    speed = max(speed * 0.40, 0.0)
-                    reason = "DEGRADED: YOLO DEAD"
-                if not vision_ok:
-                    speed = max(speed * 0.25, 0.0)
-                    reason = "DEGRADED: VISION DEAD"
-                # Deadband guard: if a non-zero speed slipped below 14 after
-                # multipliers, clamp it up (motor won't respond otherwise).
-                if 0.0 < speed < 14.0:
-                    speed = 14.0
-
-                steer  = ctrl.steer_angle_deg
-                anchor = ctrl.anchor
-
-                # 10. Send to hardware
-                self.hw.set_speed(speed)
-                self.hw.set_steering(steer)
-                self._last_speed_pwm = speed
-
-                yolo_frame  = t_res.yolo_debug_frame
-                bev_frame   = v_res.lane_dbg
-                traffic_str = t_res.state
-                reason      = t_res.reason
-                light_st    = t_res.light_status
-                act_lbl     = t_res.active_labels
-
-            # ── CSV log & Telemetry Export (Run every frame) ─────────────
-            px, py, pyaw = (self.localizer.x, self.localizer.y, self.localizer.yaw) if pose is None else pose
-            self.csv_writer.writerow([
-                self.CSV_SCHEMA_VER,
-                round(t_start, 4), round(self._fps, 1),
-                round(yolo_ms, 1), round(vis_ms, 1),
-                round(speed, 2), round(velocity_ms, 3), round(steer, 2),
-                nav_state, traffic_str,
-                round(px, 4), round(py, 4), round(pyaw, 4),
-                round(imu_yaw_deg, 2), nearest_node,
-                round(v_res_curv, 5), round(l_conf, 3), round(r_conf, 3), int(estop_event.is_set())
-            ])
-
-            # ── FPS calculation ──────────────────────────────────────────
-            elapsed_this_frame = time.time() - t_start
-            self._dt  = max(0.001, elapsed_this_frame)
-            self._fps = self._fps_alpha * (1.0 / self._dt) + \
-                        (1.0 - self._fps_alpha) * self._fps
-
-            # ── Push telemetry to GUI (non-blocking) ──────────────────────
-            telem = {
-                "fps": self._fps,
-                "speed": speed, "steer": steer,
-                "nav_state": nav_state,
-                "nav_mode":  nav_mode,              # ← driving mode for dashboard
-                "traffic": traffic_str, "reason": reason,
-                "x": self.localizer.x,
-                "y": self.localizer.y,
-                "yaw": self.localizer.yaw,
-                "calib_remain": calib_remain,
-                "anchor": anchor,
-                "nearest_node": nearest_node,
-                "light_status": light_st,
-                "active_labels": act_lbl,
-                "waypoints": waypoints,
-                "yolo_frame": yolo_frame,
-                "bev_frame":  bev_frame,
-                "camera_frame": frame,
-                # ── IMU instrument data ────────────────────────────────────
-                "cam_heading_deg": imu_yaw_deg,           # localizer yaw in degrees
-                "velocity_ms":     velocity_ms,           # m/s from encoder/sim
-            }
-
-            if pose is not None:
-                telem["x"], telem["y"], telem["yaw"] = pose
-
-            if not dashboard.telem_q.full():
-                dashboard.telem_q.put(telem)
-
-            frame_idx += 1
-            sleep_sec = max(0.001, 0.033 - (time.time() - t_start))
-            time.sleep(sleep_sec)
-
-    def shutdown(self):
-        self.hw.set_speed(0.0)
-        self.hw.set_steering(0.0)
-        self.hw.shutdown()
-        if self.yolo_worker:
-            self.yolo_worker.stop()
-        if getattr(self, 'imu', None):
-            self.imu.stop()
-        try:
-            self.csv_file.close()
-        except Exception:
-            pass
-        log.info("Orchestrator shut down cleanly.")
+        log.info("Pilot loop stopped")
+        self.hw.set_speed(0)
+        self.hw.set_steering(0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ARGUMENT PARSER
-# ══════════════════════════════════════════════════════════════════════════════
-def parse_args():
-    p = argparse.ArgumentParser(description="BFMC Autonomous Pilot V4")
-    p.add_argument("--sim",       action="store_true", help="Simulation mode (no hardware)")
-    p.add_argument("--sim-video", type=str,            help="Path to .mp4 for camera sim")
-    p.add_argument("--start",     type=str,            help="Start node ID (skips wizard)")
-    p.add_argument("--target",    type=str,            help="Target node ID (skips wizard)")
-    p.add_argument("--model",     type=str,            default="best.pt",
-                   help="Path to YOLO .pt model file (default: best.pt, searched relative to script)")
-    return p.parse_args()
+# ═══════════════════════════════════════════════════════════════════════════════
+# BEV annotation helper
+# ═══════════════════════════════════════════════════════════════════════════════
+def _annotate_bev(perc, ctrl: ControlOutput) -> np.ndarray:
+    """Draw polynomial fits, target cross and anchor label on BEV debug frame."""
+    dbg = perc.lane_dbg.copy() if perc.lane_dbg is not None else \
+          np.zeros((480, 640, 3), np.uint8)
+
+    def draw_poly(fit, color):
+        if fit is None:
+            return
+        ys = np.linspace(0, 479, 240).astype(np.float32)
+        xs = np.polyval(fit, ys).astype(np.float32)
+        pts = np.stack([xs, ys], axis=1).reshape(-1, 1, 2).astype(np.int32)
+        pts[:, 0, 0] = np.clip(pts[:, 0, 0], 0, 639)
+        cv2.polylines(dbg, [pts], False, color, 3, cv2.LINE_AA)
+
+    draw_poly(perc.sl, (255, 80, 80))
+    draw_poly(perc.sr, (80, 80, 255))
+
+    # Target X cross-hair
+    tx = int(ctrl.target_x)
+    cv2.line(dbg, (tx, 380), (tx, 420), (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(dbg, (tx - 10, 400), (tx + 10, 400), (0, 255, 255), 2, cv2.LINE_AA)
+
+    cv2.putText(dbg, ctrl.anchor, (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(dbg, f"steer={ctrl.steer_angle_deg:+.1f}", (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1, cv2.LINE_AA)
+    return dbg
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    args = parse_args()
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+def main():
+    ap = argparse.ArgumentParser(description="BFMC V3 Lane Pilot")
+    ap.add_argument("--sim",   action="store_true", help="No hardware — use blank frames")
+    ap.add_argument("--speed", type=float, default=50,
+                    help="Base PWM speed 0-100 (default 50)")
+    ap.add_argument("--svg",   type=str,   default=None,
+                    help="Path to Track.svg (default: auto-detect)")
+    args = ap.parse_args()
 
-    # ── 1. Build orchestrator (loads map, inits hardware) ──────────────────────
-    orch = Orchestrator(args)
+    svg_path = args.svg or SVG_PATH_DEFAULT
+    if not os.path.exists(svg_path):
+        log.warning(f"SVG not found at {svg_path} — using blank map")
+        svg_path = svg_path   # _load_svg_as_cv2 handles missing file gracefully
 
-    # ── 2. Start Tk root ───────────────────────────────────────────────────────
+    orch = Orchestrator(
+        sim_mode   = args.sim,
+        base_speed = args.speed,
+        svg_path   = svg_path,
+    )
+
     root = tk.Tk()
-    root.title("BFMC Autonomous Dashboard")
+    orch.build_ui(root)
+
     try:
-        root.state("zoomed")
-    except Exception:
-        root.geometry("1400x800")
-    root.configure(bg="#0C0C0C")
+        root.mainloop()
+    except KeyboardInterrupt:
+        log.info("KeyboardInterrupt — shutting down")
+    finally:
+        orch._on_close()
 
-    # ── 3. Build and show main dashboard ──────────────────────────────────────
-    dash = DashboardApp(root, orch)
-    
-    # Disable controls until startup is confirmed
-    dash.btn_estop.config(state=tk.DISABLED)
-    dash.btn_pause.config(state=tk.DISABLED)
 
-    # ── 4. Define confirmation callback ───────────────────────────────────────
-    def on_startup_confirmed(start_node, target_node):
-        orch.start_node = start_node
-        orch.target_node = target_node
-        orch.planned_path = orch.planner.plan_route(start_node, target_node)
-        
-        if not orch.planned_path:
-            log.warning(f"A* found no path {start_node}→{target_node}. Driving on vision only.")
-        else:
-            log.info(f"A* path: {len(orch.planned_path)} nodes  ({start_node} → {target_node})")
-
-        sp = orch.planner.node_positions.get(start_node, (0.0, 0.0))
-
-        # Derive initial heading from first A* edge so dead-reckoning starts correct.
-        # Without this, yaw=0 and the car dead-reckons east regardless of orientation.
-        init_yaw = 0.0
-        if orch.planned_path and len(orch.planned_path) >= 2:
-            p1 = orch.planner.node_positions.get(orch.planned_path[0])
-            p2 = orch.planner.node_positions.get(orch.planned_path[1])
-            if p1 and p2:
-                init_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
-                log.info(f"Initial yaw from A* edge: {math.degrees(init_yaw):.1f}°")
-
-        orch.localizer.set_pose(sp[0], sp[1], init_yaw)
-        log.info(f"Initial pose: node {start_node} @ ({sp[0]:.2f}, {sp[1]:.2f})  yaw={math.degrees(init_yaw):.1f}°")
-        
-        dash.draw_route_on_map(orch.planned_path, start_node, target_node)
-        
-        dash.btn_estop.config(state=tk.NORMAL)
-        dash.btn_pause.config(state=tk.NORMAL)
-
-        # BUG 1 FIX: Reset the calibration timer NOW — at the moment the pilot
-        # thread starts — not at __init__ time.  Without this, the 6-second
-        # countdown expires before the wizard closes and the car skips
-        # calibration entirely (or worse, never drives because the timer was
-        # already done before driving variables were initialised).
-        orch.t0 = time.time()
-        orch._calib_started = False   # ensure calibration runs fresh
-        log.info(f"=== PILOT LAUNCH — calibration window reset (t0={orch.t0:.2f}) ===")
-
-        # Start pilot in daemon thread
-        pilot_t = threading.Thread(
-            target=orch.run_pilot_loop, args=(dash,), daemon=True
-        )
-        pilot_t.start()
-
-    # ── 5. Run localization wizard overlay (unless CLI args provided) ─────────
-    if args.start and args.target:
-        on_startup_confirmed(args.start, args.target)
-    else:
-        overlay = StartupOverlay(root, orch.planner, on_startup_confirmed)
-        overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
-
-    # ── 6. Tkinter main loop ───────────────────────────────────────────────────
-    def on_close():
-        estop_event.set()
-        time.sleep(0.1)
-        orch.shutdown()
-        root.destroy()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.mainloop()
+if __name__ == "__main__":
+    main()

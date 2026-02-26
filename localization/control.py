@@ -1,17 +1,13 @@
 """
-control.py — BFMC Controller  (Localization-Based Autonomous Driving)
-=======================================================================
-Driving Modes (nav_mode):
-
-  BASIC         Standard lane-keeping + map-snap.  City speeds.
-  INTERSECTION  A* junction following: slow to 60 %, tight lookahead 150 px.
-  AEB           Autonomous Emergency Braking: hard-stop immediately.
-                Triggered externally by main.py (pedestrian / stop sign).
-  HIGHWAY       High-speed right-lane driving: base_speed×1.4, la≥350 px.
-
-Other features carried over from previous version:
-  ZONE SPEED FLOORS, LINE-TYPE-GATED OVERTAKING, PARKING, BUS-LANE GUARD.
-  PWM DEADBAND GUARD: speed is never in (0, 14) — motors are silent below ~12.
+control.py — V3 YOLO Pure Pursuit Controller
+=============================================
+Exact port of bfmc_pilot_v3_yolo.py steering logic:
+  - _pure_pursuit: pure geometric atan2-based formula
+  - Steering EMA:  STEER_EMA_SLOW=0.40, STEER_EMA_FAST=0.10
+  - DividerGuard:  forcefield repulsion from centre line
+  - Speed scaling: curvature-based HI(>0.0025)→0.60×, MED(>0.001)→0.80×
+  - IMU yaw rate used for feed-forward heading correction
+  - No A* path planning — pure camera lane following
 """
 
 import math
@@ -28,260 +24,251 @@ class ControlOutput:
     lookahead_px: float
 
 
-class Controller:
-    Ki = 0.002    # integral gain
-    Kd = 0.15     # derivative gain
+class DividerGuard:
+    """
+    Forcefield repulsion from the centre-lane divider (left line).
+    Direct V3 port: violent shove rightward when too close to left line.
+    """
+    DIVIDER_SAFE_PX = 110   # minimum gap from centre divider
+    EDGE_SAFE_PX    =  70   # minimum gap from right edge
+    GAIN            = 0.35  # repulsion gain
+    MAX_CORR        = 25.0  # max emergency correction degrees
+    DEADBAND_PX     =  2    # ignore tiny errors
 
-    # ── Speed floor constants (PWM units, 0-100 scale) ────────────────────────
-    # Using SPEED_CALIB = 0.014, deadband = 12:
-    #   velocity_ms = max(0, (pwm - 12) * 0.014)
-    #   For 0.40 m/s: pwm = 12 + 0.40/0.014 ≈ 41
-    #   For 0.20 m/s: pwm = 12 + 0.20/0.014 ≈ 26
-    MIN_PWM_HIGHWAY = 41.0   # 40 cm/s minimum
-    MIN_PWM_CITY    = 27.0   # 20 cm/s minimum
-    # PWM_DEADBAND is enforced in main.py AFTER speed_multiplier is applied.
-    # Do NOT apply it here — the multiplier can drop speed back below 14
-    # AFTER compute() returns, so a guard here would fire too early (BUG-03).
-    PWM_DEADBAND    = 14.0   # kept as a reference constant only
+    def apply(self, steer_angle, left_fit, right_fit, y_eval=440, car_x=320):
+        correction, speed_scale, triggered = 0.0, 1.0, False
+        div_corr = edge_corr = 0.0
+
+        if left_fit is not None:
+            div_x = float(np.polyval(left_fit, y_eval))
+            gap = car_x - div_x
+            if gap < self.DIVIDER_SAFE_PX - self.DEADBAND_PX:
+                err = float(self.DIVIDER_SAFE_PX - gap)
+                div_corr  = min((self.GAIN * 3.0) * err, self.MAX_CORR)
+                speed_scale = min(speed_scale, max(0.2, 1.0 - err / 60.0))
+                triggered = True
+
+        if right_fit is not None:
+            edge_x = float(np.polyval(right_fit, y_eval))
+            gap = edge_x - car_x
+            if gap < self.EDGE_SAFE_PX - self.DEADBAND_PX:
+                err = float(self.EDGE_SAFE_PX - gap)
+                edge_corr = min(self.GAIN * err, self.MAX_CORR * 0.4)
+                speed_scale = min(speed_scale, max(0.5, 1.0 - err / 100.0))
+                triggered = True
+
+        if div_corr > 0 and edge_corr > 0:
+            correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN)
+        else:
+            correction = div_corr - edge_corr
+
+        return steer_angle + correction, speed_scale, triggered
+
+
+class Controller:
+    """
+    V3-exact pure-pursuit steering controller with IMU feed-forward.
+
+    Key parameters (from bfmc_pilot_v3_yolo.py):
+      STEER_EMA_SLOW  = 0.40   (60% new signal accepted per frame)
+      STEER_EMA_FAST  = 0.10   (90% for emergency/guard saves)
+      GUARD_EMA       = 0.30
+      MAX_STEER       = 45.0
+      MAX_STEER_RATE  = 15.0   degrees/frame
+    """
+
+    # ── EMA coefficients (V3 exact) ──────────────────────────────────────────
+    STEER_EMA_SLOW = 0.40   # blend factor for NEW signal (0.40 = accept 60% new)
+    STEER_EMA_FAST = 0.10   # for emergency saves
+    GUARD_EMA      = 0.30   # for guard corrections
+
+    # ── Limits ───────────────────────────────────────────────────────────────
+    MAX_STEER      = 45.0
+    MAX_STEER_RATE = 15.0   # max deg/frame rate limiting
+
+    # ── Speed curvature thresholds (V3) ─────────────────────────────────────
+    HIGH_CURV_THRESH = 0.0025
+    MED_CURV_THRESH  = 0.0010
+    HIGH_CURV_SCALE  = 0.60
+    MED_CURV_SCALE   = 0.80
+    DUAL_SPEED_SCALE = 1.15   # bonus when both lines visible
+
+    # ── PWM deadband (applied in main.py AFTER traffic multiplier) ──────────
+    PWM_DEADBAND     = 14.0   # reference only — do not guard here
+    MIN_PWM_CITY     = 27.0
+    MIN_PWM_HIGHWAY  = 41.0
+
+    # ── Base lookahead (pixels) ──────────────────────────────────────────────
+    LOOKAHEAD_NORMAL    = 200
+    LOOKAHEAD_JUNCTION  = 150
+    LOOKAHEAD_HIGHWAY   = 350
+
+    # ── Physical constants ───────────────────────────────────────────────────
+    WHEELBASE_M   = 0.23
+    LANE_WIDTH_M  = 0.35
 
     def __init__(self):
-        self.last_steer    = 0.0
-        self._err_integral = 0.0
-        self._last_err     = 0.0
-        self._dt           = 0.033
+        self.smooth_steer = 0.0
+        self.smooth_guard = 0.0
+        self.prev_steer   = 0.0
+        self.guard = DividerGuard()
 
-    def pure_pursuit(self, target_x_px, lookahead_px, lane_width_px,
-                     wheelbase_m=0.23, lane_width_m=0.35):
-        ppm = lane_width_px / lane_width_m
-        if ppm <= 0:
-            ppm = 1.0
-        dx = target_x_px - 320.0
-        dy = max(float(lookahead_px), 1.0)
-        ld     = math.hypot(dx, dy)
-        alpha  = math.atan2(dx, dy)
-        wb_px  = wheelbase_m * ppm
-        steer_rad = math.atan2(2.0 * wb_px * math.sin(alpha), ld)
-        return math.degrees(steer_rad)
-
-    def compute(self, perc_res, pose, waypoints, nav_state,
-                traffic_state, base_speed, map_curvature=0.0,
-                velocity_ms=0.0, dt=0.033,
-                zone_mode="CITY",
-                line_type="UNKNOWN",
-                parking_state="NONE",
-                steer_bias=0.0,
-                bus_lane=False,
-                in_roundabout=False,
-                nav_mode="BASIC"):
+    # ─────────────────────────────────────────────────────────────────────────
+    # Pure Pursuit (V3 exact)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _pure_pursuit(self, target_x, lookahead_px, lane_width_px):
         """
-        Compute steering and speed commands.
-
-        nav_mode : "BASIC" | "INTERSECTION" | "AEB" | "HIGHWAY"
-          BASIC        — standard lane-keep, city speed.
-          INTERSECTION — slow to 60 %, tight lookahead, full A* guidance.
-          AEB          — hard-stop (pedestrian / stop-sign emergency).
-          HIGHWAY      — high-speed, right-lane bias, long lookahead.
-
-        Other parameters (unchanged)
-        zone_mode      : "CITY" | "HIGHWAY" — governs speed floors and lane bias.
-        line_type      : "DASHED"|"CONTINUOUS"|"UNKNOWN" — gates overtaking.
-        parking_state  : "NONE"|"SEEK"|"ENTER"|"WAIT"|"EXIT".
-        steer_bias     : additional steering degrees from ParkingStateMachine.
-        bus_lane       : True → rightward correction to avoid bus lane.
-        in_roundabout  : True → tighter lookahead and slower speed.
+        Direct V3 formula: steer = atan2(2 * wb_px * sin(alpha), ld)
+        target_x    : pixel column in BEV frame
+        lookahead_px: forward distance (pixels)
+        lane_width_px: pixels per lane width (used as pixels-per-metre scaler)
         """
-        self._dt = max(dt, 0.001)
+        lane_width_px = max(lane_width_px, 50)
+        ppm   = lane_width_px / self.LANE_WIDTH_M
+        dx    = target_x - 320.0
+        dy    = max(float(lookahead_px), 1.0)
+        ld    = math.sqrt(dx * dx + dy * dy)
+        alpha = math.atan2(dx, dy)
+        wb_px = self.WHEELBASE_M * ppm
+        steer = math.atan2(2.0 * wb_px * math.sin(alpha), ld)
+        return math.degrees(steer)
 
-        # ── Effective traffic state: gate lane change on line type ────────────
-        eff_traffic_state = traffic_state
-        if traffic_state == "SYS_LANE_CHANGE_LEFT" and line_type == "CONTINUOUS":
-            # Continuous line: must NOT overtake — demote to slow/tail
-            eff_traffic_state = "SYS_SLOW"
+    # ─────────────────────────────────────────────────────────────────────────
+    # Main compute
+    # ─────────────────────────────────────────────────────────────────────────
+    def compute(self,
+                perc_res,            # PerceptionResult from perception.py
+                nav_state: str,      # "NORMAL"|"JUNCTION_LEFT"|"JUNCTION_RIGHT"|"ROUNDABOUT"
+                traffic_state: str,  # "SYS_GO"|"SYS_STOP"|"SYS_SLOW"|"SYS_LIMIT"
+                base_speed: float,   # raw base PWM (0-100)
+                traffic_mult: float, # multiplier from TrafficDecisionEngine
+                zone_mode: str = "CITY",     # "CITY"|"HIGHWAY"
+                parking_state: str = "NONE", # "NONE"|"SEEK"|"ENTER"|"WAIT"|"EXIT"
+                steer_bias: float = 0.0,     # extra degrees from parking FSM
+                imu_yaw_rate_rps: float = 0.0,  # IMU gz in rad/s (feed-forward)
+                velocity_ms: float = 0.0,   # from hardware_io speed estimate
+                dt: float = 0.033,
+                ) -> ControlOutput:
+        """
+        V3-style compute.  Returns ControlOutput.
 
-        # ── AEB: hard-stop immediately — no steering computed ─────────────────
-        if nav_mode == "AEB":
-            return ControlOutput(
-                steer_angle_deg = 0.0,
-                speed_pwm       = 0.0,
-                target_x        = 320.0,
-                anchor          = "AEB_STOP",
-                lookahead_px    = 0.0,
-            )
+        Steering pipeline (V3):
+          1. pure pursuit →  raw_steer
+          2. feed-forward IMU yaw rate nudge
+          3. rate limiting ± MAX_STEER_RATE
+          4. EMA blend (SLOW for normal, FAST for guard saves)
+          5. DividerGuard forcefield
+          6. clip to ± MAX_STEER
 
-        # ── 1. Target computation (Vision + Map) ──────────────────────────────
-        t_vis = 320.0 + perc_res.lateral_error_px
-        t_map = 320.0
-        ppm   = perc_res.lane_width_px / 0.35
+        Speed pipeline:
+          base_speed × curvature_scale × traffic_mult × parking_mult
+          + zone floor (MIN_PWM_CITY or MIN_PWM_HIGHWAY)
+          - deadband guard NOT applied here (main.py does it after multiplier)
+        """
+        sl         = perc_res.sl
+        sr         = perc_res.sr
+        target_x   = 320.0 + perc_res.lateral_error_px  # convert error back to pixel
+        lw         = perc_res.lane_width_px
+        curvature  = perc_res.curvature
+        anchor     = perc_res.anchor
 
-        # Adaptive lookahead — tuned per nav_mode
-        if nav_mode == "INTERSECTION":
-            la_px = min(150.0, velocity_ms * ppm * 1.0 + 80.0)
-        elif nav_mode == "HIGHWAY":
-            la_px = max(350.0, min(600.0, velocity_ms * ppm * 2.0))
+        # ── Lookahead selection ───────────────────────────────────────────────
+        if nav_state.startswith("JUNCTION") or nav_state == "JUNCTION_PROMPT":
+            la_px = self.LOOKAHEAD_JUNCTION
+        elif zone_mode == "HIGHWAY":
+            la_px = self.LOOKAHEAD_HIGHWAY
         else:
-            la_px = 320.0 if velocity_ms < 0.15 else max(
-                150.0, min(500.0, velocity_ms * ppm * 1.5)
-            )
-        if map_curvature > 0.002:
-            la_px *= 0.8
-        if perc_res.anchor == "DEAD_RECKONING":
-            la_px = 120.0
-        if in_roundabout:
-            la_px = min(la_px, 180.0)   # tighter lookahead in roundabouts
+            la_px = self.LOOKAHEAD_NORMAL
 
-        # Project first valid map waypoint > 0.2 m ahead
-        px, py, pyaw = pose
-        map_wp_valid = False
-        for wp in waypoints:
-            dx = wp[0] - px
-            dy_ = wp[1] - py
-            lx = dx * math.cos(-pyaw) - dy_ * math.sin(-pyaw)
-            ly = dx * math.sin(-pyaw) + dy_ * math.cos(-pyaw)
-            if ly > 0.2:
-                t_map       = 320.0 + lx * ppm
-                la_px       = ly * ppm
-                map_wp_valid = True
-                break
+        # ── 1. Pure pursuit ───────────────────────────────────────────────────
+        raw_steer = self._pure_pursuit(target_x, la_px, lw)
 
-        anchor = perc_res.anchor
+        # ── 2. IMU feed-forward heading correction ────────────────────────────
+        # Convert gz (rad/s) to expected steering degrees per frame
+        # A yaw-rate of +0.5 rad/s means car is already turning left;
+        # we add a small counter-steer to stabilise.
+        imu_ff = math.degrees(imu_yaw_rate_rps) * dt * 0.35
+        raw_steer += imu_ff
 
-        if perc_res.confidence >= 0.6:
-            target_x = (0.75 * t_vis + 0.25 * t_map) if map_wp_valid else t_vis
-            if map_wp_valid:
-                anchor += "+MAP"
+        # ── 3. Rate limiting ─────────────────────────────────────────────────
+        delta = raw_steer - self.prev_steer
+        delta = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, delta))
+        rate_limited = self.prev_steer + delta
+
+        # ── 4. EMA blend (V3 exact) ──────────────────────────────────────────
+        # smooth_steer holds previous EMA state
+        new_steer = (self.STEER_EMA_SLOW * rate_limited
+                     + (1.0 - self.STEER_EMA_SLOW) * self.smooth_steer)
+        self.smooth_steer = new_steer
+
+        # ── 5. DividerGuard ──────────────────────────────────────────────────
+        guarded_steer, guard_speed_scale, guard_triggered = self.guard.apply(
+            new_steer, sl, sr, y_eval=440, car_x=320)
+
+        if guard_triggered:
+            # Blend guard correction with fast EMA
+            self.smooth_guard = (self.GUARD_EMA * guarded_steer
+                                 + (1.0 - self.GUARD_EMA) * self.smooth_guard)
+            final_steer = self.smooth_guard
         else:
-            if map_wp_valid:
-                target_x = t_map
-                anchor   = "MAP_TAKEOVER"
-            else:
-                target_x = 320.0
-                anchor   = "HOLD"
+            self.smooth_guard = guarded_steer
+            final_steer = new_steer
 
-        # ── Right-side driving constant bias ──────────────────────────────────
-        # REMOVED: RIGHT_LANE_BIAS_PX — perception.py already centers the lane
-        # target correctly for RIGHT-only anchors. A second rightward shift here
-        # caused hard weaving by fighting the perception target.
+        # Add parking bias
+        final_steer += steer_bias
 
-        # ── Highway nav_mode right-lane bias ─────────────────────────────────
-        # In HIGHWAY mode apply a 10 % rightward nudge so the car stays in the
-        # outer right lane even on sensor-drift frames.
-        if nav_mode == "HIGHWAY" or zone_mode == "HIGHWAY":
-            target_x += 0.10 * perc_res.lane_width_px
-            anchor += "+HW"
+        # ── 6. Clip and store ─────────────────────────────────────────────────
+        final_steer = max(-self.MAX_STEER, min(self.MAX_STEER, final_steer))
+        self.prev_steer = final_steer
 
-        # ── Bus-lane guard (steer right to avoid it) ──────────────────────────
-        if bus_lane:
-            target_x += 0.30 * perc_res.lane_width_px
-            anchor    += "+BUS_AVOID"
-
-        # ── Overtaking lane shift (gated by line type) ────────────────────────
-        if eff_traffic_state == "SYS_LANE_CHANGE_LEFT":
-            target_x -= 0.40 * perc_res.lane_width_px
-            anchor    += "+OVERTAKE"
-        elif traffic_state == "SYS_LANE_CHANGE_LEFT" and eff_traffic_state == "SYS_SLOW":
-            # Continuous line: stay in lane, no shift
-            anchor += "+TAIL"
-
-        # ── DividerGuard (80 px min margin from lane lines) ───────────────────
-        if perc_res.sl is not None:
-            lx_v = np.polyval(perc_res.sl, 400)
-            if (t_vis - lx_v) < 80:
-                target_x += 40
-        if perc_res.sr is not None:
-            rx_v = np.polyval(perc_res.sr, 400)
-            if (rx_v - t_vis) < 80:
-                target_x -= 40
-
-        # ── 2. PID ───────────────────────────────────────────────────────────
-        lateral_err_px = target_x - 320.0
-
-        self._err_integral += lateral_err_px * self._dt
-        self._err_integral  = max(-200.0, min(200.0, self._err_integral))
-
-        err_deriv = (
-            (lateral_err_px - self._last_err) / self._dt if self._dt > 0 else 0.0
-        )
-        self._last_err = lateral_err_px
-
-        pid_correction = self.Ki * self._err_integral + self.Kd * err_deriv
-        target_x      += pid_correction
-
-        if abs(lateral_err_px) < 5.0 or perc_res.anchor == "DEAD_RECKONING":
-            self._err_integral *= 0.90
-
-        # ── 3. Pure Pursuit + smoothing ───────────────────────────────────────
-        raw_steer = self.pure_pursuit(target_x, la_px, perc_res.lane_width_px)
-
-        # Add parking steer bias BEFORE smoothing
-        raw_steer += steer_bias
-
-        blend = 0.10 if abs(raw_steer - self.last_steer) > 12.0 else 0.40
-        steer = self.last_steer + blend * (raw_steer - self.last_steer)
-        steer = np.clip(steer, self.last_steer - 15.0, self.last_steer + 15.0)
-        steer = np.clip(steer, -45.0, 45.0)
-        self.last_steer = steer
-
-        # ── 4. Speed rules ────────────────────────────────────────────────────
-        # nav_mode modifies base_speed BEFORE traffic / curvature multipliers
-        if nav_mode == "HIGHWAY":
-            base_speed = min(100.0, base_speed * 1.40)   # +40 % on highway
-        elif nav_mode == "INTERSECTION":
-            base_speed = base_speed * 0.60               # -40 % at junctions
-
-        speed = base_speed
-
-        if eff_traffic_state == "SYS_STOP" or nav_state == "CALIBRATING":
+        # ─────────────────────────────────────────────────────────────────────
+        # Speed calculation (V3 curvature + traffic scaling)
+        # ─────────────────────────────────────────────────────────────────────
+        if traffic_state == "SYS_STOP" or parking_state == "WAIT":
             speed = 0.0
-        elif eff_traffic_state == "SYS_SLOW":
-            speed *= 0.5
-        elif eff_traffic_state == "SYS_LIMIT":
-            speed *= 0.75
+        else:
+            speed = base_speed
 
-        # Roundabout: slow down for safety
-        if in_roundabout:
-            speed *= 0.70
+            # V3 curvature scaling
+            if curvature > self.HIGH_CURV_THRESH:
+                speed *= self.HIGH_CURV_SCALE
+            elif curvature > self.MED_CURV_THRESH:
+                speed *= self.MED_CURV_SCALE
 
-        # Map curvature pre-emptive slowdown
-        if map_curvature > 0.0030:
-            speed *= 0.40
-        elif map_curvature > 0.0015:
-            speed *= 0.65
+            # Bonus for dual lines (stable)
+            if sl is not None and sr is not None and anchor.startswith("CENTERED_DUAL"):
+                speed *= self.DUAL_SPEED_SCALE
 
-        # Steering-based slowdown
-        abs_steer = abs(steer)
-        if abs_steer > 25.0:
-            speed *= 0.6
-        elif abs_steer > 12.0:
-            speed *= 0.8
-        elif abs_steer < 8.0 and perc_res.anchor.startswith("DUAL"):
-            speed *= 1.20 if perc_res.confidence > 0.8 else 1.15
+            # Guard speed scaling
+            speed *= guard_speed_scale
 
-        # Dead-reckoning crawl (only in BASIC/INTERSECTION, not HIGHWAY)
-        if perc_res.anchor == "DEAD_RECKONING" and nav_mode != "HIGHWAY":
-            speed *= 0.30
+            # Dead-reckoning penalty
+            if "DEAD_RECKONING" in anchor:
+                speed *= 0.50
 
-        speed = max(0.0, min(100.0, speed))
+            # Apply traffic multiplier
+            speed *= traffic_mult
 
-        # ── Zone speed floors (applied only when actively driving) ─────────────
-        _freely_driving = (
-            eff_traffic_state == "SYS_GO"
-            and perc_res.anchor != "DEAD_RECKONING"
-            and parking_state in ("NONE", "DONE")
-            and speed > 0.0
-        )
-        if _freely_driving:
-            if nav_mode == "HIGHWAY" or zone_mode == "HIGHWAY":
-                speed = max(speed, self.MIN_PWM_HIGHWAY)
-            else:
-                speed = max(speed, self.MIN_PWM_CITY)
+            # Apply parking multiplier
+            if parking_state not in ("NONE", "DONE"):
+                park_mult_map = {
+                    "SEEK": 0.30, "ENTER": 0.20, "EXIT": 0.28
+                }
+                speed *= park_mult_map.get(parking_state, 1.0)
 
-        # BUG-03: Deadband guard deliberately NOT applied here.
-        # main.py multiplies by t_res.speed_multiplier AFTER this call,
-        # which can push speed back below deadband.  The single authoritative
-        # guard lives in main.py after the multiplier is applied.
+            speed = max(0.0, min(100.0, speed))
+
+            # Zone speed floors (only when actually driving)
+            if speed > 0.0 and traffic_state == "SYS_GO":
+                if zone_mode == "HIGHWAY":
+                    speed = max(speed, self.MIN_PWM_HIGHWAY)
+                else:
+                    speed = max(speed, self.MIN_PWM_CITY)
+
+        # BUG-03: Deadband NOT applied here — main.py applies after traffic mult
 
         return ControlOutput(
-            steer_angle_deg = steer,
+            steer_angle_deg = final_steer,
             speed_pwm       = speed,
             target_x        = target_x,
             anchor          = anchor,
