@@ -208,7 +208,12 @@ class STM32_SerialHandler:
         return self.send_command("speed", str(int(speed_mm_s)))
 
     def set_steering(self, angle_deg: float) -> bool:
-        angle_deg = max(-25.0, min(25.0, angle_deg))
+        # BUG-02 FIX: clamp raised from ±25° to ±45° to match control.py and
+        # hardware_io.py expectations.  The old ±25° silently discarded hard-
+        # corner commands without any feedback, causing controller integral
+        # wind-up and oscillation.
+        # IMPORTANT: verify your servo mechanical stop before setting > 30°.
+        angle_deg = max(-45.0, min(45.0, angle_deg))
         self.status.steering_angle = angle_deg
         return self.send_command("steer", str(int(angle_deg * 10)))
 

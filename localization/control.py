@@ -39,10 +39,10 @@ class Controller:
     #   For 0.20 m/s: pwm = 12 + 0.20/0.014 ≈ 26
     MIN_PWM_HIGHWAY = 41.0   # 40 cm/s minimum
     MIN_PWM_CITY    = 27.0   # 20 cm/s minimum
-    PWM_DEADBAND    = 14.0   # below this threshold motors are silent
-
-    # ── AEB: person box height fraction that triggers hard-stop ──────────────
-    AEB_PERSON_THRESH = 0.45  # person bbox-height / image-height > 45% → STOP
+    # PWM_DEADBAND is enforced in main.py AFTER speed_multiplier is applied.
+    # Do NOT apply it here — the multiplier can drop speed back below 14
+    # AFTER compute() returns, so a guard here would fire too early (BUG-03).
+    PWM_DEADBAND    = 14.0   # kept as a reference constant only
 
     def __init__(self):
         self.last_steer    = 0.0
@@ -275,12 +275,10 @@ class Controller:
             else:
                 speed = max(speed, self.MIN_PWM_CITY)
 
-        # ── PWM deadband guard ─────────────────────────────────────────────────
-        # Motors are physically silent below ~12 PWM.  Any non-zero commanded
-        # speed must clear the deadband; otherwise clamp to 0 (true stop) so
-        # the intent is actually executed rather than silently wasted.
-        if 0.0 < speed < self.PWM_DEADBAND:
-            speed = self.PWM_DEADBAND
+        # BUG-03: Deadband guard deliberately NOT applied here.
+        # main.py multiplies by t_res.speed_multiplier AFTER this call,
+        # which can push speed back below deadband.  The single authoritative
+        # guard lives in main.py after the multiplier is applied.
 
         return ControlOutput(
             steer_angle_deg = steer,

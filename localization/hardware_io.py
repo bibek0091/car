@@ -58,7 +58,11 @@ class HardwareIO:
         self.camera = None
         self.video_cap = None
         self.serial = STM32_SerialHandler()
-        self.SPEED_CALIB = 0.014
+        self.SPEED_CALIB = 0.014   # m/s per PWM unit above deadband-12
+        self.DEADBAND_PWM = 12.0   # PWM below this = 0 motor RPM
+        self.MAX_SPEED_MS = 0.50   # physical top speed (PWM 100 ≈ 0.50 m/s)
+        # MIN-10: initialize _vel_filtered so get_velocity_ms avoids getattr()
+        self._vel_filtered = 0.0
 
         # Simulator Kinematic Model State
         self._sim_yaw = 0.0          # integrated heading for sim
@@ -147,15 +151,25 @@ class HardwareIO:
         self._last_cmd_steer = steer_angle_deg
         if self.sim_mode:
             return
+        # BUG-02 FIX: hardware_io clips to ±45 but STM32_SerialHandler was
+        # silently clamping to ±25.  Clamp is now raised to ±45 there as well.
         self.serial.set_steering(steer_angle_deg)
 
     def set_speed(self, speed_pwm):
-        """speed_pwm: 0-100."""
+        """speed_pwm: 0-100 PWM scale."""
         speed_pwm = max(0.0, min(100.0, speed_pwm))
         if self.sim_mode:
             self._last_cmd_speed = speed_pwm
             return
-        self.serial.set_speed(speed_pwm)
+        # BUG-01 FIX: STM32_SerialHandler.set_speed() expects mm/s, NOT PWM.
+        # Convert: velocity_ms = max(0, (pwm - deadband) * SPEED_CALIB)
+        # Then scale to mm/s for the serial protocol (0-500 mm/s range).
+        if speed_pwm == 0.0:
+            speed_mm_s = 0.0
+        else:
+            speed_ms   = max(0.0, (speed_pwm - self.DEADBAND_PWM) * self.SPEED_CALIB)
+            speed_mm_s = min(500.0, speed_ms * 1000.0)  # m/s -> mm/s, capped at 500
+        self.serial.set_speed(speed_mm_s)
 
     def get_velocity_ms(self):
         """
@@ -181,8 +195,8 @@ class HardwareIO:
                 raw = 0.0
 
         # IIR low-pass: y[n] = 0.80*y[n-1] + 0.20*x[n]
-        # alpha=0.20 balances noise rejection vs. response lag
-        self._vel_filtered = 0.80 * getattr(self, '_vel_filtered', 0.0) + 0.20 * raw
+        # MIN-10: use direct attribute access (initialized in __init__, no getattr)
+        self._vel_filtered = 0.80 * self._vel_filtered + 0.20 * raw
         return self._vel_filtered
 
     def get_encoder_steer_deg(self):

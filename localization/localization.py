@@ -53,7 +53,8 @@ class LocalizationEngine:
         self.y = 0.0
         self.yaw = 0.0          # radians, map frame, wrapped to [-pi, pi]
         self.wheelbase = 0.23   # metres (1:10 scale car)
-        self.pose_lock = threading.Lock()
+        self.pose_lock = threading.RLock()  # BUG-10: RLock prevents deadlock if
+        # fuse_map_correction and update() are ever called from different threads.
 
         self._yaw_rate_smoothed = 0.0
         self._conf_history = deque(maxlen=self.CONF_HISTORY_LEN)
@@ -231,6 +232,14 @@ class LocalizationEngine:
                     * min(mean_conf, 1.0)
                 )
 
+                # BUG-04: SIGN CONVENTION NOTE
+                # Heading vector: (cos yaw, sin yaw)
+                # Left  perpendicular: (-sin yaw,  cos yaw)
+                # Right perpendicular: ( sin yaw, -cos yaw)  ← used here
+                # lane_error_px = target_x - 320:
+                #   positive = car must move RIGHT → right perpendicular is correct.
+                # camera_lateral_vel_ms uses the same perp; rightward velocity
+                # increments x by +sin(yaw), which is correct for all headings.
                 perp_x =  math.sin(self.yaw)
                 perp_y = -math.cos(self.yaw)
                 self.x += gain * lane_error_m * perp_x

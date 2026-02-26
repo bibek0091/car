@@ -217,10 +217,13 @@ class CollisionPredictor:
             cx = (x1 + x2) / 2
 
             matched = None
+            best_dist = 50   # pixel proximity threshold
             for tid, data in self.history.items():
-                if data["label"] == lbl and abs(data["cx"] - cx) < 50:
-                    matched = tid
-                    break
+                if data["label"] == lbl:
+                    dist = abs(data["cx"] - cx)
+                    if dist < best_dist:   # BUG-05: pick CLOSEST, not first match
+                        best_dist = dist
+                        matched   = tid
             if not matched:
                 self._next_id = getattr(self, '_next_id', 0) + 1
                 matched = f"{lbl}_{self._next_id}"
@@ -621,9 +624,18 @@ class TrafficDecisionEngine:
             elif any(k in lbl_lower for k in ("roundabout",)):
                 commit(4, "SYS_SLOW", "ROUNDABOUT ENTRY")
 
-            # ── Speed-limit signs ─────────────────────────────────────────────
-            elif any(k in lbl_lower for k in ("speed", "limit", "30", "50", "80")):
+            # ── Speed-limit signs (BUG-09: exact class name match) ────────────
+            elif lbl_lower in {
+                "speed_30", "speed_50", "speed_80",
+                "speed-limit-30", "speed-limit-50", "speed-limit-80",
+                "speedlimit_30", "speedlimit_50", "speedlimit_80",
+                "speed-limit", "speedlimit", "speed_limit",
+            } or (
+                lbl_lower.startswith(("speed_", "speed-limit-", "speedlimit_"))
+                and any(ch.isdigit() for ch in lbl_lower)
+            ):
                 commit(4, "SYS_LIMIT", "SPEED LIMIT ZONE")
+
 
             # ── Parking sign ──────────────────────────────────────────────────
             elif any(k in lbl_lower for k in ("parking", "park-sign", "park_sign",

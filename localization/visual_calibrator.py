@@ -195,9 +195,12 @@ def _find_matching_edge(heading_deg: float, node_positions: dict,
     """
     Find the graph edge that best matches the car's estimated position AND heading.
     Returns (node1, node2, edge_heading_deg) or None.
+
+    BUG-06 FIX: When the reversed-edge direction is a better heading match,
+    edge_heading is now corrected by +180 so that initial_heading_deg points
+    in the direction the car is actually travelling (not 180 deg opposite).
     """
-    best = None
-    best_score = float('inf')
+    candidates = []
 
     for u, v, _ in graph.edges(data=True):
         if u not in node_positions or v not in node_positions:
@@ -205,28 +208,38 @@ def _find_matching_edge(heading_deg: float, node_positions: dict,
         p1 = node_positions[u]
         p2 = node_positions[v]
 
-        # Edge midpoint and heading
         mid_x = (p1[0] + p2[0]) / 2.0
         mid_y = (p1[1] + p2[1]) / 2.0
         edge_heading = math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
 
-        # Distance from car to edge midpoint
         pos_err = math.hypot(mid_x - car_x, mid_y - car_y)
-
-        # Heading angular error (consider both directions)
-        h_err = abs(((heading_deg - edge_heading + 180) % 360) - 180)
-        h_err = min(h_err, abs(h_err - 180))   # also check reversed edge
-
-        if pos_err > max_pos_err_m or h_err > max_heading_err_deg:
+        if pos_err > max_pos_err_m:
             continue
 
-        # Score = position error (m) + heading error (°) / 10
-        score = pos_err + h_err / 10.0
-        if score < best_score:
-            best_score = score
-            best = (u, v, edge_heading)
+        # BUG-06: compute forward AND reverse heading error separately.
+        # Track WHICH direction won so the returned heading is correct.
+        h_err_fwd = abs(((heading_deg - edge_heading + 180) % 360) - 180)
+        h_err_rev = abs(((heading_deg - (edge_heading + 180) + 180) % 360) - 180)
+        if h_err_rev < h_err_fwd:
+            h_err = h_err_rev
+            matched_heading = (edge_heading + 180) % 360   # reversed wins
+        else:
+            h_err = h_err_fwd
+            matched_heading = edge_heading
 
-    return best
+        if h_err > max_heading_err_deg:
+            continue
+
+        score = pos_err + h_err / 10.0
+        candidates.append((score, u, v, matched_heading))
+
+    if not candidates:
+        return None
+
+    # MIN-09: sort by score; pick best (BUG-05 style: closest + most aligned)
+    candidates.sort(key=lambda c: c[0])
+    _, u, v, best_heading = candidates[0]
+    return (u, v, best_heading)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
