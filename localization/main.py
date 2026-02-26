@@ -40,6 +40,7 @@ from control import Controller
 from hardware_io import HardwareIO
 from traffic_module import ThreadedYOLODetector, TrafficDecisionEngine
 from visual_calibrator import VisualCalibrator
+from mpu9250_imu import MPU9250_Thread
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -1647,6 +1648,10 @@ class Orchestrator:
         self.localizer = LocalizationEngine()
         self.controller = Controller()
         self.calibrator: VisualCalibrator = None  # instantiated after start_node is set
+        
+        self.imu = MPU9250_Thread()
+        if not args.sim:
+            self.imu.start()
 
         self.path_lock = threading.Lock()
         self.planned_path: list = []
@@ -1865,6 +1870,8 @@ class Orchestrator:
                     )
 
                 # 6. Camera-only localizer update
+                imu_yaw_rad, imu_yaw_rate_rps = self.imu.get_yaw_data() if hasattr(self, 'imu') else (None, None)
+                
                 pose = self.localizer.update(
                     velocity_ms              = velocity_ms,
                     steer_angle_deg          = steer,
@@ -1874,7 +1881,8 @@ class Orchestrator:
                     dt                       = self._dt,
                     camera_yaw_correction    = cam_yaw_corr,
                     camera_lateral_vel_ms    = cam_lat_vel,
-                    camera_heading_rate_rps  = cam_heading_rate
+                    camera_heading_rate_rps  = cam_heading_rate,
+                    imu_yaw_rate_rps         = imu_yaw_rate_rps
                 )
 
                 # 7. Lookahead waypoints from A* path
@@ -2010,6 +2018,8 @@ class Orchestrator:
         self.hw.shutdown()
         if self.yolo_worker:
             self.yolo_worker.stop()
+        if getattr(self, 'imu', None):
+            self.imu.stop()
         try:
             self.csv_file.close()
         except Exception:

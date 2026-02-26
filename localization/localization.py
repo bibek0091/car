@@ -60,7 +60,8 @@ class LocalizationEngine:
                lane_error_px, lane_width_px, conf, dt,
                camera_yaw_correction=0.0,
                camera_lateral_vel_ms=0.0,
-               camera_heading_rate_rps=0.0):
+               camera_heading_rate_rps=0.0,
+               imu_yaw_rate_rps=None):
         """
         Camera-only fused pose update.
 
@@ -82,6 +83,7 @@ class LocalizationEngine:
         camera_yaw_correction     : rad, signed lane-tangent heading offset.
         camera_lateral_vel_ms     : m/s, signed lateral drift from lane-centre shift.
         camera_heading_rate_rps   : rad/s, signed heading rate from consecutive fits.
+        imu_yaw_rate_rps          : rad/s, signed heading rate directly from IMU gyro.
         """
         with self.pose_lock:
             self._conf_history.append(conf)
@@ -90,9 +92,11 @@ class LocalizationEngine:
             # ── Layer 1: Heading ─────────────────────────────────────────────
             steer_rad = math.radians(max(-45.0, min(45.0, steer_angle_deg)))
 
-            # Source A: bicycle kinematic yaw rate
+            # Source A: bicycle kinematic yaw rate or IMU yaw rate
             yaw_rate_km = 0.0
-            if velocity_ms > 0.05:
+            if imu_yaw_rate_rps is not None:
+                yaw_rate_km = imu_yaw_rate_rps
+            elif velocity_ms > 0.05:
                 yaw_rate_km = (velocity_ms / self.wheelbase) * math.tan(steer_rad)
 
             # Source B: lane-tangent heading correction
