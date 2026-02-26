@@ -1,42 +1,24 @@
 """
-Car IMU Visualizer — MPU-9250 + Raspberry Pi
-=============================================
-Uses smbus2 directly — no AK8963 magnetometer dependency.
-Complementary filter for Roll & Pitch. Gyro integration for Yaw.
+MPU-9250 Live IMU Visualizer — Matplotlib
+==========================================
+Shows Roll, Pitch, Yaw + raw Accel & Gyro live plots.
 
 Install:
-    pip install smbus2 numpy pygame
+    pip install smbus2 numpy matplotlib
 
 Run:
-    python car_imu_visualizer.py
+    python imu_plot.py
 """
 
-import numpy as np
-import pygame
-import time
-import math
 import smbus2
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import math
+import time
 
 # ─────────────────────────────────────────────
-#  COLORS
-# ─────────────────────────────────────────────
-WHITE      = (240, 240, 240)
-BG         = (20,  20,  30)
-PANEL_BG   = (30,  30,  45)
-CAR_BODY   = (52,  152, 219)
-CAR_ROOF   = (41,  128, 185)
-WHEEL      = (44,  44,  44)
-WHEEL_RIM  = (180, 180, 180)
-WINDSHIELD = (163, 228, 215)
-ARROW      = (46,  204, 113)
-RED        = (231, 76,  60)
-YELLOW     = (241, 196, 15)
-GRAY       = (100, 100, 120)
-GRID       = (40,  40,  60)
-ACCENT     = (155, 89,  182)
-
-# ─────────────────────────────────────────────
-#  MPU-9250 DIRECT READER (smbus2)
+#  MPU-9250
 # ─────────────────────────────────────────────
 class MPU9250:
     def __init__(self, bus=1, address=0x68):
@@ -49,15 +31,15 @@ class MPU9250:
         time.sleep(0.1)
         print(f"MPU-9250 connected at 0x{self.addr:02X}")
 
-    def _signed(self, val):
-        return val - 65536 if val > 32767 else val
+    def _signed(self, v):
+        return v - 65536 if v > 32767 else v
 
     def read(self):
-        d = self.bus.read_i2c_block_data(self.addr, 0x3B, 14)
-        ax = self._signed(d[0]  << 8 | d[1])  / 4096.0   # ±8g
+        d  = self.bus.read_i2c_block_data(self.addr, 0x3B, 14)
+        ax = self._signed(d[0]  << 8 | d[1])  / 4096.0
         ay = self._signed(d[2]  << 8 | d[3])  / 4096.0
         az = self._signed(d[4]  << 8 | d[5])  / 4096.0
-        gx = self._signed(d[8]  << 8 | d[9])  / 32.8     # ±1000 deg/s
+        gx = self._signed(d[8]  << 8 | d[9])  / 32.8
         gy = self._signed(d[10] << 8 | d[11]) / 32.8
         gz = self._signed(d[12] << 8 | d[13]) / 32.8
         return ax, ay, az, gx, gy, gz
@@ -69,9 +51,7 @@ class MPU9250:
 class ComplementaryFilter:
     def __init__(self, alpha=0.96):
         self.alpha = alpha
-        self.roll  = 0.0
-        self.pitch = 0.0
-        self.yaw   = 0.0
+        self.roll = self.pitch = self.yaw = 0.0
 
     def update(self, ax, ay, az, gx, gy, gz, dt):
         roll_acc  = math.degrees(math.atan2(ay, az))
@@ -83,233 +63,146 @@ class ComplementaryFilter:
         if self.yaw < -180: self.yaw += 360
         return self.roll, self.pitch, self.yaw
 
-    def reset(self):
-        self.roll = self.pitch = self.yaw = 0.0
+
+# ─────────────────────────────────────────────
+#  SETUP
+# ─────────────────────────────────────────────
+mpu = MPU9250(bus=1, address=0x68)
+cf  = ComplementaryFilter(alpha=0.96)
+
+# Calibrate gyro bias
+print("Calibrating gyro (keep still 2 sec)...")
+gx_b = gy_b = gz_b = 0.0
+N = 200
+for _ in range(N):
+    _, _, _, gx, gy, gz = mpu.read()
+    gx_b += gx; gy_b += gy; gz_b += gz
+    time.sleep(0.01)
+gx_b /= N; gy_b /= N; gz_b /= N
+print(f"Bias: gx={gx_b:.3f}  gy={gy_b:.3f}  gz={gz_b:.3f}")
+print("Starting live plot... (close window to stop)")
+
+# Data buffers (last 200 samples)
+MAXLEN = 200
+t_buf                          = list(range(MAXLEN))
+roll_buf  = [0.0] * MAXLEN
+pitch_buf = [0.0] * MAXLEN
+yaw_buf   = [0.0] * MAXLEN
+ax_buf    = [0.0] * MAXLEN
+ay_buf    = [0.0] * MAXLEN
+az_buf    = [0.0] * MAXLEN
+gx_buf    = [0.0] * MAXLEN
+gy_buf    = [0.0] * MAXLEN
+gz_buf    = [0.0] * MAXLEN
+
+prev_time = time.time()
+
+# ─────────────────────────────────────────────
+#  MATPLOTLIB SETUP
+# ─────────────────────────────────────────────
+plt.style.use("dark_background")
+fig, axes = plt.subplots(3, 1, figsize=(12, 9))
+fig.suptitle("MPU-9250 Live IMU Data  |  Bosch Future Mobility Challenge",
+             fontsize=14, fontweight="bold", color="white")
+fig.tight_layout(pad=3.0)
+
+# ── Plot 1: Roll Pitch Yaw ──
+ax1 = axes[0]
+ax1.set_title("Orientation (deg)", color="white")
+ax1.set_ylim(-180, 180)
+ax1.set_xlim(0, MAXLEN)
+ax1.set_ylabel("Degrees")
+ax1.grid(True, alpha=0.3)
+line_roll,  = ax1.plot(roll_buf,  color="#3498db", label="Roll",  linewidth=2)
+line_pitch, = ax1.plot(pitch_buf, color="#2ecc71", label="Pitch", linewidth=2)
+line_yaw,   = ax1.plot(yaw_buf,   color="#f1c40f", label="Yaw",   linewidth=2)
+ax1.legend(loc="upper right")
+ax1.axhline(0, color="white", linewidth=0.5, linestyle="--")
+
+# ── Plot 2: Accelerometer ──
+ax2 = axes[1]
+ax2.set_title("Accelerometer (g)", color="white")
+ax2.set_ylim(-4, 4)
+ax2.set_xlim(0, MAXLEN)
+ax2.set_ylabel("g force")
+ax2.grid(True, alpha=0.3)
+line_ax, = ax2.plot(ax_buf, color="#e74c3c", label="Ax", linewidth=1.5)
+line_ay, = ax2.plot(ay_buf, color="#e67e22", label="Ay", linewidth=1.5)
+line_az, = ax2.plot(az_buf, color="#9b59b6", label="Az", linewidth=1.5)
+ax2.legend(loc="upper right")
+ax2.axhline(0, color="white", linewidth=0.5, linestyle="--")
+
+# ── Plot 3: Gyroscope ──
+ax3 = axes[2]
+ax3.set_title("Gyroscope (deg/s)", color="white")
+ax3.set_ylim(-200, 200)
+ax3.set_xlim(0, MAXLEN)
+ax3.set_ylabel("deg/s")
+ax3.set_xlabel("Samples")
+ax3.grid(True, alpha=0.3)
+line_gx, = ax3.plot(gx_buf, color="#1abc9c", label="Gx", linewidth=1.5)
+line_gy, = ax3.plot(gy_buf, color="#e91e63", label="Gy", linewidth=1.5)
+line_gz, = ax3.plot(gz_buf, color="#00bcd4", label="Gz", linewidth=1.5)
+ax3.legend(loc="upper right")
+ax3.axhline(0, color="white", linewidth=0.5, linestyle="--")
+
+# Live text display
+info_text = fig.text(0.01, 0.01,
+    "Roll: 0.00  Pitch: 0.00  Yaw: 0.00",
+    fontsize=11, color="white",
+    bbox=dict(facecolor="#1a1a2e", edgecolor="gray", boxstyle="round"))
 
 
 # ─────────────────────────────────────────────
-#  DRAWING HELPERS
+#  ANIMATION UPDATE
 # ─────────────────────────────────────────────
-def rot(px, py, cx, cy, a):
-    r  = math.radians(a)
-    dx, dy = px-cx, py-cy
-    return cx + dx*math.cos(r) - dy*math.sin(r), cy + dx*math.sin(r) + dy*math.cos(r)
+def update(_):
+    global prev_time
 
-def rot_poly(pts, cx, cy, a):
-    return [rot(p[0], p[1], cx, cy, a) for p in pts]
+    now = time.time()
+    dt  = max(now - prev_time, 0.001)
+    prev_time = now
 
-def draw_grid(surf, rect):
-    x0, y0, w, h = rect
-    for x in range(x0, x0+w, 30):
-        pygame.draw.line(surf, GRID, (x,y0), (x,y0+h))
-    for y in range(y0, y0+h, 30):
-        pygame.draw.line(surf, GRID, (x0,y), (x0+w,y))
+    try:
+        ax, ay, az, gx, gy, gz = mpu.read()
+        gx -= gx_b; gy -= gy_b; gz -= gz_b
+        roll, pitch, yaw = cf.update(ax, ay, az, gx, gy, gz, dt)
+    except Exception as e:
+        print(f"Read error: {e}")
+        return
 
-def panel(surf, rect, title, font):
-    pygame.draw.rect(surf, PANEL_BG, rect, border_radius=12)
-    pygame.draw.rect(surf, GRAY,     rect, 2, border_radius=12)
-    draw_grid(surf, rect)
-    surf.blit(font.render(title, True, ACCENT), (rect[0]+10, rect[1]+8))
+    # Append and trim buffers
+    def push(buf, val):
+        buf.append(val)
+        if len(buf) > MAXLEN: buf.pop(0)
 
-def txt_c(surf, text, font, color, cx, cy):
-    t = font.render(text, True, color)
-    surf.blit(t, t.get_rect(center=(cx,cy)))
+    push(roll_buf,  roll)
+    push(pitch_buf, pitch)
+    push(yaw_buf,   yaw)
+    push(ax_buf, ax); push(ay_buf, ay); push(az_buf, az)
+    push(gx_buf, gx); push(gy_buf, gy); push(gz_buf, gz)
 
+    # Update lines
+    line_roll.set_ydata(roll_buf)
+    line_pitch.set_ydata(pitch_buf)
+    line_yaw.set_ydata(yaw_buf)
+    line_ax.set_ydata(ax_buf)
+    line_ay.set_ydata(ay_buf)
+    line_az.set_ydata(az_buf)
+    line_gx.set_ydata(gx_buf)
+    line_gy.set_ydata(gy_buf)
+    line_gz.set_ydata(gz_buf)
 
-# ─────────────────────────────────────────────
-#  CAR VIEWS
-# ─────────────────────────────────────────────
-def car_top(surf, cx, cy, yaw, fs):
-    W, H = 36, 70
-    body = rot_poly([(cx-W//2,cy-H//2),(cx+W//2,cy-H//2),
-                     (cx+W//2+6,cy-H//4),(cx+W//2+6,cy+H//4),
-                     (cx+W//2,cy+H//2),(cx-W//2,cy+H//2),
-                     (cx-W//2-6,cy+H//4),(cx-W//2-6,cy-H//4)], cx, cy, yaw)
-    pygame.draw.polygon(surf, CAR_BODY, body)
-    pygame.draw.polygon(surf, WHITE, body, 2)
-    roof = rot_poly([(cx-14,cy-19),(cx+14,cy-19),(cx+14,cy+19),(cx-14,cy+19)],cx,cy,yaw)
-    pygame.draw.polygon(surf, CAR_ROOF, roof)
-    ws = rot_poly([(cx-12,cy-H//2+5),(cx+12,cy-H//2+5),
-                   (cx+10,cy-H//2+16),(cx-10,cy-H//2+16)],cx,cy,yaw)
-    pygame.draw.polygon(surf, WINDSHIELD, ws)
-    tip = rot(cx, cy-H//2-18, cx, cy, yaw)
-    al  = rot(cx-8, cy-H//2-6, cx, cy, yaw)
-    ar  = rot(cx+8, cy-H//2-6, cx, cy, yaw)
-    pygame.draw.polygon(surf, ARROW, [tip, al, ar])
-    for wx,wy in [(cx-W//2-2,cy-H//2+10),(cx+W//2+2,cy-H//2+10),
-                  (cx-W//2-2,cy+H//2-10),(cx+W//2+2,cy+H//2-10)]:
-        rx,ry = rot(wx,wy,cx,cy,yaw)
-        pygame.draw.ellipse(surf, WHEEL,     (rx-5,ry-8,10,16))
-        pygame.draw.ellipse(surf, WHEEL_RIM, (rx-3,ry-5,6,10),1)
-    surf.blit(fs.render(f"YAW: {yaw:+.1f} deg", True, YELLOW),(cx-45,cy+H//2+18))
+    # Update info text
+    info_text.set_text(
+        f"Roll: {roll:+7.2f}°   Pitch: {pitch:+7.2f}°   Yaw: {yaw:+7.2f}°  |  "
+        f"Ax: {ax:+.3f}g  Ay: {ay:+.3f}g  Az: {az:+.3f}g"
+    )
 
-def car_front(surf, cx, cy, roll, fs):
-    W, H = 80, 50
-    body = rot_poly([(cx-W//2,cy+H//2),(cx+W//2,cy+H//2),
-                     (cx+W//2+10,cy),(cx+W//2-5,cy-H//2+10),
-                     (cx-W//2+5,cy-H//2+10),(cx-W//2-10,cy)],cx,cy,roll)
-    pygame.draw.polygon(surf, CAR_BODY, body)
-    pygame.draw.polygon(surf, WHITE, body, 2)
-    roof = rot_poly([(cx-25,cy-H//2+10),(cx+25,cy-H//2+10),
-                     (cx+20,cy-H//2-18),(cx-20,cy-H//2-18)],cx,cy,roll)
-    pygame.draw.polygon(surf, CAR_ROOF, roof)
-    ws = rot_poly([(cx-20,cy-H//2+10),(cx+20,cy-H//2+10),
-                   (cx+16,cy-H//2-16),(cx-16,cy-H//2-16)],cx,cy,roll)
-    pygame.draw.polygon(surf, WINDSHIELD, ws)
-    for wx in [cx-W//2-5, cx+W//2+5]:
-        rx,ry = rot(wx,cy+H//2,cx,cy,roll)
-        pygame.draw.ellipse(surf, WHEEL,    (rx-12,ry-8,24,16))
-        pygame.draw.circle(surf, WHEEL_RIM, (int(rx),int(ry)),5,2)
-    l1 = rot(cx-60, cy+H//2+15, cx, cy+H//2+15, roll)
-    l2 = rot(cx+60, cy+H//2+15, cx, cy+H//2+15, roll)
-    pygame.draw.line(surf, RED, (int(l1[0]),int(l1[1])), (int(l2[0]),int(l2[1])), 2)
-    surf.blit(fs.render(f"ROLL: {roll:+.1f} deg", True, YELLOW),(cx-50,cy+H//2+28))
-
-def car_side(surf, cx, cy, pitch, fs):
-    W, H = 100, 45
-    body = rot_poly([(cx-W//2,cy+H//2),(cx+W//2,cy+H//2),
-                     (cx+W//2+5,cy+H//4),(cx+W//2,cy-H//2+10),
-                     (cx+W//4,cy-H//2-5),(cx-W//4+5,cy-H//2-5),
-                     (cx-W//2+5,cy-H//2+10),(cx-W//2-5,cy+H//4)],cx,cy,pitch)
-    pygame.draw.polygon(surf, CAR_BODY, body)
-    pygame.draw.polygon(surf, WHITE, body, 2)
-    roof = rot_poly([(cx-W//4+5,cy-H//2-5),(cx+W//4,cy-H//2-5),
-                     (cx+W//4-5,cy-H//2-22),(cx-W//4+8,cy-H//2-22)],cx,cy,pitch)
-    pygame.draw.polygon(surf, CAR_ROOF, roof)
-    ws = rot_poly([(cx-W//4+8,cy-H//2-22),(cx+W//4-5,cy-H//2-22),
-                   (cx+W//4,cy-H//2-5),(cx-W//4+5,cy-H//2-5)],cx,cy,pitch)
-    pygame.draw.polygon(surf, WINDSHIELD, ws)
-    for wx in [cx-W//2+12, cx+W//2-12]:
-        rx,ry = rot(wx,cy+H//2+2,cx,cy,pitch)
-        pygame.draw.circle(surf, WHEEL,     (int(rx),int(ry)),13)
-        pygame.draw.circle(surf, WHEEL_RIM, (int(rx),int(ry)),7,2)
-    pygame.draw.line(surf, GRAY,(cx-W//2-20,cy+H//2+15),(cx+W//2+20,cy+H//2+15),2)
-    surf.blit(fs.render(f"PITCH: {pitch:+.1f} deg", True, YELLOW),(cx-55,cy+H//2+23))
+    print(f"Roll:{roll:+7.2f}  Pitch:{pitch:+7.2f}  Yaw:{yaw:+7.2f}  |  "
+          f"Ax:{ax:+.3f}  Ay:{ay:+.3f}  Az:{az:+.3f}  "
+          f"Gx:{gx:+.2f}  Gy:{gy:+.2f}  Gz:{gz:+.2f}")
 
 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
-def main():
-    print("Connecting to MPU-9250...")
-    mpu = MPU9250(bus=1, address=0x68)
-    cf  = ComplementaryFilter(alpha=0.96)
-
-    print("Calibrating gyro (keep still 2 sec)...")
-    gx_b = gy_b = gz_b = 0.0
-    N = 200
-    for _ in range(N):
-        _, _, _, gx, gy, gz = mpu.read()
-        gx_b += gx; gy_b += gy; gz_b += gz
-        time.sleep(0.01)
-    gx_b /= N; gy_b /= N; gz_b /= N
-    print(f"Bias  gx={gx_b:.3f}  gy={gy_b:.3f}  gz={gz_b:.3f}")
-
-    pygame.init()
-    SW, SH = 1100, 700
-    screen = pygame.display.set_mode((SW, SH))
-    pygame.display.set_caption("Car IMU Visualizer — Bosch Challenge")
-    clock = pygame.time.Clock()
-
-    ft = pygame.font.SysFont("monospace", 20, bold=True)
-    fl = pygame.font.SysFont("monospace", 15, bold=True)
-    fs = pygame.font.SysFont("monospace", 13)
-    fd = pygame.font.SysFont("monospace", 15)
-
-    roll = pitch = yaw = 0.0
-    yaw_hist = []
-    prev = time.time()
-
-    while True:
-        for e in pygame.event.get():
-            if e.type == pygame.QUIT:
-                pygame.quit(); return
-            if e.type == pygame.KEYDOWN and e.key == pygame.K_r:
-                cf.reset()
-
-        now = time.time()
-        dt  = max(now - prev, 0.001)
-        prev = now
-
-        try:
-            ax, ay, az, gx, gy, gz = mpu.read()
-            gx -= gx_b; gy -= gy_b; gz -= gz_b
-            roll, pitch, yaw = cf.update(ax, ay, az, gx, gy, gz, dt)
-        except Exception as ex:
-            print(f"Read error: {ex}")
-
-        yaw_hist.append(yaw)
-        if len(yaw_hist) > 100: yaw_hist.pop(0)
-
-        # ── DRAW ──────────────────────────────────
-        screen.fill(BG)
-
-        # Title bar
-        pygame.draw.rect(screen, (25,25,40), (0,0,SW,48))
-        screen.blit(ft.render("Car IMU Visualizer  |  MPU-9250  |  Bosch Future Mobility", True, WHITE),(15,13))
-        screen.blit(fs.render("R = Reset", True, GRAY),(SW-110,16))
-
-        # ── TOP VIEW ──
-        panel(screen, (15,55,330,370), "TOP VIEW  —  YAW", fl)
-        car_top(screen, 180, 250, yaw, fs)
-        # compass
-        ccx, ccy = 305, 115
-        pygame.draw.circle(screen, GRAY, (ccx,ccy), 30, 1)
-        for lbl,ang in [("N",0),("E",90),("S",180),("W",270)]:
-            txt_c(screen, lbl, fs, GRAY,
-                  int(ccx+38*math.sin(math.radians(ang))),
-                  int(ccy-38*math.cos(math.radians(ang))))
-        nx2 = ccx+24*math.sin(math.radians(yaw))
-        ny2 = ccy-24*math.cos(math.radians(yaw))
-        pygame.draw.line(screen, RED,(ccx,ccy),(int(nx2),int(ny2)),3)
-        pygame.draw.circle(screen, RED,(ccx,ccy),4)
-
-        # ── FRONT VIEW ──
-        panel(screen, (360,55,330,370), "FRONT VIEW  —  ROLL", fl)
-        car_front(screen, 525, 240, roll, fs)
-
-        # ── SIDE VIEW ──
-        panel(screen, (705,55,380,370), "SIDE VIEW  —  PITCH", fl)
-        car_side(screen, 895, 235, -pitch, fs)
-
-        # ── DATA PANEL ──
-        panel(screen, (15,440,1070,245), "LIVE DATA", fl)
-
-        def gauge(lbl, val, lo, hi, x, y, col):
-            w = 220
-            p = max(0.0, min(1.0, (val-lo)/(hi-lo)))
-            pygame.draw.rect(screen, GRAY,  (x,y,w,18), border_radius=4)
-            pygame.draw.rect(screen, col,   (x,y,int(w*p),18), border_radius=4)
-            pygame.draw.rect(screen, WHITE, (x,y,w,18),1,border_radius=4)
-            screen.blit(fd.render(f"{lbl}: {val:+7.2f} deg", True, WHITE),(x+w+10,y))
-
-        gauge("ROLL ", roll,  -90,  90, 35, 490, CAR_BODY)
-        gauge("PITCH", pitch, -90,  90, 35, 525, ARROW)
-        gauge("YAW  ", yaw,  -180, 180, 35, 560, YELLOW)
-
-        # yaw graph
-        gx0,gy0,gw,gh = 330,455,400,120
-        pygame.draw.rect(screen,(20,20,35),(gx0,gy0,gw,gh))
-        pygame.draw.rect(screen,GRAY,(gx0,gy0,gw,gh),1)
-        my = gy0+gh//2
-        pygame.draw.line(screen,GRID,(gx0,my),(gx0+gw,my),1)
-        screen.blit(fs.render("Yaw History",True,GRAY),(gx0+5,gy0+3))
-        if len(yaw_hist) > 1:
-            pts = [(gx0+int(i/100*gw), my-int(v/180*(gh//2-5)))
-                   for i,v in enumerate(yaw_hist)]
-            pygame.draw.lines(screen, YELLOW, False, pts, 2)
-
-        # numeric
-        screen.blit(fl.render("ORIENTATION",True,ACCENT),(760,460))
-        for i,(lbl,val,col) in enumerate([("Roll  ",roll,CAR_BODY),
-                                           ("Pitch ",pitch,ARROW),
-                                           ("Yaw   ",yaw,YELLOW)]):
-            screen.blit(fd.render(f"{lbl}: {val:+8.2f} deg",True,col),(760,490+i*28))
-
-        screen.blit(fs.render("● LIVE",True,ARROW),(SW-70,SH-22))
-        pygame.display.flip()
-        clock.tick(60)
-
-
-if __name__ == "__main__":
-    main()
+ani = animation.FuncAnimation(fig, update, interval=50, cache_frame_data=False)
+plt.show()
