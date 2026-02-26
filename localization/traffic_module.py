@@ -171,7 +171,7 @@ class CollisionPredictor:
         now = time.time()
         for det in detections:
             lbl = det["label"]
-            if lbl not in ["car", "pedestrian", "closed-road-stand"]:
+            if lbl not in ["car", "pedestrian", "closed-road-stand", "roadblock", "obstacle"]:
                 continue
             x1, y1, x2, y2 = det["bbox"]
             h = y2 - y1
@@ -285,14 +285,14 @@ class TrafficDecisionEngine:
                 elif fsm_st == "LIGHT_GREEN_GO":
                     light_st = "[GREEN] CLEAR"
             else:
-                if box_h < 90: continue
-                if lbl == "stop-sign":
+                if box_h < 40: continue
+                if lbl in ["stop-sign", "stop"]:
                     if now > self.stop_cd:
                         if self.stop_timer == 0.0: self.stop_timer = now
                         commit(2, "SYS_STOP", "STOP SIGN")
-                elif lbl == "crosswalk-sign": commit(4, "SYS_SLOW", "CROSSWALK ZONE")
-                elif "speed-limit" in lbl: commit(4, "SYS_LIMIT", "SPEED LIMIT ZONE")
-                elif lbl in ["car", "closed-road-stand"]:
+                elif lbl in ["crosswalk-sign", "crosswalk", "pedestrian_crossing"]: commit(4, "SYS_SLOW", "CROSSWALK ZONE")
+                elif "speed" in lbl and "limit" in lbl: commit(4, "SYS_LIMIT", "SPEED LIMIT ZONE")
+                elif lbl in ["car", "closed-road-stand", "roadblock", "obstacle"]:
                     if (x1 < w*0.8) and (x2 > w*0.2) and y2 > h*0.6:
                         commit(3, "SYS_LANE_CHANGE_LEFT", "EVADING OBSTACLE")
 

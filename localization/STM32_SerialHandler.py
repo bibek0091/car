@@ -125,7 +125,13 @@ class STM32_SerialHandler:
         self.send_command("alive", "1")
         time.sleep(0.1)
 
-        # BFMC-CORRECT IGNITION (KL30)
+        # BFMC-CORRECT IGNITION SEQUENCE
+        # Step B: KL15 (Accessories)
+        logger.info("Requesting KL:15 (Accessories)")
+        self.send_command("kl", "15")
+        time.sleep(0.3)
+
+        # Step D: KL30 (Ignition / Motor Enable)
         self.enable_ignition()
         time.sleep(0.4)
 
