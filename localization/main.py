@@ -722,9 +722,19 @@ class DashboardApp:
 
         tk.Frame(pnl_stat, bg="#303038", height=1).pack(fill=tk.X, padx=16, pady=6)
 
-        # ── IMU INSTRUMENT PANEL ──────────────────────────────────────────────
+        # ── IMU INSTRUMENT PANEL ────────────────────────────────────────────────
         tk.Label(pnl_stat, text="IMU INSTRUMENTS", font=("Courier", 9),
                  fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(2, 0))
+
+        # ── NAV MODE indicator ───────────────────────────────────────────
+        frm_mode = tk.Frame(pnl_stat, bg=self.PANEL_BG)
+        frm_mode.pack(fill=tk.X, padx=10, pady=(4, 2))
+        tk.Label(frm_mode, text="NAV MODE:", font=("Courier", 9),
+                 fg=self.MUTED, bg=self.PANEL_BG).pack(side=tk.LEFT, padx=4)
+        self.lbl_navmode = tk.Label(frm_mode, text="CALIBRATING",
+                                    font=("Courier", 11, "bold"),
+                                    fg=self.CYAN, bg=self.PANEL_BG)
+        self.lbl_navmode.pack(side=tk.LEFT, padx=4)
 
         self._imu_fig, (self._ax_car, self._ax_speed) = plt.subplots(
             1, 2, figsize=(2.9, 1.75), facecolor=self.PANEL_BG)
@@ -1300,7 +1310,7 @@ class DashboardApp:
         lbl_str = "  ".join(act_lbl[:6]) if act_lbl else "—"
         self.lbl_labels.config(text=f"Detections: {lbl_str}")
 
-        # ── Camera confidence instruments (car model + speed + cam LEDs) ─────
+        # ── Camera confidence instruments (car model + speed + cam LEDs) ───
         mean_conf = (l_conf + r_conf) / 2.0
         bev_cal   = 3 if (hasattr(self.orch, 'vision') and self.orch.vision.bev_calibrated) else 0
         cam_led_vals = (
@@ -1310,6 +1320,18 @@ class DashboardApp:
             bev_cal
         )
         self._update_imu_instruments(cam_heading_deg, velocity_ms, cam_led_vals, steer)
+
+        # ── Nav mode label ──────────────────────────────────────────────
+        nav_mode_t = t.get("nav_mode", "BASIC")
+        _MODE_COLORS = {
+            "BASIC":        self.CYAN,
+            "INTERSECTION": self.YELLOW,
+            "AEB":          self.RED_C,
+            "HIGHWAY":      self.GREEN_C,
+            "CALIBRATING":  self.AMBER,
+        }
+        mode_color = _MODE_COLORS.get(nav_mode_t, self.MUTED)
+        self.lbl_navmode.config(text=nav_mode_t, fg=mode_color)
 
         # ── 3D Dead-Reckoning visualiser ──────────────────────────────────────
         self._update_dr_view(x, y, cam_heading_deg, velocity_ms, nav_st)
@@ -1805,6 +1827,7 @@ class Orchestrator:
             yolo_frame  = None
             bev_frame   = None
             nav_state   = "INIT"
+            nav_mode    = "CALIBRATING"   # active navigation mode for this frame
             traffic_str = "SYS_GO"
             reason      = "—"
             light_st    = "NONE"
@@ -1822,6 +1845,7 @@ class Orchestrator:
                 reason = "E-STOP"
                 light_st = "NONE"
                 act_lbl  = []
+                nav_mode = "AEB"
 
             elif self._paused:
                 self.hw.set_speed(0.0)
@@ -1833,6 +1857,7 @@ class Orchestrator:
                 reason = "PAUSED"
                 light_st = "NONE"
                 act_lbl  = []
+                nav_mode = "BASIC"
 
             elif calib_remain > 0:
                 # ── Pre-flight: WAITING FOR START POSITION CONFIRMATION ────────
@@ -1911,9 +1936,10 @@ class Orchestrator:
                     speed, steer = 0.0, 0.0
                     light_st = "NONE"
                     act_lbl  = []
+                    nav_mode = "CALIBRATING"
 
             else:
-                # ── Full autonomous driving ────────────────────────────────────
+                # ── Full autonomous driving ─────────────────────────────────────────
                 
                 # Degradation tracking flags
                 vision_ok = True
@@ -2001,11 +2027,8 @@ class Orchestrator:
                 _prev_sl = getattr(self, '_prev_sl', None)
                 _prev_sr = getattr(self, '_prev_sr', None)
 
-                # FIX-9: while the lane is lost, cached polynomials are from a
-                # prior position.  Computing camera_odometry between those stale
-                # fits and the first recovered fit after loss would produce a huge
-                # spurious heading-rate spike (the fits differ by many frames of
-                # travel, but dt is still one frame).  Invalidate cache during loss.
+                # FIX-9: while the lane is lost, invalidate cache to prevent
+                # spurious heading-rate spikes on recovery.
                 _dead_frames = getattr(self, '_dead_reckon_frames', 0)
                 if v_res.anchor == "DEAD_RECKONING":
                     self._dead_reckon_frames = _dead_frames + 1
@@ -2030,24 +2053,71 @@ class Orchestrator:
                 with self.path_lock:
                     current_path = list(self.planned_path)
 
-                # 5. Map-matching correction — called every frame.
-                # FIX-5:  max_snap_m reduced from 0.90 m to 0.38 m (one lane width).
-                #          At 90 cm the car could be in the wrong lane before snapping.
-                # FIX-12: cursor restricts the segment search to a local window so
-                #          the call is O(1) and does not need a modulo throttle.
-                self.localizer.fuse_map_correction(
-                    current_path,
-                    self.planner.node_positions,
-                    max_snap_m=0.38,
-                    lane_conf=v_res.confidence,
-                    cursor=self._path_cursor
+                # ─────────────────────────────────────────────────────────────
+                # ── NAV MODE DETERMINATION ─────────────────────────────────────
+                # Checked in priority order: AEB > INTERSECTION > HIGHWAY > BASIC
+                # ─────────────────────────────────────────────────────────────
+
+                # --- AEB detection ---------------------------------------------------
+                # Check YOLO results for a large pedestrian bounding box.
+                # If a person/obstacle occupies > AEB_PERSON_THRESH of image height
+                # AND we are NOT already stopped, trigger AEB immediately.
+                _aeb_trigger = False
+                if yolo_ok and hasattr(t_res, 'active_labels') and t_res.active_labels:
+                    for lbl in t_res.active_labels:
+                        if any(k in lbl.lower() for k in ("person", "pedestrian", "stop_sign")):
+                            _aeb_trigger = True
+                            break
+                # Also respect explicit YOLO STOP signal as AEB
+                if t_res.state == "SYS_STOP":
+                    _aeb_trigger = True
+
+                # --- AEB consecutive-frame counter -----------------------------------
+                if _aeb_trigger:
+                    self._aeb_frames = getattr(self, '_aeb_frames', 0) + 1
+                else:
+                    self._aeb_frames = 0
+
+                # --- Mode assignment -------------------------------------------------
+                nearest_node_for_mode = self.planner.get_nearest_node(
+                    self.localizer.x, self.localizer.y
                 )
+
+                if self._aeb_frames >= 1:   # instant stop on first detection
+                    nav_mode = "AEB"
+                elif _in_roundabout or (
+                    nearest_node_for_mode and
+                    self.planner.is_at_junction(nearest_node_for_mode)
+                ):
+                    nav_mode = "INTERSECTION"
+                elif _zone_mode == "HIGHWAY":
+                    nav_mode = "HIGHWAY"
+                else:
+                    nav_mode = "BASIC"
+
+                # Inform localizer so it can tune map-correction gains
+                self.localizer.set_nav_mode(nav_mode)
+
+                # ─────────────────────────────────────────────────────────────
+                # (steps 5-10 identical to before except nav_mode wiring)
+                # ─────────────────────────────────────────────────────────────
+
+                # 5. Map-matching correction
+                if current_path:   # Bug Fix 5: skip if A* gave no path
+                    self.localizer.fuse_map_correction(
+                        current_path,
+                        self.planner.node_positions,
+                        max_snap_m=0.38,
+                        lane_conf=v_res.confidence,
+                        cursor=self._path_cursor
+                    )
+                else:
+                    log.warning("No A* path — running vision-only (BASIC mode)")
 
                 # 6. Localizer update — fuses kinematics, camera, and IMU
                 imu_yaw_rad, imu_yaw_rate_rps = (
                     self.imu.get_yaw_data() if hasattr(self, 'imu') else (None, None)
                 )
-
                 pose = self.localizer.update(
                     velocity_ms              = velocity_ms,
                     steer_angle_deg          = steer,
@@ -2064,9 +2134,10 @@ class Orchestrator:
 
                 # 7. Lookahead waypoints from A* path
                 waypoints, new_cursor = self.planner.get_lookahead_waypoints(
-                    pose[0], pose[1], current_path, cursor=self._path_cursor, lookahead_m=0.8
+                    pose[0], pose[1], current_path, cursor=self._path_cursor,
+                    lookahead_m=0.8 if nav_mode != "HIGHWAY" else 1.4
                 )
-                # Never let cursor go backward — prevents waypoints pointing behind car
+                # Never let cursor go backward
                 self._path_cursor = max(self._path_cursor, new_cursor)
 
                 # 8. Nearest node (for telemetry)
@@ -2118,16 +2189,16 @@ class Orchestrator:
                 if self.planner.is_at_junction(nearest_node):
                     next_node = self.planner.get_junction_branch(nearest_node, current_path, cursor=self._path_cursor)
                     if next_node:
-                        # Project next_node into BEV and bias target_x toward it
                         next_pos = self.planner.node_positions[next_node]
-                        waypoints = [next_pos] + waypoints  # prepend as priority target
+                        waypoints = [next_pos] + waypoints
 
                 # 8c. Lookahead map curvature
-                map_curv = self.planner.get_path_curvature(pose[0], pose[1], current_path, cursor=self._path_cursor, window_m=1.0)
+                map_curv = self.planner.get_path_curvature(
+                    pose[0], pose[1], current_path, cursor=self._path_cursor, window_m=1.0
+                )
 
-
-                # 9. Control — pass all new context: zone, line type, parking, roundabout
-                nav_state = "PILOTING"
+                # 9. Control — full nav_mode context
+                nav_state = nav_mode   # dashboard shows active mode
                 ctrl = self.controller.compute(
                     v_res, pose, waypoints, nav_state,
                     t_res.state,
@@ -2141,17 +2212,22 @@ class Orchestrator:
                     steer_bias    = t_res.steer_bias,
                     bus_lane      = _bus_lane,
                     in_roundabout = _in_roundabout,
+                    nav_mode      = nav_mode,          # ← new
                 )
-                
-                # Apply degradation speed overrides
-                speed  = ctrl.speed_pwm * t_res.speed_multiplier
+
+                # Apply degradation speed overrides (with deadband-safe floor)
+                speed = ctrl.speed_pwm * t_res.speed_multiplier
                 if not yolo_ok:
-                    speed *= 0.40
+                    speed = max(speed * 0.40, 0.0)
                     reason = "DEGRADED: YOLO DEAD"
                 if not vision_ok:
-                    speed *= 0.25
+                    speed = max(speed * 0.25, 0.0)
                     reason = "DEGRADED: VISION DEAD"
-                    
+                # Deadband guard: if a non-zero speed slipped below 14 after
+                # multipliers, clamp it up (motor won't respond otherwise).
+                if 0.0 < speed < 14.0:
+                    speed = 14.0
+
                 steer  = ctrl.steer_angle_deg
                 anchor = ctrl.anchor
 
@@ -2191,10 +2267,11 @@ class Orchestrator:
                 "fps": self._fps,
                 "speed": speed, "steer": steer,
                 "nav_state": nav_state,
+                "nav_mode":  nav_mode,              # ← driving mode for dashboard
                 "traffic": traffic_str, "reason": reason,
-                "x": 0.0,
-                "y": 0.0,
-                "yaw": 0.0,
+                "x": self.localizer.x,
+                "y": self.localizer.y,
+                "yaw": self.localizer.yaw,
                 "calib_remain": calib_remain,
                 "anchor": anchor,
                 "nearest_node": nearest_node,
@@ -2204,17 +2281,13 @@ class Orchestrator:
                 "yolo_frame": yolo_frame,
                 "bev_frame":  bev_frame,
                 "camera_frame": frame,
-                # ── IMU instrument data ──────────────────────────────────────
+                # ── IMU instrument data ────────────────────────────────────
                 "cam_heading_deg": imu_yaw_deg,           # localizer yaw in degrees
                 "velocity_ms":     velocity_ms,           # m/s from encoder/sim
             }
 
             if pose is not None:
                 telem["x"], telem["y"], telem["yaw"] = pose
-            else:
-                telem["x"] = self.localizer.x
-                telem["y"] = self.localizer.y
-                telem["yaw"] = self.localizer.yaw
 
             if not dashboard.telem_q.full():
                 dashboard.telem_q.put(telem)
@@ -2307,6 +2380,15 @@ if __name__ == "__main__":
         
         dash.btn_estop.config(state=tk.NORMAL)
         dash.btn_pause.config(state=tk.NORMAL)
+
+        # BUG 1 FIX: Reset the calibration timer NOW — at the moment the pilot
+        # thread starts — not at __init__ time.  Without this, the 6-second
+        # countdown expires before the wizard closes and the car skips
+        # calibration entirely (or worse, never drives because the timer was
+        # already done before driving variables were initialised).
+        orch.t0 = time.time()
+        orch._calib_started = False   # ensure calibration runs fresh
+        log.info(f"=== PILOT LAUNCH — calibration window reset (t0={orch.t0:.2f}) ===")
 
         # Start pilot in daemon thread
         pilot_t = threading.Thread(

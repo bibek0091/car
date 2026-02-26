@@ -62,7 +62,22 @@ class LocalizationEngine:
         # Remains None until set_pose() is called with a valid imu_yaw_rad.
         self._imu_yaw_offset = None
 
+        # Current navigation mode — set by Orchestrator each frame.
+        # "BASIC" | "INTERSECTION" | "AEB" | "HIGHWAY"
+        self._nav_mode = "BASIC"
+
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_nav_mode(self, mode: str):
+        """
+        Called by Orchestrator each frame to inform the localizer of the
+        current driving mode.  Adjusts map-correction aggressiveness:
+          BASIC        — default gains
+          INTERSECTION — stronger snap (0.60), wider search window
+          HIGHWAY      — weaker snap (0.15), trust dead-reckoning at speed
+          AEB          — frozen pose (car is stopped, no correction needed)
+        """
+        self._nav_mode = mode
 
     def set_pose(self, x, y, yaw, imu_yaw_rad=None):
         """
@@ -244,23 +259,32 @@ class LocalizationEngine:
         the A* path segment closest to the current cursor position.
 
         FIX-6:  self.x/y are read inside pose_lock (eliminates read race).
-        FIX-12: Search is restricted to [cursor-2 .. cursor+6] -> O(1).
-                Safe to call every frame without a modulo throttle.
+        FIX-12: Search is restricted to a cursor-centred window -> O(1).
         FIX-13: Only the LATERAL component of the error is applied.
-                Longitudinal position is left entirely to dead-reckoning.
-        max_snap_m default reduced from 0.90 to 0.38 (FIX-5 from main.py).
+        Nav-mode tuning:
+          INTERSECTION — wider window (±8 nodes), snap_alpha up to 0.60
+          HIGHWAY      — narrower window (±4), snap_alpha max 0.15
+          AEB          — skip entirely (car is stopped)
         """
         if not planned_path or len(planned_path) < 2:
             return
-        # When camera confidence is low, allow map correction but with a
-        # tighter snap_alpha so dead-reckoning drift is still reined in.
-        # Previously this returned early when conf < 0.20, which disabled
-        # map anchoring exactly when the car needed it most during startup.
+
+        # AEB: car is stopped, skip map correction entirely
+        if self._nav_mode == "AEB":
+            return
+
         low_conf = lane_conf < 0.20
 
-        # FIX-12: cursor-windowed segment search
-        search_start = max(0, cursor - 2)
-        search_end   = min(len(planned_path) - 1, cursor + 6)
+        # Search window tuned per nav_mode
+        if self._nav_mode == "INTERSECTION":
+            window_back, window_fwd = 3, 8
+        elif self._nav_mode == "HIGHWAY":
+            window_back, window_fwd = 2, 4
+        else:  # BASIC
+            window_back, window_fwd = 2, 6
+
+        search_start = max(0, cursor - window_back)
+        search_end   = min(len(planned_path) - 1, cursor + window_fwd)
 
         # FIX-6: read position inside the lock
         with self.pose_lock:
@@ -290,9 +314,13 @@ class LocalizationEngine:
         if best_pt is None or min_dist >= max_snap_m:
             return
 
-        # Low-confidence snap uses a much smaller alpha to avoid jumps
+        # snap_alpha tuned per nav_mode and confidence
         if low_conf:
             snap_alpha = 0.10
+        elif self._nav_mode == "INTERSECTION":
+            snap_alpha = 0.60  # strong correction at junctions
+        elif self._nav_mode == "HIGHWAY":
+            snap_alpha = 0.15  # gentle — trust dead-reckoning at speed
         else:
             snap_alpha = 0.45 if lane_conf > 0.7 else 0.30
 

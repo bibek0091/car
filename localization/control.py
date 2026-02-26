@@ -1,38 +1,17 @@
 """
-control.py — BFMC Controller
-==============================
-Changes vs previous version:
+control.py — BFMC Controller  (Localization-Based Autonomous Driving)
+=======================================================================
+Driving Modes (nav_mode):
 
-  ZONE SPEED FLOORS
-    Highway area : minimum speed 40 cm/s (PWM ≈ 41) when freely driving.
-    City area    : minimum speed 20 cm/s (PWM ≈ 27) when freely driving.
-    Floors apply only when traffic_state == "SYS_GO" (not during stops/slow).
+  BASIC         Standard lane-keeping + map-snap.  City speeds.
+  INTERSECTION  A* junction following: slow to 60 %, tight lookahead 150 px.
+  AEB           Autonomous Emergency Braking: hard-stop immediately.
+                Triggered externally by main.py (pedestrian / stop sign).
+  HIGHWAY       High-speed right-lane driving: base_speed×1.4, la≥350 px.
 
-  HIGHWAY SECOND-LANE BIAS
-    In HIGHWAY zone the controller shifts target_x rightward by
-    HIGHWAY_RIGHT_BIAS_PX (default 0.20 × lane_width_px) so the car
-    naturally occupies the second (outermost right) lane.
-    The A* path routes through right-lane nodes anyway; this bias is
-    insurance for straight highway sections.
-
-  LINE-TYPE-GATED OVERTAKING
-    If traffic_state == "SYS_LANE_CHANGE_LEFT" but line_type == "CONTINUOUS",
-    the car is NOT allowed to overtake.  It falls back to SYS_SLOW
-    (tail the obstacle) and the lateral shift is suppressed.
-
-  PARKING STEER BIAS
-    When parking_state is active the controller adds steer_bias (supplied
-    by ParkingStateMachine) directly to the final steering angle before
-    smoothing, overriding the pure-pursuit target.
-
-  BUS-LANE GUARD
-    If the current edge is flagged bus_lane=True (map attribute) the
-    controller applies a rightward correction to steer away from it.
-
-  RIGHT-SIDE DRIVING BIAS
-    A small constant bias (RIGHT_LANE_BIAS_PX = 20 px) is always added so
-    the car prefers the right side of the detected lane.  This helps on
-    two-lane city roads without explicit lane-change commands.
+Other features carried over from previous version:
+  ZONE SPEED FLOORS, LINE-TYPE-GATED OVERTAKING, PARKING, BUS-LANE GUARD.
+  PWM DEADBAND GUARD: speed is never in (0, 14) — motors are silent below ~12.
 """
 
 import math
@@ -60,6 +39,10 @@ class Controller:
     #   For 0.20 m/s: pwm = 12 + 0.20/0.014 ≈ 26
     MIN_PWM_HIGHWAY = 41.0   # 40 cm/s minimum
     MIN_PWM_CITY    = 27.0   # 20 cm/s minimum
+    PWM_DEADBAND    = 14.0   # below this threshold motors are silent
+
+    # ── AEB: person box height fraction that triggers hard-stop ──────────────
+    AEB_PERSON_THRESH = 0.45  # person bbox-height / image-height > 45% → STOP
 
     def __init__(self):
         self.last_steer    = 0.0
@@ -88,17 +71,23 @@ class Controller:
                 parking_state="NONE",
                 steer_bias=0.0,
                 bus_lane=False,
-                in_roundabout=False):
+                in_roundabout=False,
+                nav_mode="BASIC"):
         """
         Compute steering and speed commands.
 
-        Extra parameters vs previous version
-        -------------------------------------
+        nav_mode : "BASIC" | "INTERSECTION" | "AEB" | "HIGHWAY"
+          BASIC        — standard lane-keep, city speed.
+          INTERSECTION — slow to 60 %, tight lookahead, full A* guidance.
+          AEB          — hard-stop (pedestrian / stop-sign emergency).
+          HIGHWAY      — high-speed, right-lane bias, long lookahead.
+
+        Other parameters (unchanged)
         zone_mode      : "CITY" | "HIGHWAY" — governs speed floors and lane bias.
         line_type      : "DASHED"|"CONTINUOUS"|"UNKNOWN" — gates overtaking.
-        parking_state  : from ParkingStateMachine ("NONE"|"SEEK"|"ENTER"|"WAIT"|"EXIT").
+        parking_state  : "NONE"|"SEEK"|"ENTER"|"WAIT"|"EXIT".
         steer_bias     : additional steering degrees from ParkingStateMachine.
-        bus_lane       : True → strong rightward correction to avoid bus lane.
+        bus_lane       : True → rightward correction to avoid bus lane.
         in_roundabout  : True → tighter lookahead and slower speed.
         """
         self._dt = max(dt, 0.001)
@@ -109,15 +98,30 @@ class Controller:
             # Continuous line: must NOT overtake — demote to slow/tail
             eff_traffic_state = "SYS_SLOW"
 
+        # ── AEB: hard-stop immediately — no steering computed ─────────────────
+        if nav_mode == "AEB":
+            return ControlOutput(
+                steer_angle_deg = 0.0,
+                speed_pwm       = 0.0,
+                target_x        = 320.0,
+                anchor          = "AEB_STOP",
+                lookahead_px    = 0.0,
+            )
+
         # ── 1. Target computation (Vision + Map) ──────────────────────────────
         t_vis = 320.0 + perc_res.lateral_error_px
         t_map = 320.0
         ppm   = perc_res.lane_width_px / 0.35
 
-        # Adaptive lookahead
-        la_px = 320.0 if velocity_ms < 0.15 else max(
-            150.0, min(500.0, velocity_ms * ppm * 1.5)
-        )
+        # Adaptive lookahead — tuned per nav_mode
+        if nav_mode == "INTERSECTION":
+            la_px = min(150.0, velocity_ms * ppm * 1.0 + 80.0)
+        elif nav_mode == "HIGHWAY":
+            la_px = max(350.0, min(600.0, velocity_ms * ppm * 2.0))
+        else:
+            la_px = 320.0 if velocity_ms < 0.15 else max(
+                150.0, min(500.0, velocity_ms * ppm * 1.5)
+            )
         if map_curvature > 0.002:
             la_px *= 0.8
         if perc_res.anchor == "DEAD_RECKONING":
@@ -158,11 +162,11 @@ class Controller:
         # target correctly for RIGHT-only anchors. A second rightward shift here
         # caused hard weaving by fighting the perception target.
 
-        # ── Highway second-lane bias ──────────────────────────────────────────
-        # REMOVED: A* path routes through right-lane nodes; adding a fixed pixel
-        # offset on top of the waypoint-computed t_map was redundant and caused
-        # the car to exit the right lane entirely on highways.
-        if zone_mode == "HIGHWAY":
+        # ── Highway nav_mode right-lane bias ─────────────────────────────────
+        # In HIGHWAY mode apply a 10 % rightward nudge so the car stays in the
+        # outer right lane even on sensor-drift frames.
+        if nav_mode == "HIGHWAY" or zone_mode == "HIGHWAY":
+            target_x += 0.10 * perc_res.lane_width_px
             anchor += "+HW"
 
         # ── Bus-lane guard (steer right to avoid it) ──────────────────────────
@@ -218,6 +222,12 @@ class Controller:
         self.last_steer = steer
 
         # ── 4. Speed rules ────────────────────────────────────────────────────
+        # nav_mode modifies base_speed BEFORE traffic / curvature multipliers
+        if nav_mode == "HIGHWAY":
+            base_speed = min(100.0, base_speed * 1.40)   # +40 % on highway
+        elif nav_mode == "INTERSECTION":
+            base_speed = base_speed * 0.60               # -40 % at junctions
+
         speed = base_speed
 
         if eff_traffic_state == "SYS_STOP" or nav_state == "CALIBRATING":
@@ -246,17 +256,13 @@ class Controller:
         elif abs_steer < 8.0 and perc_res.anchor.startswith("DUAL"):
             speed *= 1.20 if perc_res.confidence > 0.8 else 1.15
 
-        # Dead-reckoning crawl
-        if perc_res.anchor == "DEAD_RECKONING":
+        # Dead-reckoning crawl (only in BASIC/INTERSECTION, not HIGHWAY)
+        if perc_res.anchor == "DEAD_RECKONING" and nav_mode != "HIGHWAY":
             speed *= 0.30
 
         speed = max(0.0, min(100.0, speed))
 
         # ── Zone speed floors (applied only when actively driving) ─────────────
-        # Min speeds per BFMC rules:
-        #   Highway area : 40 cm/s ≈ PWM 41
-        #   City area    : 20 cm/s ≈ PWM 27
-        # Floors are NOT applied during stops, dead-reckoning, or parking.
         _freely_driving = (
             eff_traffic_state == "SYS_GO"
             and perc_res.anchor != "DEAD_RECKONING"
@@ -264,10 +270,17 @@ class Controller:
             and speed > 0.0
         )
         if _freely_driving:
-            if zone_mode == "HIGHWAY":
+            if nav_mode == "HIGHWAY" or zone_mode == "HIGHWAY":
                 speed = max(speed, self.MIN_PWM_HIGHWAY)
             else:
                 speed = max(speed, self.MIN_PWM_CITY)
+
+        # ── PWM deadband guard ─────────────────────────────────────────────────
+        # Motors are physically silent below ~12 PWM.  Any non-zero commanded
+        # speed must clear the deadband; otherwise clamp to 0 (true stop) so
+        # the intent is actually executed rather than silently wasted.
+        if 0.0 < speed < self.PWM_DEADBAND:
+            speed = self.PWM_DEADBAND
 
         return ControlOutput(
             steer_angle_deg = steer,
