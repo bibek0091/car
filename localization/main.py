@@ -39,6 +39,7 @@ from perception import VisionPipeline
 from control import Controller
 from hardware_io import HardwareIO
 from traffic_module import ThreadedYOLODetector, TrafficDecisionEngine
+from visual_calibrator import VisualCalibrator
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -773,18 +774,17 @@ class DashboardApp:
         self._imu_canvas = FigureCanvasTkAgg(self._imu_fig, master=pnl_stat)
         self._imu_canvas.get_tk_widget().pack(pady=2)
 
-        # ── Calibration status LEDs: SYS / GYRO / ACCEL / MAG ───────────────
-        # Each LED is 0-3: 0=red, 1=orange, 2=yellow, 3=green
+        # ── Camera Confidence Indicators (replaces IMU calib LEDs) ──────────
         frm_leds = tk.Frame(pnl_stat, bg=self.PANEL_BG)
         frm_leds.pack(pady=(0, 4))
         self._calib_leds = []
-        _LED_NAMES = ["SYS", "GYR", "ACC", "MAG"]
+        _LED_NAMES = ["L-LANE", "R-LANE", "MEAN", "BEV-CAL"]
         for name in _LED_NAMES:
             cell = tk.Frame(frm_leds, bg=self.PANEL_BG)
             cell.pack(side=tk.LEFT, padx=6)
             tk.Label(cell, text=name, font=("Courier", 7),
                      fg=self.MUTED, bg=self.PANEL_BG).pack()
-            led = tk.Label(cell, text="●", font=("Courier", 12),
+            led = tk.Label(cell, text="\u25cf", font=("Courier", 12),
                            fg="#1A1A2A", bg=self.PANEL_BG)
             led.pack()
             self._calib_leds.append(led)
@@ -923,7 +923,7 @@ class DashboardApp:
         # ── 3-D Dead-Reckoning Visualiser ─────────────────────────────────────
         # Shows car body (Poly3DCollection), fading yellow trajectory trail,
         # floor grid, and live data overlays — all from fused IMU + encoder data.
-        tk.Label(pnl_cam, text="DEAD-RECKONING  (IMU + ENCODER)",
+        tk.Label(pnl_cam, text="DEAD-RECKONING  (CAMERA + ENCODER)",
                  font=("Courier", 9), fg=self.MUTED, bg=self.PANEL_BG).pack(pady=(6, 0))
 
         self._dr_fig = plt.figure(figsize=(4.5, 2.6), facecolor=self.PANEL_BG)
@@ -1178,9 +1178,10 @@ class DashboardApp:
         waypoints = t.get("waypoints", [])
         yolo_frame = t.get("yolo_frame")
         bev_frame  = t.get("bev_frame")
-        imu_yaw_deg = t.get("imu_yaw_deg", 0.0)
-        imu_calib   = t.get("imu_calib", (0, 0, 0, 0))
+        cam_heading_deg = t.get("cam_heading_deg", 0.0)
         velocity_ms = t.get("velocity_ms", 0.0)
+        l_conf = t.get("lane_l_conf", 0.0) if "lane_l_conf" in t else 0.0
+        r_conf = t.get("lane_r_conf", 0.0) if "lane_r_conf" in t else 0.0
 
         # ── Status labels ──────────────────────────────────────────────────────
         short = trf_st.replace("SYS_", "")
@@ -1202,11 +1203,19 @@ class DashboardApp:
         lbl_str = "  ".join(act_lbl[:6]) if act_lbl else "—"
         self.lbl_labels.config(text=f"Detections: {lbl_str}")
 
-        # ── IMU instruments (car model + speedometer + calib LEDs) ──────────
-        self._update_imu_instruments(imu_yaw_deg, velocity_ms, imu_calib, steer)
+        # ── Camera confidence instruments (car model + speed + cam LEDs) ─────
+        mean_conf = (l_conf + r_conf) / 2.0
+        bev_cal   = 3 if (hasattr(self.orch, 'vision') and self.orch.vision.bev_calibrated) else 0
+        cam_led_vals = (
+            int(round(l_conf * 3)),
+            int(round(r_conf * 3)),
+            int(round(mean_conf * 3)),
+            bev_cal
+        )
+        self._update_imu_instruments(cam_heading_deg, velocity_ms, cam_led_vals, steer)
 
         # ── 3D Dead-Reckoning visualiser ──────────────────────────────────────
-        self._update_dr_view(x, y, imu_yaw_deg, velocity_ms, nav_st)
+        self._update_dr_view(x, y, cam_heading_deg, velocity_ms, nav_st)
 
         # Calibration overlay
         if calib_remain > 0:
@@ -1393,7 +1402,7 @@ class DashboardApp:
 
         self._dr_canvas.draw_idle()
 
-    def _update_imu_instruments(self, yaw_deg, velocity_ms, imu_calib, steer_deg=0.0):
+    def _update_imu_instruments(self, yaw_deg, velocity_ms, cam_conf_vals, steer_deg=0.0):
         """
         Redraws the top-down car model and speedometer each frame.
 
@@ -1508,7 +1517,7 @@ class DashboardApp:
 
         # ── 8. Calibration LEDs ───────────────────────────────────────────────
         _LED_COLS = ["#5A1010", "#AA5500", "#AAAA00", "#00CC44"]
-        for i, val in enumerate(imu_calib[:4]):
+        for i, val in enumerate(cam_conf_vals[:4]):
             self._calib_leds[i].config(fg=_LED_COLS[max(0, min(3, int(val)))])
 
         self._imu_canvas.draw_idle()
@@ -1619,12 +1628,12 @@ class DashboardApp:
 # ORCHESTRATOR (Pilot Thread)
 # ══════════════════════════════════════════════════════════════════════════════
 class Orchestrator:
-    CSV_SCHEMA_VER = 3
+    CSV_SCHEMA_VER = 4
     CSV_HEADER = [
         "schema_ver", "timestamp", "fps", "yolo_ms", "vis_ms",
         "speed_pwm", "velocity_ms", "steer_angle",
         "nav_state", "traffic_state", "x_est", "y_est", "yaw_est",
-        "imu_yaw_raw", "nearest_node", "curvature", "lane_l_conf", "lane_r_conf", "estop"
+        "cam_heading_deg", "nearest_node", "curvature", "lane_l_conf", "lane_r_conf", "estop"
     ]
 
     def __init__(self, args):
@@ -1637,6 +1646,7 @@ class Orchestrator:
         self.vision    = VisionPipeline()
         self.localizer = LocalizationEngine()
         self.controller = Controller()
+        self.calibrator: VisualCalibrator = None  # instantiated after start_node is set
 
         self.path_lock = threading.Lock()
         self.planned_path: list = []
@@ -1717,24 +1727,29 @@ class Orchestrator:
                 act_lbl  = []
 
             elif calib_remain > 0:
-                # ── Calibration phase: Pre-flight checklist ──────────────────
+                # ── Calibration phase: Pre-flight visual calibration ──────────
                 self.hw.set_speed(0.0)
                 self.hw.set_steering(0.0)
-                nav_state = f"CALIBRATING"
+                nav_state   = "CALIBRATING"
                 traffic_str = "CALIBRATING"
+
                 if not hasattr(self, '_calib_started'):
                     self._calib_started = True
-                    log.info("--- PRE-FLIGHT CALIBRATION STARTED ---")
-                
-                # Try to pull one frame to warm up camera and YOLO
+                    # Instantiate VisualCalibrator once we know start_node position
+                    self.calibrator = VisualCalibrator(
+                        self.planner, self.localizer, self.vision
+                    )
+                    log.info("--- PRE-FLIGHT VISUAL CALIBRATION STARTED ---")
+
+                # Capture frame and feed warmup pipelines + calibrator
                 try:
                     frame = self.hw.capture_frame()
                     if frame is not None and frame.any():
-                        # Feed the pipeline once to compile/warmup allocators
+                        self.calibrator.add_frame(frame)
                         t_warm = self.traffic.process(frame)
                         v_warm = self.vision.process(frame)
                         yolo_frame = t_warm.yolo_debug_frame if t_warm.yolo_debug_frame is not None else frame
-                        bev_frame  = v_warm.lane_dbg          # Show BEV during calibration too
+                        bev_frame  = v_warm.lane_dbg
                     else:
                         yolo_frame = None
                         bev_frame  = None
@@ -1742,36 +1757,25 @@ class Orchestrator:
                     log.warning(f"Calibration warmup frame error: {e}")
                     yolo_frame = None
                     bev_frame  = None
-                
-                reason = f"{calib_remain:.1f} s remaining"
+
+                # At t > 3.0 s: finalize calibration and apply result
+                if elapsed > 3.0 and not getattr(self, '_calib_applied', False):
+                    cal_result = self.calibrator.finalize()
+                    if cal_result.src_pts is not None:
+                        self.vision.update_bev_transform(cal_result.src_pts)
+                    # Apply detected initial heading to localizer
+                    cx, cy, _ = self.localizer.get_pose()
+                    self.localizer.set_pose(
+                        cx, cy, math.radians(cal_result.initial_heading_deg)
+                    )
+                    self._calib_applied = True
+                    log.info(f"Visual calibration applied: {cal_result.status_msg}")
+
+                cal_msg = self.calibrator._result.status_msg if self.calibrator else "init"
+                reason  = f"{calib_remain:.1f}s  {cal_msg}"
                 speed, steer = 0.0, 0.0
                 light_st = "NONE"
                 act_lbl  = []
-
-                # Zero IMU yaw at t=5.5s (camera settled, ready to zero)
-                if 5.4 < elapsed < 5.6:
-                    raw_yaw, calib_status = self.hw.read_imu()
-                    if not getattr(self, '_imu_zeroed', False):
-                        self.hw.zero_imu_yaw(raw_yaw)
-                        self._imu_zeroed = True
-                        log.info(f"IMU yaw zeroed at {raw_yaw:.1f}°. Status: Sys={calib_status[0]} Gyro={calib_status[1]} Accel={calib_status[2]} Mag={calib_status[3]}")
-                        if calib_status[1] < 2:
-                            log.warning("IMU Gyro calibration logic is LOW. Do not move the car.")
-
-                # Auto-tune SPEED_CALIB
-                if not self.hw.sim_mode:
-                    if 2.0 <= elapsed < 3.0:
-                        self.hw.set_speed(50.0)
-                        self.hw.set_steering(0.0)
-                        if not hasattr(self, "_calib_speed_start_dist"):
-                            self._calib_speed_start_dist = 0.0
-                        self._calib_speed_start_dist += self.hw.get_velocity_ms() * self._dt
-                    elif 3.0 <= elapsed < 3.1:
-                        if hasattr(self, "_calib_speed_start_dist") and self._calib_speed_start_dist > 0:
-                            # SPEED_CALIB = measured_distance / (50 - 12)
-                            self.hw.SPEED_CALIB = self._calib_speed_start_dist / (50.0 - 12.0)
-                            log.info(f"Auto-tuned SPEED_CALIB to {self.hw.SPEED_CALIB:.4f}")
-                            self._calib_speed_start_dist = 0.0 # prevent recalculation
 
             else:
                 # ── Full autonomous driving ────────────────────────────────────
@@ -1823,66 +1827,51 @@ class Orchestrator:
                 if frame_idx % 30 == 0:
                     log.info(f"Pipeline Profiling: YOLO={yolo_ms:.1f}ms, Vision={vis_ms:.1f}ms")
                     
-                # 4. IMU heading
-                imu_yaw_deg, imu_calib = self.hw.get_fused_imu_yaw()
-                self.hw._last_imu_calib = imu_calib          # cache for telem
-                # IMU is available only when the real BNO055 driver loaded AND
-                # we are not in sim mode (sim uses kinematic model internally)
-                imu_available = (not self.hw.sim_mode) and (self.hw.imu is not None)
-                
+                # 4. Camera-only heading signals (always computed — no IMU)
+                from perception import estimate_heading_from_lanes, estimate_camera_odometry
+
                 # Assign visual confidences for the CSV later
                 v_res_curv = v_res.curvature
                 l_conf = v_res.l_conf
                 r_conf = v_res.r_conf
 
-                # Camera-only yaw correction (used when IMU is dead)
-                cam_yaw_corr = 0.0
-                cam_lat_vel  = 0.0
-                cam_heading_rate = 0.0
-                if not imu_available:
-                    from perception import estimate_heading_from_lanes, estimate_camera_odometry
-                    cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
-                    # Compute lateral drift velocity + heading rate from consecutive frames
-                    _prev_sl = getattr(self, '_prev_sl', None)
-                    _prev_sr = getattr(self, '_prev_sr', None)
-                    cam_lat_vel, cam_heading_rate = estimate_camera_odometry(
-                        v_res.sl, v_res.sr, _prev_sl, _prev_sr, max(self._dt, 1e-4)
-                    )
+                cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
+
+                _prev_sl = getattr(self, '_prev_sl', None)
+                _prev_sr = getattr(self, '_prev_sr', None)
+                cam_lat_vel, cam_heading_rate = estimate_camera_odometry(
+                    v_res.sl, v_res.sr, _prev_sl, _prev_sr, max(self._dt, 1e-4)
+                )
                 # Cache current fits for next-frame comparison
                 self._prev_sl = v_res.sl
                 self._prev_sr = v_res.sr
+
+                # Camera heading in degrees for telemetry / CSV
+                imu_yaw_deg = math.degrees(self.localizer.yaw)  # reuse CSV column name
 
                 # Snapshot the planned path to avoid mid-frame GUI mutations
                 with self.path_lock:
                     current_path = list(self.planned_path)
 
-                # 5. Map-matching correction (every 6 frames ≈ 5 Hz)
+                # 5. Map-matching correction (every 3 frames ≈ 10 Hz)
                 map_fuse_ctr += 1
-                if map_fuse_ctr >= 6:
+                if map_fuse_ctr >= 3:
                     map_fuse_ctr = 0
                     self.localizer.fuse_map_correction(
                         current_path,
                         self.planner.node_positions,
-                        max_snap_m=0.60,
+                        max_snap_m=0.90,
                         lane_conf=v_res.confidence
                     )
 
-                # 6. Localizer update (fuses IMU + dead-reckoning + vision)
-                accel = self.hw.get_imu_accel()
-
-                if self.localizer.detect_slip(accel, velocity_ms, self._dt):
-                    log.warning("Slip detected! Encoder velocity discarded.")
-                    velocity_ms = 0.0
-
+                # 6. Camera-only localizer update
                 pose = self.localizer.update(
                     velocity_ms              = velocity_ms,
                     steer_angle_deg          = steer,
-                    imu_yaw_deg              = imu_yaw_deg,
                     lane_error_px            = v_res.lateral_error_px,
                     lane_width_px            = v_res.lane_width_px,
                     conf                     = v_res.confidence,
                     dt                       = self._dt,
-                    imu_available            = imu_available,
                     camera_yaw_correction    = cam_yaw_corr,
                     camera_lateral_vel_ms    = cam_lat_vel,
                     camera_heading_rate_rps  = cam_heading_rate
@@ -1931,7 +1920,7 @@ class Orchestrator:
                 ctrl = self.controller.compute(
                     v_res, pose, waypoints, nav_state,
                     t_res.state, base_speed=50.0, map_curvature=map_curv,
-                    velocity_ms=velocity_ms
+                    velocity_ms=velocity_ms, dt=self._dt
                 )
                 
                 # Apply level degradation speed overrides
@@ -1997,9 +1986,8 @@ class Orchestrator:
                 "bev_frame":  bev_frame,
                 "camera_frame": frame,
                 # ── IMU instrument data ──────────────────────────────────────
-                "imu_yaw_deg":  imu_yaw_deg,              # degrees, map-frame
-                "imu_calib":    getattr(self.hw, '_last_imu_calib', (0, 0, 0, 0)),
-                "velocity_ms":  velocity_ms,              # m/s from encoder/sim
+                "cam_heading_deg": imu_yaw_deg,           # localizer yaw in degrees
+                "velocity_ms":     velocity_ms,           # m/s from encoder/sim
             }
 
             if pose is not None:

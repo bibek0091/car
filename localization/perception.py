@@ -7,8 +7,8 @@ from dataclasses import dataclass
 class PerceptionResult:
     warped_binary: np.ndarray
     lane_dbg: np.ndarray
-    sl: np.ndarray # Left polynomial
-    sr: np.ndarray # Right polynomial
+    sl: np.ndarray  # Left polynomial
+    sr: np.ndarray  # Right polynomial
     lateral_error_px: float
     anchor: str
     confidence: float
@@ -27,11 +27,14 @@ def estimate_heading_from_lanes(sl, sr, h=480):
 
     Returns the correction in RADIANS to add to the current yaw estimate.
     A negative return value = road turns left = car needs to yaw left.
+
+    Improvements over v1:
+    - Outlier rejection: discard tangents > 2 std-devs from median.
+    - Bottom-row bonus: y=480 row weight raised to 3.0.
+    - Returns 0.0 (not garbage) when no valid lane is found.
     """
-    # Sample at 5 rows from top to bottom of BEV image.
-    # Bottom rows are closest to car and most reliable → higher weight.
     eval_rows   = [h * f for f in [0.2, 0.35, 0.5, 0.7, 1.0]]
-    row_weights = [0.5,  0.75,  1.0,  1.5,  2.0]
+    row_weights = [0.5,   0.75,   1.0,   1.5,   3.0]   # bottom row 3.0
 
     all_tangents = []
     all_weights  = []
@@ -45,20 +48,31 @@ def estimate_heading_from_lanes(sl, sr, h=480):
 
     if not all_tangents:
         return 0.0
-    tangent_mean = np.average(all_tangents, weights=all_weights)
+
+    # Outlier rejection: drop anything > 2 std-devs from the median
+    arr = np.array(all_tangents)
+    wts = np.array(all_weights)
+    med = float(np.median(arr))
+    std = float(np.std(arr)) if len(arr) > 2 else 1.0
+    mask = np.abs(arr - med) <= 2.0 * std + 1e-6
+    if mask.sum() == 0:
+        mask = np.ones(len(arr), dtype=bool)  # fallback: keep all
+
+    tangent_mean = np.average(arr[mask], weights=wts[mask])
     # Negate: rightward lean in BEV = road curving right = positive yaw rate
     return -float(tangent_mean)
 
 
-def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt, h=480, scale_m_per_px=0.35/280.0):
+def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt,
+                             h=480, scale_m_per_px=0.35/280.0):
     """
     Estimates lateral drift velocity (m/s) and heading rate (rad/s) from
-    consecutive lane polynomial fits.  Used as the primary motion source when
-    IMU is unavailable.
+    consecutive lane polynomial fits.
 
-    Returns:
-        lateral_vel_ms  : signed lateral velocity. Positive = drifting right.
-        heading_rate_rps: signed yaw rate from lane tangent change. rad/s.
+    Improvements over v1:
+    - Lateral drift computed at 3 rows (200, 300, 400) and median-averaged.
+    - Drift clamped to ±0.05 m/s to prevent spike injection.
+    - Heading-rate sanity check: if |ΔH| > 0.5 rad in one frame, return 0.
     """
     if dt <= 0:
         return 0.0, 0.0
@@ -68,38 +82,50 @@ def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt, h=480, scale_m_per_px
         if sfl is not None and sfr is not None:
             return (np.polyval(sfl, y) + np.polyval(sfr, y)) / 2.0
         elif sfr is not None:
-            return np.polyval(sfr, y) - 140.0   # assume half-lane offset
+            return np.polyval(sfr, y) - 140.0
         elif sfl is not None:
             return np.polyval(sfl, y) + 140.0
         return None
 
-    c_now  = lane_center(sl,      sr)
-    c_prev = lane_center(prev_sl, prev_sr)
+    drift_samples = []
+    for eval_y in [200, 300, 400]:
+        c_now  = lane_center(sl,      sr,      eval_y)
+        c_prev = lane_center(prev_sl, prev_sr, eval_y)
+        if c_now is not None and c_prev is not None:
+            drift_samples.append((c_now - c_prev) * scale_m_per_px / dt)
 
-    if c_now is None or c_prev is None:
-        lateral_vel_ms = 0.0
+    if drift_samples:
+        lateral_vel_ms = float(np.median(drift_samples))
+        # Clamp to ±0.05 m/s — beyond this it's a fit artifact, not real motion
+        lateral_vel_ms = max(-0.05, min(0.05, lateral_vel_ms))
     else:
-        lateral_drift_px  = c_now - c_prev          # positive → drifting right
-        lateral_vel_ms    = lateral_drift_px * scale_m_per_px / dt
+        lateral_vel_ms = 0.0
 
     # ── Heading rate from tangent change between frames ─────────────────────
     curr_heading = estimate_heading_from_lanes(sl,      sr,      h)
     prev_heading = estimate_heading_from_lanes(prev_sl, prev_sr, h)
-    heading_rate_rps = (curr_heading - prev_heading) / dt
+    raw_heading_rate = (curr_heading - prev_heading) / dt
+
+    # Sanity check: > 0.5 rad/frame change is almost certainly a stale-fit artifact
+    if abs(curr_heading - prev_heading) > 0.5:
+        heading_rate_rps = 0.0
+    else:
+        heading_rate_rps = raw_heading_rate
 
     return lateral_vel_ms, heading_rate_rps
 
 
-
 class HybridLaneTracker:
-    NWINDOWS         = 9
-    SW_MARGIN        = 60
-    MINPIX           = 50
-    POLY_MARGIN_BASE = 60
-    POLY_MARGIN_CURV = 120
-    MIN_PIX_OK       = 200
-    EMA_ALPHA        = 0.50
-    STALE_FIT_FRAMES = 5
+    NWINDOWS           = 9
+    SW_MARGIN          = 60
+    SW_MARGIN_RECOVERY = 100    # wider search during lost-lane recovery
+    MINPIX             = 50
+    POLY_MARGIN_BASE   = 60
+    POLY_MARGIN_CURV   = 120
+    MIN_PIX_OK         = 200
+    EMA_ALPHA          = 0.35   # ↓ from 0.50 — smoother polynomial tracking
+    STALE_FIT_FRAMES   = 8      # ↑ from 5 — hold last known fit longer
+    LOST_RECOVERY_THRESH = 3    # trigger wide-sweep after this many lost frames
 
     def __init__(self, h=480, w=640):
         self.h, self.w = h, w
@@ -110,6 +136,7 @@ class HybridLaneTracker:
         self.l_stale, self.r_stale = 0, 0
         self.l_conf, self.r_conf = 0.0, 0.0
         self.lane_width_px = 280.0
+        self._lost_frames = 0   # consecutive frames with no lane at all
 
     def get_curvature(self, fit, y_eval):
         if fit is None: return 0.0
@@ -121,15 +148,15 @@ class HybridLaneTracker:
         if prev is None: return new.copy()
         return self.EMA_ALPHA * new + (1.0 - self.EMA_ALPHA) * prev
 
-    def _sliding_window(self, warped, nzx, nzy):
+    def _sliding_window(self, warped, nzx, nzy, wide=False):
         dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
         hist = np.sum(warped[self.h // 2:, :], axis=0)
 
         mid    = int(self.w * 0.40)
-        margin = self.SW_MARGIN
+        margin = self.SW_MARGIN_RECOVERY if wide else self.SW_MARGIN
 
-        lb = int(np.argmax(hist[margin : mid - margin])) + margin
-        rb = int(np.argmax(hist[mid + margin : self.w - margin])) + mid + margin
+        lb = int(np.argmax(hist[margin: mid - margin])) + margin
+        rb = int(np.argmax(hist[mid + margin: self.w - margin])) + mid + margin
 
         if abs(rb - lb) < 100:
             smoothed = np.convolve(hist.astype(float), np.ones(20) / 20, mode='same')
@@ -145,14 +172,15 @@ class HybridLaneTracker:
 
         for win in range(self.NWINDOWS):
             y_lo, y_hi = self.h - (win + 1) * wh, self.h - win * wh
-            xl0, xl1 = max(0, lx - self.SW_MARGIN), min(self.w, lx + self.SW_MARGIN)
-            xr0, xr1 = max(0, rx - self.SW_MARGIN), min(self.w, rx + self.SW_MARGIN)
+            sw = self.SW_MARGIN_RECOVERY if wide else self.SW_MARGIN
+            xl0, xl1 = max(0, lx - sw), min(self.w, lx + sw)
+            xr0, xr1 = max(0, rx - sw), min(self.w, rx + sw)
 
             cv2.rectangle(dbg, (xl0, y_lo), (xl1, y_hi), (0, 255, 0), 2)
             cv2.rectangle(dbg, (xr0, y_lo), (xr1, y_hi), (0, 255, 0), 2)
 
-            gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0)  & (nzx < xl1)).nonzero()[0]
-            gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0)  & (nzx < xr1)).nonzero()[0]
+            gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0) & (nzx < xl1)).nonzero()[0]
+            gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0) & (nzx < xr1)).nonzero()[0]
 
             li.append(gl); ri.append(gr)
 
@@ -192,13 +220,21 @@ class HybridLaneTracker:
         nzy = np.array(nz[0])
         nzx = np.array(nz[1])
 
+        # Lost-lane recovery: widen search when both fits have been None for too long
+        both_lost = (self.sl is None and self.sr is None)
+        if both_lost:
+            self._lost_frames += 1
+        else:
+            self._lost_frames = 0
+        do_wide_sweep = (self._lost_frames >= self.LOST_RECOVERY_THRESH)
+
         if self.mode == "TRACKING" and (self.sl is not None or self.sr is not None):
             curv = self.get_curvature(self.sl if self.sl is not None else self.sr, self.h // 2)
             li, ri, dbg = self._poly_search(warped, nzx, nzy, curvature=curv)
             mode_label  = "POLY"
         else:
-            li, ri, dbg = self._sliding_window(warped, nzx, nzy)
-            mode_label  = "SLIDE"
+            li, ri, dbg = self._sliding_window(warped, nzx, nzy, wide=do_wide_sweep)
+            mode_label  = "SLIDE-WIDE" if do_wide_sweep else "SLIDE"
 
         self.l_conf = len(li) / 1000.0
         self.r_conf = len(ri) / 1000.0
@@ -244,39 +280,47 @@ class HybridLaneTracker:
                     self.r_stale = self.STALE_FIT_FRAMES
                     has_r = False
             else:
-                # y=400 is at the BOTTOM of the BEV (closest to car) — most reliable
-                # y=100 is at the TOP (furthest) — least reliable
-                # Weights must be [1,2,3,4] for [100,200,300,400]
                 y_pos = [100, 200, 300, 400]
                 widths = []
                 for y in y_pos:
-                    lx = np.polyval(self.sl, y)
-                    rx = np.polyval(self.sr, y)
-                    widths.append(rx - lx)
-                w = np.average(widths, weights=[1, 2, 3, 4])   # bottom row = highest weight
+                    lx_v = np.polyval(self.sl, y)
+                    rx_v = np.polyval(self.sr, y)
+                    widths.append(rx_v - lx_v)
+                w = np.average(widths, weights=[1, 2, 3, 4])
                 self.lane_width_px = 0.8 * self.lane_width_px + 0.2 * w
 
         self.lane_width_px = max(150.0, min(self.lane_width_px, 400.0))
         self.mode = "TRACKING" if (has_l or has_r or self.sl is not None or self.sr is not None) else "SEARCH"
-        
+
         return dbg
+
 
 class VisionPipeline:
     def __init__(self):
         self.tracker = HybridLaneTracker()
-        self.SRC_PTS = np.float32([[200,260],[440,260],[40,450],[600,450]])
-        self.DST_PTS = np.float32([[150,0],[490,0],[150,480],[490,480]])
+        # Default BEV transform — will be auto-calibrated by VisualCalibrator
+        self.SRC_PTS = np.float32([[200, 260], [440, 260], [40, 450], [600, 450]])
+        self.DST_PTS = np.float32([[150, 0], [490, 0], [150, 480], [490, 480]])
         self.M = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
-        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        
+        self.clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))  # raised from 3.0
+        self.bev_calibrated = False
+
+    def update_bev_transform(self, src_pts):
+        """
+        Called by VisualCalibrator after vanishing-point detection.
+        Updates the perspective transform with calibrated source points.
+        """
+        self.SRC_PTS = np.float32(src_pts)
+        self.M = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
+        self.bev_calibrated = True
+
     def process(self, frame_bgr):
         warped = cv2.warpPerspective(frame_bgr, self.M, (640, 480))
-        
+
         lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
         L = self.clahe.apply(lab[:, :, 0])
-        
+
         # Adaptive Lighting Compensation
-        # BUG 11: Gradual interpolation prevents harsh contrast snapping (from bfmc_pilot_v3_yolo)
         mean_l = np.mean(L)
         if mean_l < 100:
             a = 1.0 + (100 - mean_l) / 200
@@ -287,40 +331,48 @@ class VisionPipeline:
             b = -(mean_l - 180) * 0.4
             L = cv2.convertScaleAbs(L, alpha=a, beta=int(b))
 
-        # Track is WHITE, lines are BLACK (dark spots). Filtering out shadows with a +15 constant adjustment.
+        # Track is WHITE, lines are BLACK. Filter shadows with +15 constant.
         binary = cv2.adaptiveThreshold(
             L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 31, 15)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        
+
         dbg = self.tracker.update(binary)
-        
+
         sl, sr = self.tracker.sl, self.tracker.sr
         lw = self.tracker.lane_width_px
         anchor = "DEAD_RECKONING"
-        
-        # Coarse 3-level confidence (1.0, 0.7, 0.0) is sufficient for current controller architecture
+
         conf = 0.0
         curv = 0.0
-        
-        y_eval = 400 # look lower down for immediate steering
+
+        y_eval = 400  # look lower down for immediate steering
         if sl is not None and sr is not None:
-            tx = (np.polyval(sl, y_eval) + np.polyval(sr, y_eval))/2.0
-            anchor, conf, curv = "DUAL", (self.tracker.l_conf + self.tracker.r_conf) / 2.0, (self.tracker.get_curvature(sl, y_eval)+self.tracker.get_curvature(sr, y_eval))/2.0
+            tx = (np.polyval(sl, y_eval) + np.polyval(sr, y_eval)) / 2.0
+            anchor = "DUAL"
+            conf = (self.tracker.l_conf + self.tracker.r_conf) / 2.0
+            curv = (self.tracker.get_curvature(sl, y_eval) + self.tracker.get_curvature(sr, y_eval)) / 2.0
         elif sr is not None:
-            tx = np.polyval(sr, y_eval) - lw/2.0
-            anchor, conf, curv = "RIGHT", self.tracker.r_conf * 0.7, self.tracker.get_curvature(sr, y_eval)
+            # Right-lane bias: offset 0.40× lane width instead of 0.50× to keep car right-of-centre
+            tx = np.polyval(sr, y_eval) - lw * 0.40
+            anchor = "RIGHT"
+            conf = self.tracker.r_conf * 0.7
+            curv = self.tracker.get_curvature(sr, y_eval)
         elif sl is not None:
-            tx = np.polyval(sl, y_eval) + lw/2.0
-            anchor, conf, curv = "LEFT", self.tracker.l_conf * 0.7, self.tracker.get_curvature(sl, y_eval)
+            tx = np.polyval(sl, y_eval) + lw / 2.0
+            anchor = "LEFT"
+            conf = self.tracker.l_conf * 0.7
+            curv = self.tracker.get_curvature(sl, y_eval)
         else:
             tx = 320.0
-            anchor, conf, curv = "DEAD_RECKONING", 0.0, 0.0
-            
+            anchor = "DEAD_RECKONING"
+            conf = 0.0
+            curv = 0.0
+
         error_px = tx - 320.0
-        
+
         return PerceptionResult(
             warped_binary=binary,
             lane_dbg=dbg,

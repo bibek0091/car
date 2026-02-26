@@ -58,23 +58,21 @@ class HardwareIO:
         self.sim_video = sim_video
         self.camera = None
         self.video_cap = None
-        self.imu = None
         self.serial = STM32_SerialHandler()
-        self.yaw_offset = 0.0
+        self.SPEED_CALIB = 0.014
 
         # Simulator Kinematic Model State
-        self._sim_yaw = 0.0
+        self._sim_yaw = 0.0          # integrated heading for sim
         self._last_sim_time = time.time()
         self._last_cmd_speed = 0.0
         self._last_cmd_steer = 0.0
-        self.SPEED_CALIB = 0.014
 
         # Initialize STM32
         if not self.sim_mode and _SERIAL_AVAILABLE:
             connected = self.serial.connect()
             if not connected:
-                log.error("Failed to connect to STM32. Motor and IMU commands will be ignored.")
-        
+                log.error("Failed to connect to STM32. Motor commands will be ignored.")
+
         # Initialize Camera or Video
         if self.sim_video and _CV2_AVAILABLE:
             self.video_cap = cv2.VideoCapture(self.sim_video)
@@ -105,58 +103,47 @@ class HardwareIO:
         if self.video_cap and _CV2_AVAILABLE:
             ret, frame = self.video_cap.read()
             if not ret:
-                self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Loop video
+                self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Loop video
                 ret, frame = self.video_cap.read()
             if ret:
                 return cv2.resize(frame, (640, 480))
-            
+
         if self.camera and _CV2_AVAILABLE:
             frame = self.camera.capture_array()
             if frame is not None:
                 if frame.ndim == 3 and frame.shape[2] == 4:
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 else:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # XRGB8888 can be RGB depending on version
-                
-                # Resize from 1280x720 to 640x480
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 return cv2.resize(frame, (640, 480))
-            
+
         # Fallback simulation blank frame
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
-    def read_imu(self):
-        """Returns (yaw_deg, calibration_tuple).
-        calibration_tuple = (sys, gyro, accel, mag), each 0-3.
-        Returns (0.0, (0,0,0,0)) when IMU is not connected.
-        """
-        if not self.sim_mode and self.serial.status.imu_data is not None:
-            try:
-                imu_data = self.serial.status.imu_data
-                yaw = imu_data.get('yaw', 0.0)
-                # The STM32 doesn't send the raw BNO055 calib status, 
-                # but NDOF mode is handled on the firmware side, so we mock calib=(3,3,3,3)
-                return yaw, (3, 3, 3, 3)
-            except Exception as e:
-                log.error(f"IMU read error from serial handling: {e}")
-        # IMU absent or failed
-        return 0.0, (0, 0, 0, 0)
-    
-    def zero_imu_yaw(self, current_raw_yaw):
-        self.yaw_offset = current_raw_yaw
+    # Alias used in calibration phase
+    def capture_frame(self):
+        return self.read_camera()
 
-    def get_fused_imu_yaw(self):
+    def get_sim_heading_deg(self):
+        """
+        Simulation-only: returns kinematic-integrated heading.
+        Used only when sim_mode=True — replaces what the IMU would give.
+        In camera-only real-hardware mode this is not called.
+        """
         if self.sim_mode:
-            yaw_rate = (self._last_cmd_speed * self.SPEED_CALIB / 0.23) * math.tan(math.radians(self._last_cmd_steer))
-            self._sim_yaw += yaw_rate * 0.033  # assume 30Hz
-            return math.degrees(self._sim_yaw), (3,3,3,3)
-            
-        raw_yaw, calib = self.read_imu()
-        yaw = ((raw_yaw - self.yaw_offset + 540) % 360) - 180
-        return yaw, calib
+            yaw_rate = 0.0
+            v = max(0.0, (self._last_cmd_speed - 12.0) * self.SPEED_CALIB)
+            if v > 0.05:
+                steer_rad = math.radians(
+                    max(-45.0, min(45.0, self._last_cmd_steer))
+                )
+                yaw_rate = (v / 0.23) * math.tan(steer_rad)
+            self._sim_yaw += yaw_rate * 0.033  # assume 30 Hz
+            return math.degrees(self._sim_yaw)
+        return 0.0
 
     def set_steering(self, steer_angle_deg):
         """steer_angle_deg: -45 to +45."""
-        # Clamp to -45 / +45
         steer_angle_deg = max(-45.0, min(45.0, steer_angle_deg))
         self._last_cmd_steer = steer_angle_deg
         if self.sim_mode:
@@ -167,26 +154,21 @@ class HardwareIO:
         """speed_pwm: 0-100."""
         speed_pwm = max(0.0, min(100.0, speed_pwm))
         if self.sim_mode:
-            self._sim_speed_pwm = speed_pwm
             self._last_cmd_speed = speed_pwm
             return
         self.serial.set_speed(speed_pwm)
 
     def get_velocity_ms(self):
-        """Return encoder speed in m/s.
-        Compatible with both old STM32_SerialHandler (uses _feedback_speed directly)
-        and new versions that have get_feedback(). Falls back to 0 on any error.
-        """
+        """Return encoder speed in m/s."""
         if self.sim_mode:
             cmd = getattr(self, "_last_cmd_speed", 0.0)
             return max(0.0, (cmd - 12.0) * self.SPEED_CALIB)
         try:
-            # Try new API first (get_feedback returns (speed_mms, steer_deg))
             if hasattr(self.serial, 'get_feedback'):
                 raw_mms = self.serial.get_feedback()[0]
             else:
-                # Old STM32_SerialHandler: access _feedback_speed directly
-                with getattr(self.serial, 'feedback_lock', __import__('contextlib').nullcontext()):
+                import contextlib
+                with getattr(self.serial, 'feedback_lock', contextlib.nullcontext()):
                     raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
             return raw_mms / 1000.0   # mm/s → m/s
         except Exception as e:
@@ -205,12 +187,6 @@ class HardwareIO:
         except Exception as e:
             log.warning(f"get_encoder_steer_deg error: {e}")
             return 0.0
-
-    def get_imu_accel(self):
-        """Return the scalar acceleration in m/s^2. For STM32 this uses velocity delta approximation or returns 0.0."""
-        # The new firmware provides velocity vx/vy/vz, not direct raw acceleration.
-        # This isn't critical for basic path following.
-        return 0.0
 
     def shutdown(self):
         self.set_speed(0)
