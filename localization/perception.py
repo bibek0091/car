@@ -20,24 +20,76 @@ class PerceptionResult:
 
 def estimate_heading_from_lanes(sl, sr, h=480):
     """
-    Estimates the car's heading offset from the road centre line using the
-    derivative of the lane polynomials at the bottom of the BEV image.
+    Estimates the car's heading offset from road centre using lane polynomial
+    derivatives sampled at 5 depth levels with bottom-weighted averaging.
 
     x = a*y^2 + b*y + c   →   dx/dy = 2a*y + b
-    A positive tangent slope means the road curves right relative to the camera.
+
     Returns the correction in RADIANS to add to the current yaw estimate.
     A negative return value = road turns left = car needs to yaw left.
     """
-    tangents = []
+    # Sample at 5 rows from top to bottom of BEV image.
+    # Bottom rows are closest to car and most reliable → higher weight.
+    eval_rows   = [h * f for f in [0.2, 0.35, 0.5, 0.7, 1.0]]
+    row_weights = [0.5,  0.75,  1.0,  1.5,  2.0]
+
+    all_tangents = []
+    all_weights  = []
     for fit in [sl, sr]:
         if fit is None:
             continue
-        dxdy = 2.0 * fit[0] * h + fit[1]   # derivative at bottom row
-        tangents.append(math.atan2(dxdy, 1.0))
-    if not tangents:
+        for y, w in zip(eval_rows, row_weights):
+            dxdy = 2.0 * fit[0] * y + fit[1]
+            all_tangents.append(math.atan2(dxdy, 1.0))
+            all_weights.append(w)
+
+    if not all_tangents:
         return 0.0
-    # Negate: a rightward lean in BEV = road curving right = positive yaw rate
-    return -float(np.mean(tangents))
+    tangent_mean = np.average(all_tangents, weights=all_weights)
+    # Negate: rightward lean in BEV = road curving right = positive yaw rate
+    return -float(tangent_mean)
+
+
+def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt, h=480, scale_m_per_px=0.35/280.0):
+    """
+    Estimates lateral drift velocity (m/s) and heading rate (rad/s) from
+    consecutive lane polynomial fits.  Used as the primary motion source when
+    IMU is unavailable.
+
+    Returns:
+        lateral_vel_ms  : signed lateral velocity. Positive = drifting right.
+        heading_rate_rps: signed yaw rate from lane tangent change. rad/s.
+    """
+    if dt <= 0:
+        return 0.0, 0.0
+
+    # ── Lateral velocity from lane-centre shift ────────────────────────────
+    def lane_center(sfl, sfr, y=400):
+        if sfl is not None and sfr is not None:
+            return (np.polyval(sfl, y) + np.polyval(sfr, y)) / 2.0
+        elif sfr is not None:
+            return np.polyval(sfr, y) - 140.0   # assume half-lane offset
+        elif sfl is not None:
+            return np.polyval(sfl, y) + 140.0
+        return None
+
+    c_now  = lane_center(sl,      sr)
+    c_prev = lane_center(prev_sl, prev_sr)
+
+    if c_now is None or c_prev is None:
+        lateral_vel_ms = 0.0
+    else:
+        lateral_drift_px  = c_now - c_prev          # positive → drifting right
+        lateral_vel_ms    = lateral_drift_px * scale_m_per_px / dt
+
+    # ── Heading rate from tangent change between frames ─────────────────────
+    curr_heading = estimate_heading_from_lanes(sl,      sr,      h)
+    prev_heading = estimate_heading_from_lanes(prev_sl, prev_sr, h)
+    heading_rate_rps = (curr_heading - prev_heading) / dt
+
+    return lateral_vel_ms, heading_rate_rps
+
+
 
 class HybridLaneTracker:
     NWINDOWS         = 9

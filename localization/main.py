@@ -1824,9 +1824,20 @@ class Orchestrator:
 
                 # Camera-only yaw correction (used when IMU is dead)
                 cam_yaw_corr = 0.0
+                cam_lat_vel  = 0.0
+                cam_heading_rate = 0.0
                 if not imu_available:
-                    from perception import estimate_heading_from_lanes
+                    from perception import estimate_heading_from_lanes, estimate_camera_odometry
                     cam_yaw_corr = estimate_heading_from_lanes(v_res.sl, v_res.sr)
+                    # Compute lateral drift velocity + heading rate from consecutive frames
+                    _prev_sl = getattr(self, '_prev_sl', None)
+                    _prev_sr = getattr(self, '_prev_sr', None)
+                    cam_lat_vel, cam_heading_rate = estimate_camera_odometry(
+                        v_res.sl, v_res.sr, _prev_sl, _prev_sr, max(self._dt, 1e-4)
+                    )
+                # Cache current fits for next-frame comparison
+                self._prev_sl = v_res.sl
+                self._prev_sr = v_res.sr
 
                 # Snapshot the planned path to avoid mid-frame GUI mutations
                 with self.path_lock:
@@ -1851,15 +1862,17 @@ class Orchestrator:
                     velocity_ms = 0.0
 
                 pose = self.localizer.update(
-                    velocity_ms            = velocity_ms,
-                    steer_angle_deg        = steer,
-                    imu_yaw_deg            = imu_yaw_deg,
-                    lane_error_px          = v_res.lateral_error_px,
-                    lane_width_px          = v_res.lane_width_px,
-                    conf                   = v_res.confidence,
-                    dt                     = self._dt,
-                    imu_available          = imu_available,
-                    camera_yaw_correction  = cam_yaw_corr
+                    velocity_ms              = velocity_ms,
+                    steer_angle_deg          = steer,
+                    imu_yaw_deg              = imu_yaw_deg,
+                    lane_error_px            = v_res.lateral_error_px,
+                    lane_width_px            = v_res.lane_width_px,
+                    conf                     = v_res.confidence,
+                    dt                       = self._dt,
+                    imu_available            = imu_available,
+                    camera_yaw_correction    = cam_yaw_corr,
+                    camera_lateral_vel_ms    = cam_lat_vel,
+                    camera_heading_rate_rps  = cam_heading_rate
                 )
 
                 # 7. Lookahead waypoints from A* path
