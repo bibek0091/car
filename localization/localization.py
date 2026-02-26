@@ -154,8 +154,10 @@ class LocalizationEngine:
 
             # Source C: consecutive-frame tangent heading rate
             # (blended before EMA so it participates in smoothing)
-            if abs(camera_heading_rate_rps) > 0.001 and conf > 0.5:
-                cam_rate_weight = min(0.40, conf - 0.1)
+            # Guard raised from 0.5 to 0.6: single-lane (LEFT/RIGHT) anchors
+            # are noisier; only blend in camera rate when we have solid dual detection.
+            if abs(camera_heading_rate_rps) > 0.001 and conf > 0.60:
+                cam_rate_weight = min(0.35, conf - 0.15)
                 yaw_rate = (
                     yaw_rate * (1.0 - cam_rate_weight)
                     + camera_heading_rate_rps * cam_rate_weight
@@ -250,8 +252,11 @@ class LocalizationEngine:
         """
         if not planned_path or len(planned_path) < 2:
             return
-        if lane_conf < 0.20:
-            return
+        # When camera confidence is low, allow map correction but with a
+        # tighter snap_alpha so dead-reckoning drift is still reined in.
+        # Previously this returned early when conf < 0.20, which disabled
+        # map anchoring exactly when the car needed it most during startup.
+        low_conf = lane_conf < 0.20
 
         # FIX-12: cursor-windowed segment search
         search_start = max(0, cursor - 2)
@@ -285,7 +290,11 @@ class LocalizationEngine:
         if best_pt is None or min_dist >= max_snap_m:
             return
 
-        snap_alpha = 0.45 if lane_conf > 0.7 else 0.30
+        # Low-confidence snap uses a much smaller alpha to avoid jumps
+        if low_conf:
+            snap_alpha = 0.10
+        else:
+            snap_alpha = 0.45 if lane_conf > 0.7 else 0.30
 
         with self.pose_lock:
             if best_tangent is not None:

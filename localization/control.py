@@ -61,10 +61,6 @@ class Controller:
     MIN_PWM_HIGHWAY = 41.0   # 40 cm/s minimum
     MIN_PWM_CITY    = 27.0   # 20 cm/s minimum
 
-    # ── Lane positioning biases ───────────────────────────────────────────────
-    RIGHT_LANE_BIAS_PX    = 20.0    # constant rightward nudge for right-side driving
-    HIGHWAY_RIGHT_BIAS_PX = 0.20    # fraction of lane_width_px for highway 2nd-lane
-
     def __init__(self):
         self.last_steer    = 0.0
         self._err_integral = 0.0
@@ -158,13 +154,16 @@ class Controller:
                 anchor   = "HOLD"
 
         # ── Right-side driving constant bias ──────────────────────────────────
-        # Always shift slightly right to stay on the right side of the lane.
-        target_x += self.RIGHT_LANE_BIAS_PX
+        # REMOVED: RIGHT_LANE_BIAS_PX — perception.py already centers the lane
+        # target correctly for RIGHT-only anchors. A second rightward shift here
+        # caused hard weaving by fighting the perception target.
 
         # ── Highway second-lane bias ──────────────────────────────────────────
+        # REMOVED: A* path routes through right-lane nodes; adding a fixed pixel
+        # offset on top of the waypoint-computed t_map was redundant and caused
+        # the car to exit the right lane entirely on highways.
         if zone_mode == "HIGHWAY":
-            target_x += self.HIGHWAY_RIGHT_BIAS_PX * perc_res.lane_width_px
-            anchor += "+HW2"
+            anchor += "+HW"
 
         # ── Bus-lane guard (steer right to avoid it) ──────────────────────────
         if bus_lane:

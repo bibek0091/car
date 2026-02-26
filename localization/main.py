@@ -1697,7 +1697,11 @@ class Orchestrator:
             r_conf = 0.0
             anchor = "HOLD"
             waypoints = []
-            # ── CRITICAL: must be initialized every frame or telem dict crashes ──
+            # ── CRITICAL: initialize all variables used in CSV/telem BEFORE branching ──
+            # Without these, the ESTOP / PAUSED / CALIBRATING branches crash with NameError.
+            frame       = np.zeros((480, 640, 3), dtype=np.uint8)  # BUG 5 fix
+            speed       = 0.0
+            steer       = 0.0
             yolo_frame  = None
             bev_frame   = None
             nav_state   = "INIT"
@@ -1999,11 +2003,6 @@ class Orchestrator:
                 # 8c. Lookahead map curvature
                 map_curv = self.planner.get_path_curvature(pose[0], pose[1], current_path, cursor=self._path_cursor, window_m=1.0)
 
-                # Resolve final zone: sign-based wins; map-based is fallback
-                # (car stays in correct mode even if highway sign is missed)
-                _zone_mode = t_res.zone_mode
-                if _zone_mode == "CITY" and _map_zone == "HIGHWAY":
-                    _zone_mode = "HIGHWAY"
 
                 # 9. Control — pass all new context: zone, line type, parking, roundabout
                 nav_state = "PILOTING"

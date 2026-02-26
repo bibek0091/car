@@ -10,12 +10,11 @@ log = logging.getLogger(__name__)
 # STM32 Serial Handler
 # ===========================================================================
 try:
-    sys.path.insert(0, "..")
-    from serial_handler import STM32_SerialHandler
+    from STM32_SerialHandler import STM32_SerialHandler
     _SERIAL_AVAILABLE = True
 except ImportError:
     _SERIAL_AVAILABLE = False
-    log.warning("serial_handler not found. Using simulation mode for STM32.")
+    log.warning("STM32_SerialHandler not found. Using simulation mode for STM32.")
 
     class STM32_SerialHandler:
         def connect(self): return False

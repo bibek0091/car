@@ -355,8 +355,9 @@ class VisionPipeline:
             conf = (self.tracker.l_conf + self.tracker.r_conf) / 2.0
             curv = (self.tracker.get_curvature(sl, y_eval) + self.tracker.get_curvature(sr, y_eval)) / 2.0
         elif sr is not None:
-            # Right-lane bias: offset 0.40× lane width instead of 0.50× to keep car right-of-centre
-            tx = np.polyval(sr, y_eval) - lw * 0.40
+            # Right-only: estimate lane centre as right_x - 0.45 * lane_width
+            # 0.45 (not 0.50) keeps the car slightly right of centre (right-side driving rule)
+            tx = np.polyval(sr, y_eval) - lw * 0.45
             anchor = "RIGHT"
             conf = self.tracker.r_conf * 0.7
             curv = self.tracker.get_curvature(sr, y_eval)
