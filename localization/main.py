@@ -301,9 +301,7 @@ class Orchestrator:
         self._q_yolo  = queue.Queue(maxsize=1)
         self._q_bev   = queue.Queue(maxsize=1)
 
-        # ── Camera ────────────────────────────────────────────────────────────
-        if not sim_mode:
-            self.hw.open_camera()
+        # Camera is opened inside HardwareIO.__init__() automatically.
 
     # ─────────────────────────────────────────────────────────────────────────
     # GUI
@@ -528,7 +526,7 @@ class Orchestrator:
                 continue
 
             # ── 1. Capture frame ─────────────────────────────────────────────
-            raw_frame = self.hw.get_frame()
+            raw_frame = self.hw.read_camera()
             if raw_frame is None:
                 raw_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
