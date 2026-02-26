@@ -296,31 +296,54 @@ class HybridLaneTracker:
 
 
 class VisionPipeline:
+    # ── v3 lane-centre offsets (pixels) ───────────────────────────────────────
+    # DUAL        : mathematical midpoint — no offset needed
+    # SINGLE_DIV  : only centre-divider visible → offset right to stay in lane
+    # SINGLE_EDGE : only outer edge visible → offset left to stay in lane
+    # These match bfmc_pilot_v3_yolo.py constants exactly.
+    DUAL_OFFSET_PX        =   0    # both lines: perfect maths centre
+    SINGLE_DIV_OFFSET_PX  =  40    # right-divider only: nudge right
+    SINGLE_EDGE_OFFSET_PX = -40    # left-edge only: nudge left
+
+    Y_EVAL = 400   # BEV row used for immediate steering target
+
     def __init__(self):
         self.tracker = HybridLaneTracker()
         # Default BEV transform — will be auto-calibrated by VisualCalibrator
         self.SRC_PTS = np.float32([[200, 260], [440, 260], [40, 450], [600, 450]])
         self.DST_PTS = np.float32([[150, 0], [490, 0], [150, 480], [490, 480]])
         self.M = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
-        self.clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))  # raised from 3.0
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         self.bev_calibrated = False
+        self._last_target_x  = 320.0   # dead-reckoning memory
 
     def update_bev_transform(self, src_pts):
-        """
-        Called by VisualCalibrator after vanishing-point detection.
-        Updates the perspective transform with calibrated source points.
-        """
+        """Called by VisualCalibrator after vanishing-point detection."""
         self.SRC_PTS = np.float32(src_pts)
         self.M = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
         self.bev_calibrated = True
 
-    def process(self, frame_bgr):
+    def process(self, frame_bgr, extra_offset_px: float = 0.0,
+                nav_state: str = "NORMAL"):
+        """
+        Process one camera frame.
+
+        extra_offset_px : lateral nudge from controller (evasion, junction)
+        nav_state       : "NORMAL" | "ROUNDABOUT" | "JUNCTION_LEFT" | "JUNCTION_RIGHT"
+
+        Returns PerceptionResult with v3-aligned lateral_error_px:
+            error > 0  → target is RIGHT of image centre → steer right
+            error < 0  → target is LEFT of image centre  → steer left
+        """
+        # ── 1. BEV warp ───────────────────────────────────────────────────────
+        if frame_bgr.shape[:2] != (480, 640):
+            frame_bgr = cv2.resize(frame_bgr, (640, 480))
         warped = cv2.warpPerspective(frame_bgr, self.M, (640, 480))
 
+        # ── 2. LAB + CLAHE + adaptive lighting (identical to v3) ─────────────
         lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
-        L = self.clahe.apply(lab[:, :, 0])
+        L   = self.clahe.apply(lab[:, :, 0])
 
-        # Adaptive Lighting Compensation
         mean_l = np.mean(L)
         if mean_l < 100:
             a = 1.0 + (100 - mean_l) / 200
@@ -331,44 +354,100 @@ class VisionPipeline:
             b = -(mean_l - 180) * 0.4
             L = cv2.convertScaleAbs(L, alpha=a, beta=int(b))
 
-        # Track is WHITE, lines are BLACK. Filter shadows with +15 constant.
+        # ── 3. Adaptive threshold + morphology (identical to v3) ─────────────
+        # Track=WHITE, lane-lines=BLACK. C=+15 aggressively rejects shadows.
         binary = cv2.adaptiveThreshold(
             L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 31, 15)
-
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
+        # ── 4. Lane tracking ──────────────────────────────────────────────────
         dbg = self.tracker.update(binary)
 
-        sl, sr = self.tracker.sl, self.tracker.sr
+        sl = self.tracker.sl
+        sr = self.tracker.sr
         lw = self.tracker.lane_width_px
-        anchor = "DEAD_RECKONING"
+        hw = lw / 2.0
+        y  = self.Y_EVAL
 
-        conf = 0.0
-        curv = 0.0
+        def ev(fit):
+            return float(np.polyval(fit, y))
 
-        y_eval = 400  # look lower down for immediate steering
-        if sl is not None and sr is not None:
-            tx = (np.polyval(sl, y_eval) + np.polyval(sr, y_eval)) / 2.0
-            anchor = "DUAL"
-            conf = (self.tracker.l_conf + self.tracker.r_conf) / 2.0
-            curv = (self.tracker.get_curvature(sl, y_eval) + self.tracker.get_curvature(sr, y_eval)) / 2.0
-        elif sr is not None:
-            # Right-only: estimate lane centre as right_x - 0.45 * lane_width
-            # 0.45 (not 0.50) keeps the car slightly right of centre (right-side driving rule)
-            tx = np.polyval(sr, y_eval) - lw * 0.45
-            anchor = "RIGHT"
-            conf = self.tracker.r_conf * 0.7
-            curv = self.tracker.get_curvature(sr, y_eval)
-        elif sl is not None:
-            tx = np.polyval(sl, y_eval) + lw / 2.0
-            anchor = "LEFT"
-            conf = self.tracker.l_conf * 0.7
-            curv = self.tracker.get_curvature(sl, y_eval)
+        # ── 5. Target-x: exact v3 get_target_x() logic ───────────────────────
+        if nav_state == "ROUNDABOUT":
+            if sl is not None:
+                tx     = ev(sl) + hw + extra_offset_px
+                anchor = "RBT_INNER"
+            elif sr is not None:
+                tx     = ev(sr) - hw + extra_offset_px
+                anchor = "RBT_OUTER"
+            else:
+                tx     = self._last_target_x + extra_offset_px
+                anchor = "RBT_LOST"
+
+        elif nav_state == "JUNCTION_RIGHT":
+            if sr is not None:
+                tx     = ev(sr) - lw * 0.40 + extra_offset_px
+                anchor = "JCT_RIGHT_EDGE"
+            elif sl is not None:
+                tx     = ev(sl) + lw * 1.50 + extra_offset_px
+                anchor = "JCT_RIGHT_GHOST"
+            else:
+                tx     = 320.0 + lw * 0.8 + extra_offset_px
+                anchor = "JCT_RIGHT_BLIND"
+
+        elif nav_state == "JUNCTION_LEFT":
+            if sl is not None:
+                tx     = ev(sl) + lw * 0.40 + extra_offset_px
+                anchor = "JCT_LEFT_EDGE"
+            elif sr is not None:
+                tx     = ev(sr) - lw * 1.50 + extra_offset_px
+                anchor = "JCT_LEFT_GHOST"
+            else:
+                tx     = 320.0 - lw * 0.8 + extra_offset_px
+                anchor = "JCT_LEFT_BLIND"
+
         else:
-            tx = 320.0
-            anchor = "DEAD_RECKONING"
+            # ── NORMAL driving — v3 "BRUTE FORCE MIDDLE-LANE PRIORITY" ───────
+            if sl is None and sr is None:
+                # Dead-reckoning: hold last valid target
+                tx     = self._last_target_x + extra_offset_px
+                anchor = "DEAD_RECKONING"
+            elif sl is not None and sr is not None:
+                # Both lines: mathematical centre — no offset, no bias
+                tx     = (ev(sl) + ev(sr)) / 2.0 + self.DUAL_OFFSET_PX + extra_offset_px
+                anchor = "CENTERED_DUAL"
+                self._last_target_x = tx - extra_offset_px
+            elif sr is not None:
+                # Right-divider (centre/dashed line): project centre leftward
+                # +SINGLE_DIV_OFFSET_PX nudges car slightly right (right-lane rule)
+                tx     = ev(sr) - hw + self.SINGLE_DIV_OFFSET_PX + extra_offset_px
+                anchor = "CENTERED_FROM_RIGHT"
+                self._last_target_x = tx - extra_offset_px
+            elif sl is not None:
+                # Left edge (outer white line): project centre rightward
+                # +SINGLE_EDGE_OFFSET_PX nudges car slightly left (stay off edge)
+                tx     = ev(sl) + hw + self.SINGLE_EDGE_OFFSET_PX + extra_offset_px
+                anchor = "CENTERED_FROM_LEFT"
+                self._last_target_x = tx - extra_offset_px
+            else:
+                tx     = self._last_target_x + extra_offset_px
+                anchor = "DEAD_RECKONING"
+
+        # ── 6. Confidence & curvature ─────────────────────────────────────────
+        # Normalised pixel count: ≥ MIN_PIX_OK pixels → conf 1.0
+        MIN_PIX = self.tracker.MIN_PIX_OK
+        if sl is not None and sr is not None:
+            conf = min(1.0, (self.tracker.l_conf + self.tracker.r_conf) / (2.0 * MIN_PIX))
+            curv = (self.tracker.get_curvature(sl, y) + self.tracker.get_curvature(sr, y)) / 2.0
+        elif sr is not None:
+            conf = min(0.70, self.tracker.r_conf / MIN_PIX)
+            curv = self.tracker.get_curvature(sr, y)
+        elif sl is not None:
+            conf = min(0.70, self.tracker.l_conf / MIN_PIX)
+            curv = self.tracker.get_curvature(sl, y)
+        else:
             conf = 0.0
             curv = 0.0
 

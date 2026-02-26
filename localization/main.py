@@ -64,7 +64,70 @@ BFMC_SIGNS = {
 
 import matplotlib.collections as mcoll
 
-def draw_rich_map(ax, planner, signs_dict=None):
+# ── SVG overlay: rasterise Track.svg once and cache as a numpy image ──────────
+_SVG_IMAGE_CACHE: dict = {}   # {path: np.ndarray}
+
+def _load_svg_as_image(svg_path: str, px: int = 1024) -> "np.ndarray | None":
+    """
+    Convert Track.svg to an RGBA numpy array at resolution ~px × (px*aspect).
+    Tries three backends in order: cairosvg → svglib+reportlab → skips overlay.
+    Result is cached so the file is only read once per session.
+    """
+    import os
+    if svg_path in _SVG_IMAGE_CACHE:
+        return _SVG_IMAGE_CACHE[svg_path]
+    if not os.path.exists(svg_path):
+        return None
+
+    img = None
+
+    # ── Backend 1: cairosvg (pip install cairosvg) ────────────────────────────
+    try:
+        import cairosvg, io
+        from PIL import Image as PILImage
+        png_bytes = cairosvg.svg2png(url=svg_path, output_width=px)
+        img = np.array(PILImage.open(io.BytesIO(png_bytes)).convert("RGBA"), dtype=np.uint8)
+        log.info(f"[SVG] Loaded via cairosvg: {img.shape}")
+    except Exception:
+        pass
+
+    # ── Backend 2: svglib + reportlab (pip install svglib reportlab) ──────────
+    if img is None:
+        try:
+            from svglib.svglib import svg2rlg
+            from reportlab.graphics import renderPM
+            import io
+            from PIL import Image as PILImage
+            drawing = svg2rlg(svg_path)
+            if drawing is not None:
+                scale = px / drawing.width
+                drawing.width  *= scale
+                drawing.height *= scale
+                drawing.transform = (scale, 0, 0, scale, 0, 0)
+                png_bytes = renderPM.drawToString(drawing, fmt="PNG")
+                img = np.array(PILImage.open(io.BytesIO(png_bytes)).convert("RGBA"), dtype=np.uint8)
+                log.info(f"[SVG] Loaded via svglib: {img.shape}")
+        except Exception:
+            pass
+
+    if img is None:
+        log.warning("[SVG] No SVG backend found (install cairosvg or svglib) — skipping overlay")
+
+    _SVG_IMAGE_CACHE[svg_path] = img
+    return img
+
+
+def draw_rich_map(ax, planner, signs_dict=None, svg_path: str = None):
+    """
+    Render the BFMC track map on `ax`.
+
+    Combines:
+      • Track.svg  — photo-realistic SVG track image as a background
+      • GraphML    — directed-graph roads, roundabouts, traffic signs, car position
+
+    svg_path : absolute path to Track.svg (auto-detected relative to this file if None)
+    """
+
     if signs_dict is None:
         signs_dict = BFMC_SIGNS
 
@@ -74,7 +137,40 @@ def draw_rich_map(ax, planner, signs_dict=None):
     ax.clear()
     ax.set_facecolor("#121215")
 
-    # 2.5 Parking Zone
+    # ── SVG Track overlay ─────────────────────────────────────────────────────
+    # Auto-detect Track.svg next to main.py if not provided
+    if svg_path is None:
+        import os
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _candidate = os.path.join(_here, "..", "Track.svg")
+        if os.path.exists(_candidate):
+            svg_path = os.path.normpath(_candidate)
+
+    if svg_path is not None:
+        svg_img = _load_svg_as_image(svg_path, px=1200)
+        if svg_img is not None:
+            # Get GraphML coordinate bounds (will be used for axis limits later)
+            xs = [p[0] for p in pos.values()]
+            ys = [p[1] for p in pos.values()]
+            pad = 1.0
+            gx0, gx1 = min(xs) - pad, max(xs) + pad
+            gy0, gy1 = min(ys) - pad, max(ys) + pad
+
+            # Map SVG image to GraphML space.
+            # SVG has Y going DOWN (same as imshow); matplotlib will invert_yaxis later.
+            # So we use extent = [left, right, bottom, top] where bottom > top because yaxis is inverted.
+            # extent format for imshow: [xmin, xmax, ymin, ymax] — ymin is the BOTTOM of the image
+            #   but since the axis is inverted bottom becomes the larger y number.
+            ax.imshow(
+                svg_img,
+                aspect="auto",
+                extent=[gx0, gx1, gy1, gy0],   # [left, right, bottom(=gy1), top(=gy0)]
+                origin="upper",
+                alpha=0.30,                      # 30 % transparent so GraphML roads show clearly
+                zorder=0,
+                interpolation="bilinear",
+            )
+
     parking_nodes = {k: p for k, p in pos.items() if p[1] > 9.0}
     if parking_nodes:
         xs = [p[0] for p in parking_nodes.values()]
@@ -1640,6 +1736,14 @@ class Orchestrator:
     def __init__(self, args):
         self.args = args
         self.planner   = PathPlanner("Competition_track_graph.graphml")
+        # ── IMPORTANT: IMU must be initialized BEFORE the camera.
+        # PiCamera2 background threads (IMX708 sensor via RP1 I2C) briefly
+        # stall I2C bus 1 during camera.start(), causing [Errno 110] on the
+        # MPU's first write. Initializing IMU first gives it a clean bus.
+        self.imu = MPU9250_Thread(bus=1, address=0x68)
+        if not args.sim:
+            self.imu.start()
+
         self.hw        = HardwareIO(sim_mode=args.sim,
                                      sim_video=getattr(args, "sim_video", None))
         self.yolo_worker = ThreadedYOLODetector(model_path=getattr(args, "model", "best.pt"))
@@ -1649,10 +1753,6 @@ class Orchestrator:
         self.controller = Controller()
         self.calibrator: VisualCalibrator = None  # instantiated after start_node is set
         
-        self.imu = MPU9250_Thread()
-        if not args.sim:
-            self.imu.start()
-
         self.path_lock = threading.Lock()
         self.planned_path: list = []
         self._path_cursor = 0
@@ -1735,60 +1835,82 @@ class Orchestrator:
                 act_lbl  = []
 
             elif calib_remain > 0:
-                # ── Calibration phase: Pre-flight visual calibration ──────────
+                # ── Pre-flight: WAITING FOR START POSITION CONFIRMATION ────────
+                # The car must NOT move until:
+                #   (a) the user has clicked a node on the map (start_node is set), AND
+                #   (b) the 6-second visual calibration phase has completed.
                 self.hw.set_speed(0.0)
                 self.hw.set_steering(0.0)
                 nav_state   = "CALIBRATING"
                 traffic_str = "CALIBRATING"
 
-                if not hasattr(self, '_calib_started'):
-                    self._calib_started = True
-                    # Instantiate VisualCalibrator once we know start_node position
-                    self.calibrator = VisualCalibrator(
-                        self.planner, self.localizer, self.vision
-                    )
-                    log.info("--- PRE-FLIGHT VISUAL CALIBRATION STARTED ---")
+                # ── Gate A: start_node must be confirmed ──────────────────────
+                if self.start_node is None:
+                    reason = "⚠️  WAITING — Place car on map and CLICK start node"
+                    speed, steer = 0.0, 0.0
+                    light_st = "NONE"
+                    act_lbl  = []
+                    # Try to capture a frame for the live view only
+                    try:
+                        frame = self.hw.capture_frame()
+                        if frame is not None and frame.any():
+                            yolo_frame = frame.copy()
+                    except Exception:
+                        pass
 
-                # Capture frame and feed warmup pipelines + calibrator
-                try:
-                    frame = self.hw.capture_frame()
-                    if frame is not None and frame.any():
-                        self.calibrator.add_frame(frame)
-                        t_warm = self.traffic.process(frame)
-                        v_warm = self.vision.process(frame)
-                        yolo_frame = t_warm.yolo_debug_frame if t_warm.yolo_debug_frame is not None else frame
-                        bev_frame  = v_warm.lane_dbg
-                    else:
+                else:
+                    # ── Gate B: visual calibration ──────────────────────────
+                    if not hasattr(self, '_calib_started'):
+                        self._calib_started = True
+                        self.calibrator = VisualCalibrator(
+                            self.planner, self.localizer, self.vision
+                        )
+                        log.info("=== PRE-FLIGHT VISUAL CALIBRATION STARTED ===")
+                        log.info(f"  Start node : {self.start_node}")
+                        imu_ok = self.imu.is_connected if hasattr(self.imu, 'is_connected') else False
+                        log.info(f"  IMU ready  : {'YES' if imu_ok else 'NO (yaw from camera only)'}")
+
+                    # Capture frame and warmup all pipelines during calibration
+                    try:
+                        frame = self.hw.capture_frame()
+                        if frame is not None and frame.any():
+                            self.calibrator.add_frame(frame)
+                            t_warm = self.traffic.process(frame)
+                            v_warm = self.vision.process(frame)
+                            yolo_frame = t_warm.yolo_debug_frame if t_warm.yolo_debug_frame is not None else frame
+                            bev_frame  = v_warm.lane_dbg
+                        else:
+                            yolo_frame = None
+                            bev_frame  = None
+                    except Exception as e:
+                        log.warning(f"Calibration warmup frame error: {e}")
                         yolo_frame = None
                         bev_frame  = None
-                except Exception as e:
-                    log.warning(f"Calibration warmup frame error: {e}")
-                    yolo_frame = None
-                    bev_frame  = None
 
-                # At t > 3.0 s: finalize calibration and apply result
-                if elapsed > 3.0 and not getattr(self, '_calib_applied', False):
-                    cal_result = self.calibrator.finalize()
-                    if cal_result.src_pts is not None:
-                        self.vision.update_bev_transform(cal_result.src_pts)
-                    # Apply detected initial heading to localizer.
-                    # FIX-10: also pass current IMU yaw so the IMU->map offset
-                    # is calibrated here (IMU has been running 3+ s, stable reading).
-                    cx, cy, _ = self.localizer.get_pose()
-                    _cal_imu_yaw, _ = self.imu.get_yaw_data()
-                    self.localizer.set_pose(
-                        cx, cy,
-                        math.radians(cal_result.initial_heading_deg),
-                        imu_yaw_rad=_cal_imu_yaw   # may be None if IMU not connected
-                    )
-                    self._calib_applied = True
-                    log.info(f"Visual calibration applied: {cal_result.status_msg}")
+                    # Finalize calibration at 3 s in (3 s of frames collected)
+                    if elapsed > 3.0 and not getattr(self, '_calib_applied', False):
+                        cal_result = self.calibrator.finalize()
+                        if cal_result.src_pts is not None:
+                            self.vision.update_bev_transform(cal_result.src_pts)
+                        # Apply detected heading to localizer
+                        cx, cy, _ = self.localizer.get_pose()
+                        _cal_imu_yaw, _ = self.imu.get_yaw_data()
+                        self.localizer.set_pose(
+                            cx, cy,
+                            math.radians(cal_result.initial_heading_deg),
+                            imu_yaw_rad=_cal_imu_yaw
+                        )
+                        self._calib_applied = True
+                        log.info(f"=== CALIBRATION COMPLETE: {cal_result.status_msg} ===")
+                        log.info(f"  Initial heading : {cal_result.initial_heading_deg:.1f}°")
+                        log.info(f"  BEV calibrated  : {self.vision.bev_calibrated}")
+                        log.info(f"  Confidence      : {cal_result.confidence:.0%}")
 
-                cal_msg = self.calibrator._result.status_msg if self.calibrator else "init"
-                reason  = f"{calib_remain:.1f}s  {cal_msg}"
-                speed, steer = 0.0, 0.0
-                light_st = "NONE"
-                act_lbl  = []
+                    cal_msg = self.calibrator._result.status_msg if self.calibrator else "collecting..."
+                    reason  = f"CAL {calib_remain:.1f}s remaining  |  {cal_msg}"
+                    speed, steer = 0.0, 0.0
+                    light_st = "NONE"
+                    act_lbl  = []
 
             else:
                 # ── Full autonomous driving ────────────────────────────────────

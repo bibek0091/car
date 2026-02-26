@@ -57,31 +57,59 @@ class MPU9250_Thread:
         self._init_sensor()
 
     def _init_sensor(self):
-        try:
-            self.bus = smbus2.SMBus(self.bus_num)
-            self.bus.write_byte_data(self.addr, 0x6B, 0x00)  # wake up
-            time.sleep(0.1)
-            self.bus.write_byte_data(self.addr, 0x1B, 0x10)  # gyro ±1000 deg/s
-            self.bus.write_byte_data(self.addr, 0x1C, 0x10)  # accel ±8g
-            time.sleep(0.1)
-            
-            # Simple online calibration — take 50 samples
-            log.info(f"MPU-9250 -> Found at I2C bus {self.bus_num}, address 0x{self.addr:02X}. Calibrating Gyro...")
-            gx_sum = gy_sum = gz_sum = 0.0
-            N = 50
-            for _ in range(N):
-                _, _, _, gx, gy, gz = self._read_raw()
-                gx_sum += gx; gy_sum += gy; gz_sum += gz
-                time.sleep(0.01)
-            self.gx_b = gx_sum / N
-            self.gy_b = gy_sum / N
-            self.gz_b = gz_sum / N
-            log.info(f"MPU-9250 -> Gyro Bias: gx={self.gx_b:.2f}, gy={self.gy_b:.2f}, gz={self.gz_b:.2f}")
+        """Try to open the IMU up to MAX_RETRIES times.
+        
+        The PiCamera2 / RP1 I2C controller can hold the bus for ~300ms
+        during camera sensor configuration. We retry to survive that window.
+        """
+        MAX_RETRIES = 4
+        RETRY_DELAY = 1.0   # seconds between attempts
 
-            self.is_connected = True
-        except Exception as e:
-            log.warning(f"MPU-9250 -> Initialization Failed (Running in SIM mode or disconnected): {e}")
-            self.is_connected = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                self.bus = smbus2.SMBus(self.bus_num)
+
+                # WHO_AM_I quick check BEFORE waking — confirms address is alive
+                who = self.bus.read_byte_data(self.addr, 0x75)
+                KNOWN_IDS = {0x71, 0x73, 0x70, 0x68, 0x69, 0x98}
+                log.info(f"MPU IMU -> WHO_AM_I=0x{who:02X} at bus={self.bus_num}, addr=0x{self.addr:02X}")
+                if who not in KNOWN_IDS:
+                    log.warning(f"MPU IMU -> Unexpected WHO_AM_I 0x{who:02X} — proceeding anyway")
+
+                self.bus.write_byte_data(self.addr, 0x6B, 0x00)  # wake up
+                time.sleep(0.2)   # let chip fully exit sleep before configuring
+                self.bus.write_byte_data(self.addr, 0x1B, 0x10)  # gyro ±1000 deg/s
+                self.bus.write_byte_data(self.addr, 0x1C, 0x10)  # accel ±8g
+                time.sleep(0.1)
+
+                # Simple online calibration — 50 still samples
+                log.info(f"MPU IMU -> Found & awake (attempt {attempt}/{MAX_RETRIES}). Calibrating Gyro...")
+                gx_sum = gy_sum = gz_sum = 0.0
+                N = 50
+                for _ in range(N):
+                    _, _, _, gx, gy, gz = self._read_raw()
+                    gx_sum += gx; gy_sum += gy; gz_sum += gz
+                    time.sleep(0.01)
+                self.gx_b = gx_sum / N
+                self.gy_b = gy_sum / N
+                self.gz_b = gz_sum / N
+                log.info(f"MPU IMU -> Gyro Bias: gx={self.gx_b:.2f}, gy={self.gy_b:.2f}, gz={self.gz_b:.2f}")
+
+                self.is_connected = True
+                return   # success — exit retry loop
+
+            except Exception as e:
+                log.warning(f"MPU IMU -> Init attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                try:
+                    self.bus.close()
+                except Exception:
+                    pass
+                if attempt < MAX_RETRIES:
+                    log.info(f"MPU IMU -> Retrying in {RETRY_DELAY:.0f}s ...")
+                    time.sleep(RETRY_DELAY)
+
+        log.error("MPU IMU -> All init attempts failed. Running without IMU.")
+        self.is_connected = False
 
     def _signed(self, v):
         return v - 65536 if v > 32767 else v
