@@ -123,9 +123,9 @@ class HybridLaneTracker:
     POLY_MARGIN_BASE   = 60
     POLY_MARGIN_CURV   = 120
     MIN_PIX_OK         = 200
-    EMA_ALPHA          = 0.35   # ↓ from 0.50 — smoother polynomial tracking
-    STALE_FIT_FRAMES   = 8      # ↑ from 5 — hold last known fit longer
-    LOST_RECOVERY_THRESH = 3    # trigger wide-sweep after this many lost frames
+    EMA_ALPHA          = 0.30   # smoother polynomial tracking (↓ from 0.35)
+    STALE_FIT_FRAMES   = 12     # hold last known fit longer (↑ from 8)
+    LOST_RECOVERY_THRESH = 2    # trigger wide-sweep sooner after lane loss (↑ from 3)
 
     def __init__(self, h=480, w=640):
         self.h, self.w = h, w

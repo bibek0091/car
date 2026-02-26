@@ -509,6 +509,10 @@ class Orchestrator:
     def _pilot_loop(self):
         log.info("Pilot loop started")
         t_prev = time.time()
+        # Lane-hold safety: consecutive frames with NO lane visible
+        _lane_lost_frames = 0
+        _LANE_LOST_CRAWL  = 15   # frames: start crawling (speed cap 20 PWM)
+        _LANE_LOST_STOP   = 90   # frames (~3 s): full stop + E-STOP if no recovery
 
         while self.running:
             t_start = time.time()
@@ -600,8 +604,26 @@ class Orchestrator:
             )
             self._last_ctrl = ctrl
 
-            # ── 10. PWM deadband guard (single place, after multiplier) ──────
+            # ── LANE-HOLD SAFETY: consecutive blind-frame guard ──────────────
+            if perc.sl is None and perc.sr is None:
+                _lane_lost_frames += 1
+            else:
+                _lane_lost_frames = 0   # reset as soon as ANY line reappears
+
+            if _lane_lost_frames >= _LANE_LOST_STOP:
+                # 3 consecutive seconds with zero lane — stop the car
+                self.hw.set_speed(0)
+                self.hw.set_steering(0)
+                log.error(f"LANE LOST for {_lane_lost_frames} frames — emergency stop")
+                self._estop = True
+                continue
+
+            # ── 10. PWM deadband + blind-frame speed cap ─────────────────────
             speed = ctrl.speed_pwm
+            # Hard cap: if blind > CRAWL threshold, don't exceed 20 PWM
+            if _lane_lost_frames >= _LANE_LOST_CRAWL:
+                speed = min(speed, 20.0)
+            # PWM deadband
             if 0.0 < speed < PWM_DEADBAND:
                 speed = PWM_DEADBAND
 
