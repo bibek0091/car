@@ -187,6 +187,8 @@ class LocalizationEngine:
         with self._lock:
             return {
                 "x":               self.x,
+                "snap_miss":       self._snap_miss_frames,
+                "heading_conf_smoothed": self._cam_yaw_smoothed,
                 "y":               self.y,
                 "yaw_deg":         math.degrees(self.yaw),
                 "zone":            self.current_zone,
