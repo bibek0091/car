@@ -152,10 +152,15 @@ class JunctionDetector:
         if self.state == "NORMAL":
             self.entry_count = self.entry_count + 1 if evidence else 0
             if self.entry_count >= self.ENTRY_FRAMES:
-                direction, conf = self.planner.decide(warped_binary, left_fit, right_fit, lane_width_px)
-                self.state         = f"JUNCTION_{direction}"
+                # Emit JUNCTION_PROMPT; main.py will query the A* plan
+                # to override with the correct JUNCTION_LEFT/RIGHT/STRAIGHT.
+                self.state         = "JUNCTION_PROMPT"
                 self.exit_count    = 0
                 self.frames_in_jct = 0
+
+        elif self.state == "JUNCTION_PROMPT":
+            # Stays here until main.py replaces it with a direction
+            pass
 
         elif self.state.startswith("JUNCTION_"):
             self.frames_in_jct += 1
@@ -357,12 +362,12 @@ class Orchestrator:
         self._sv_nav    = tk.StringVar(value="Nav: ---")
         self._sv_map    = tk.StringVar(value="Map: ---")
         self._sv_pose   = tk.StringVar(value="Pose: not set")
-        self._sv_imu    = tk.StringVar(value="IMU: ---")
+        self._sv_odo    = tk.StringVar(value="VO Yaw: 0.00 rad/s")
         self._sv_fps    = tk.StringVar(value="FPS: ---")
 
         style_lbl = dict(bg="#111", fg="#eee", font=("Courier", 9))
         for sv in [self._sv_speed, self._sv_steer, self._sv_anchor,
-                   self._sv_nav, self._sv_map, self._sv_pose, self._sv_imu, self._sv_fps]:
+                   self._sv_nav, self._sv_map, self._sv_pose, self._sv_odo, self._sv_fps]:
             tk.Label(status, textvariable=sv, **style_lbl).pack(side=tk.LEFT, padx=10)
 
         # E-STOP / RESUME buttons
@@ -374,6 +379,9 @@ class Orchestrator:
         tk.Button(btn_frame, text="▶ RESUME",
                   bg="#27ae60", fg="white", font=("Courier", 9, "bold"),
                   command=self._resume_cb).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_frame, text="🔄 RESET ROUTE",
+                  bg="#2471a3", fg="white", font=("Courier", 9, "bold"),
+                  command=self._reset_route).pack(side=tk.LEFT, padx=4)
 
         # Click instruction overlay
         self._click_hint = tk.Label(root, text="🗺  Click on the map to place the car",
@@ -419,6 +427,16 @@ class Orchestrator:
                 self._pilot_thread = threading.Thread(
                     target=self._pilot_loop, daemon=True)
                 self._pilot_thread.start()
+
+    def _reset_route(self):
+        """Clear the planned route so the user can click a new Start + Destination."""
+        self._start_node   = None
+        self._target_node  = None
+        self._planned_path = []
+        self.running       = False   # Stops the pilot loop
+        if hasattr(self, '_click_hint'):
+            self._click_hint.config(text="🗺  Route reset. Click map to set new Start point.")
+        log.info("Route reset by user.")
 
     def _estop_cb(self):
         self._estop = True
@@ -469,7 +487,7 @@ class Orchestrator:
                 px, py = map_to_pixel(x, y, self.MAP_W, self.MAP_H)
                 # Car dot
                 cv2.circle(map_img, (px, py), 8,  (0, 230, 255), -1, cv2.LINE_AA)
-                cv2.circle(map_img, (px, py), 12, (0, 230, 255, 80), 1, cv2.LINE_AA)
+                cv2.circle(map_img, (px, py), 12, (0, 230, 255), 1, cv2.LINE_AA)
                 # Heading arrow
                 hx = px + int(math.cos(yaw) * 18)
                 hy = py + int(math.sin(yaw) * 18)
@@ -516,7 +534,8 @@ class Orchestrator:
             
             self._sv_fps.set(   f"FPS: {self._fps:.1f}")
 
-            self._sv_imu.set("IMU: OFF (Visual Odometry)")
+            vo_yaw = getattr(self.localizer, "visual_yaw_rate", 0.0)
+            self._sv_odo.set(f"VO Yaw: {vo_yaw:+.3f} r/s")
 
         except Exception as e:
             log.debug(f"GUI update error: {e}")

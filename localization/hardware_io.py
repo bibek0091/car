@@ -3,7 +3,6 @@ import math
 import time
 import numpy as np
 import logging
-from STM32_SerialHandler import STM32_SerialHandler
 
 log = logging.getLogger(__name__)
 
