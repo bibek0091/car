@@ -541,17 +541,28 @@ class LocalizationEngine:
 
     def _apply_map_snap_gated(self, velocity, dt, cam_conf, path, cursor):
         """
-        Heading-gated map snap (OPT upgrade).
+        Heading-gated + topology-aware map snap.
 
-        Identical foot-point search to _apply_map_snap but adds a 25° heading
-        gate before committing the pull.  This prevents snapping to cross-traffic
-        path segments at intersections, which could cause sudden position jumps
-        perpendicular to the car's actual direction of travel.
+        NEW: Snap is completely frozen when the cursor is at a junction or
+        roundabout node.  In complex topologies, overlapping path segments
+        cause the nearest-point search to snap to cross-traffic, so we
+        rely purely on VO + dead-reckoning instead.
         """
         if velocity < 0.05 or cam_conf < 0.3:
             return
         if not path or cursor >= len(path) - 1:
             return
+
+        # ── Topology freeze ───────────────────────────────────────────────────
+        # Roundabout nodes: planner exposes is_roundabout_node().
+        # Junction nodes: detected via 'junction' attribute in GraphML graph.
+        current_node = path[cursor]
+        if self.planner:
+            if getattr(self.planner, 'is_roundabout_node', lambda n: False)(current_node):
+                return  # inside roundabout — freeze snap
+            node_data = self.planner.graph.nodes.get(current_node, {}) if hasattr(self.planner, 'graph') else {}
+            if node_data.get('junction') or node_data.get('type') in ('junction', 'intersection'):
+                return  # inside intersection — freeze snap
 
         curvature = self.planner.get_path_curvature(
             self.x, self.y, path, cursor=cursor, window_m=0.8)

@@ -126,17 +126,19 @@ class HybridLaneTracker:
         self.dead_reckoner = DeadReckoningNavigator()
         self.estimated_lane_width = 280.0
 
-    def update(self, warped_binary):
+    def update(self, warped_binary, map_hint: str = "STRAIGHT"):
         nz  = warped_binary.nonzero()
         nzy = np.array(nz[0])
         nzx = np.array(nz[1])
 
         if self.mode == "TRACKING" and (self.sl is not None or self.sr is not None):
             curv = self.get_curvature(self.h // 2)
-            li, ri, dbg = self._poly_search(warped_binary, nzx, nzy, curvature=curv)
+            li, ri, dbg = self._poly_search(warped_binary, nzx, nzy, curvature=curv,
+                                             map_hint=map_hint)
             mode_label  = "POLY"
         else:
-            li, ri, dbg = self._sliding_window(warped_binary, nzx, nzy)
+            li, ri, dbg = self._sliding_window(warped_binary, nzx, nzy,
+                                                map_hint=map_hint)
             mode_label  = "SLIDE"
 
         self.left_conf  = len(li)
@@ -221,12 +223,24 @@ class HybridLaneTracker:
         denom = (1.0 + (2.0 * a * y_eval + b) ** 2) ** 1.5
         return abs(2.0 * a) / max(denom, 1e-6)
 
-    def _sliding_window(self, warped, nzx, nzy):
+    def _sliding_window(self, warped, nzx, nzy, map_hint: str = "STRAIGHT"):
         dbg  = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
         hist = np.sum(warped[self.h // 2:, :], axis=0)
         mid, margin = int(self.w * 0.40), self.SW_MARGIN
-        lb = int(np.argmax(hist[margin : mid - margin])) + margin
-        rb = int(np.argmax(hist[mid + margin : self.w - margin])) + mid + margin
+
+        # Map-Biased Shift: pre-bias search windows in the direction of an
+        # upcoming turn so the tracker stays locked when lines exit the frame.
+        shift = 0
+        if map_hint == "LEFT":  shift = -80
+        elif map_hint == "RIGHT": shift = 80
+
+        l_lo =  max(margin, margin + shift)
+        l_hi =  max(l_lo + 1, mid - margin + shift)
+        r_lo =  max(margin, mid + margin + shift)
+        r_hi =  min(self.w - margin, self.w - margin)
+
+        lb = int(np.argmax(hist[l_lo:l_hi])) + l_lo if l_hi > l_lo else margin
+        rb = int(np.argmax(hist[r_lo:r_hi])) + r_lo if r_hi > r_lo else mid + margin
 
         if abs(rb - lb) < 100:
             smoothed = np.convolve(hist.astype(float), np.ones(20) / 20, mode='same')
@@ -260,7 +274,7 @@ class HybridLaneTracker:
         if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
         return li, ri, dbg
 
-    def _poly_search(self, warped, nzx, nzy, curvature=0.0):
+    def _poly_search(self, warped, nzx, nzy, curvature=0.0, map_hint: str = "STRAIGHT"):
         dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
         m = (self.POLY_MARGIN_CURV if curvature > 0.0015 else self.POLY_MARGIN_BASE)
 
@@ -270,7 +284,7 @@ class HybridLaneTracker:
 
         if len(li) < self.MIN_PIX_OK and len(ri) < self.MIN_PIX_OK:
             self.mode = "SEARCH"
-            return self._sliding_window(warped, nzx, nzy)
+            return self._sliding_window(warped, nzx, nzy, map_hint=map_hint)
 
         if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
         if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
@@ -297,7 +311,8 @@ class VisionPipeline:
         self.last_target_x = 320.0
 
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
-                nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0) -> PerceptionResult:
+                nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
+                upcoming_curve: str = "STRAIGHT") -> PerceptionResult:
         if raw_frame.shape[:2] != (480, 640):
             process_frame = cv2.resize(raw_frame, (640, 480))
         else:
@@ -320,7 +335,10 @@ class VisionPipeline:
         binary = cv2.adaptiveThreshold(L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
         warped_binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
         
-        sl, sr, line_dbg, mode_label = self.tracker.update(warped_binary)
+        # Map-biased tracker update: pass upcoming_curve as map_hint  
+        # so sliding windows pre-bias toward the turn direction.
+        map_hint = upcoming_curve if upcoming_curve in ("LEFT", "RIGHT") else "STRAIGHT"
+        sl, sr, line_dbg, mode_label = self.tracker.update(warped_binary, map_hint=map_hint)
         
         y_eval = 400.0
         lw = self.tracker.estimated_lane_width

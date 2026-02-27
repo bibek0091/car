@@ -974,7 +974,8 @@ class Orchestrator:
                         extra_offset_px=extra_offset,
                         nav_state=self._nav_state,
                         velocity_ms=velocity_ms,
-                        last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0))
+                        last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0),
+                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'))
                     self._last_conf = perc.confidence; self._last_perc = perc
 
                     self._nav_state = self.jct_detector.update(
@@ -1006,7 +1007,10 @@ class Orchestrator:
                         perc_res=perc, nav_state=self._nav_state,
                         base_speed=float(self.base_speed),
                         traffic_mult=t_res.speed_multiplier,
-                        velocity_ms=velocity_ms, dt=dt)
+                        velocity_ms=velocity_ms, dt=dt,
+                        map_curvature=getattr(self.localizer,'_last_path_curvature',0.0),
+                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
+                        curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0))
                     self._last_ctrl = ctrl
 
                     _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
