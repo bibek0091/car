@@ -60,7 +60,7 @@ import numpy as np
 import tkinter as tk
 from PIL import Image, ImageTk
 
-from perception    import VisionPipeline, estimate_heading_from_lanes
+from perception    import VisionPipeline
 from localization  import LocalizationEngine
 from control       import Controller, ControlOutput
 from hardware_io   import HardwareIO
@@ -865,8 +865,8 @@ class Orchestrator:
                 fps           = self._fps,
                 sign_history  = list(self._sign_history),
                 nav_state     = self._nav_state,
-                l_conf        = perc.l_conf if perc else 0.0,
-                r_conf        = perc.r_conf if perc else 0.0,
+                l_conf        = perc.confidence if perc else 0.0,
+                r_conf        = perc.confidence if perc else 0.0,
                 curvature     = perc.curvature if perc else 0.0,
                 velocity_ms   = vm,
                 w=self.TEL_W, h=self.TEL_H)
@@ -973,7 +973,7 @@ class Orchestrator:
                         extra_offset_px=extra_offset,
                         nav_state=self._nav_state,
                         velocity_ms=velocity_ms,
-                        curvature_hint=getattr(self._last_ctrl,'curvature_used',0.0))
+                        last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0))
                     self._last_conf = perc.confidence; self._last_perc = perc
 
                     self._nav_state = self.jct_detector.update(
@@ -1001,11 +1001,8 @@ class Orchestrator:
 
                     ctrl = self.controller.compute(
                         perc_res=perc, nav_state=self._nav_state,
-                        traffic_state=t_res.state, base_speed=float(self.base_speed),
-                        traffic_mult=t_res.speed_multiplier, zone_mode=t_res.zone_mode,
-                        parking_state=t_res.parking_state, steer_bias=t_res.steer_bias,
-                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
-                        visual_yaw_rate_rps=self.localizer.visual_yaw_rate,
+                        base_speed=float(self.base_speed),
+                        traffic_mult=t_res.speed_multiplier,
                         velocity_ms=velocity_ms, dt=dt)
                     self._last_ctrl = ctrl
 
