@@ -1,40 +1,53 @@
+"""
+perception.py — BFMC BEV Lane Tracker + Visual Odometry  (FIXED v2)
+====================================================================
+Fix applied:
+  VL-02  estimate_heading_from_lanes() now returns +atan2(dxdy, 1.0)
+          — sign convention: positive tangent = road leans right = car
+          needs to yaw RIGHT (clockwise) = negative yaw delta in map frame.
+          The CALLER (localization.py Layer 3b) applies the negation for the
+          soft nudge.  Layer 1 (yaw-rate) uses the raw value directly.
+"""
+
 import cv2
 import numpy as np
 import math
 from dataclasses import dataclass
 
+
 @dataclass
 class PerceptionResult:
     warped_binary: np.ndarray
-    lane_dbg: np.ndarray
-    sl: np.ndarray  # Left polynomial
-    sr: np.ndarray  # Right polynomial
+    lane_dbg:      np.ndarray
+    sl:            np.ndarray   # Left polynomial  (ax^2+bx+c, y-space)
+    sr:            np.ndarray   # Right polynomial
     lateral_error_px: float
-    anchor: str
-    confidence: float
+    anchor:        str
+    confidence:    float
     lane_width_px: float
-    curvature: float
-    l_conf: float
-    r_conf: float
+    curvature:     float
+    l_conf:        float
+    r_conf:        float
 
 
 def estimate_heading_from_lanes(sl, sr, h=480):
     """
-    Estimates the car's heading offset from road centre using lane polynomial
-    derivatives sampled at 5 depth levels with bottom-weighted averaging.
+    Estimates the lane tangent heading from BEV polynomial fits.
 
     x = a*y^2 + b*y + c   →   dx/dy = 2a*y + b
 
-    Returns the correction in RADIANS to add to the current yaw estimate.
-    A negative return value = road turns left = car needs to yaw left.
+    FIX VL-02: Returns +atan2(dxdy, 1.0)  (NOT negated).
+    Sign convention:
+      positive return = road slopes right in BEV  = car must yaw right
+      negative return = road slopes left  in BEV  = car must yaw left
 
-    Improvements over v1:
-    - Outlier rejection: discard tangents > 2 std-devs from median.
-    - Bottom-row bonus: y=480 row weight raised to 3.0.
-    - Returns 0.0 (not garbage) when no valid lane is found.
+    Callers:
+      localization Layer 1 (yaw-rate):  uses raw value — differentiate to get rate
+      localization Layer 3b (nudge):    uses -value to correct toward centre
+    Returns 0.0 when no valid lane is found.
     """
     eval_rows   = [h * f for f in [0.2, 0.35, 0.5, 0.7, 1.0]]
-    row_weights = [0.5,   0.75,   1.0,   1.5,   3.0]   # bottom row 3.0
+    row_weights = [0.5,   0.75,   1.0,   1.5,   3.0]
 
     all_tangents = []
     all_weights  = []
@@ -49,35 +62,27 @@ def estimate_heading_from_lanes(sl, sr, h=480):
     if not all_tangents:
         return 0.0
 
-    # Outlier rejection: drop anything > 2 std-devs from the median
     arr = np.array(all_tangents)
     wts = np.array(all_weights)
     med = float(np.median(arr))
     std = float(np.std(arr)) if len(arr) > 2 else 1.0
     mask = np.abs(arr - med) <= 2.0 * std + 1e-6
     if mask.sum() == 0:
-        mask = np.ones(len(arr), dtype=bool)  # fallback: keep all
+        mask = np.ones(len(arr), dtype=bool)
 
-    tangent_mean = np.average(arr[mask], weights=wts[mask])
-    # Negate: rightward lean in BEV = road curving right = positive yaw rate
-    return -float(tangent_mean)
+    # FIX VL-02: return positive value (no negation)
+    return float(np.average(arr[mask], weights=wts[mask]))
 
 
 def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt,
-                             h=480, scale_m_per_px=0.35/280.0):
+                             h=480, scale_m_per_px=0.35 / 280.0):
     """
     Estimates lateral drift velocity (m/s) and heading rate (rad/s) from
     consecutive lane polynomial fits.
-
-    Improvements over v1:
-    - Lateral drift computed at 3 rows (200, 300, 400) and median-averaged.
-    - Drift clamped to ±0.05 m/s to prevent spike injection.
-    - Heading-rate sanity check: if |ΔH| > 0.5 rad in one frame, return 0.
     """
     if dt <= 0:
         return 0.0, 0.0
 
-    # ── Lateral velocity from lane-centre shift ────────────────────────────
     def lane_center(sfl, sfr, y=400):
         if sfl is not None and sfr is not None:
             return (np.polyval(sfl, y) + np.polyval(sfr, y)) / 2.0
@@ -94,19 +99,13 @@ def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt,
         if c_now is not None and c_prev is not None:
             drift_samples.append((c_now - c_prev) * scale_m_per_px / dt)
 
-    if drift_samples:
-        lateral_vel_ms = float(np.median(drift_samples))
-        # Clamp to ±0.05 m/s — beyond this it's a fit artifact, not real motion
-        lateral_vel_ms = max(-0.05, min(0.05, lateral_vel_ms))
-    else:
-        lateral_vel_ms = 0.0
+    lateral_vel_ms = float(np.median(drift_samples)) if drift_samples else 0.0
+    lateral_vel_ms = max(-0.05, min(0.05, lateral_vel_ms))
 
-    # ── Heading rate from tangent change between frames ─────────────────────
     curr_heading = estimate_heading_from_lanes(sl,      sr,      h)
     prev_heading = estimate_heading_from_lanes(prev_sl, prev_sr, h)
     raw_heading_rate = (curr_heading - prev_heading) / dt
 
-    # Sanity check: > 0.5 rad/frame change is almost certainly a stale-fit artifact
     if abs(curr_heading - prev_heading) > 0.5:
         heading_rate_rps = 0.0
     else:
@@ -115,17 +114,18 @@ def estimate_camera_odometry(sl, sr, prev_sl, prev_sr, dt,
     return lateral_vel_ms, heading_rate_rps
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
 class HybridLaneTracker:
-    NWINDOWS           = 9
-    SW_MARGIN          = 60
-    SW_MARGIN_RECOVERY = 100    # wider search during lost-lane recovery
-    MINPIX             = 50
-    POLY_MARGIN_BASE   = 60
-    POLY_MARGIN_CURV   = 120
-    MIN_PIX_OK         = 200
-    EMA_ALPHA          = 0.30   # smoother polynomial tracking (↓ from 0.35)
-    STALE_FIT_FRAMES   = 12     # hold last known fit longer (↑ from 8)
-    LOST_RECOVERY_THRESH = 2    # trigger wide-sweep sooner after lane loss (↑ from 3)
+    NWINDOWS             = 9
+    SW_MARGIN            = 60
+    SW_MARGIN_RECOVERY   = 100
+    MINPIX               = 50
+    POLY_MARGIN_BASE     = 60
+    POLY_MARGIN_CURV     = 120
+    MIN_PIX_OK           = 200
+    EMA_ALPHA            = 0.30
+    STALE_FIT_FRAMES     = 12
+    LOST_RECOVERY_THRESH = 2
 
     def __init__(self, h=480, w=640):
         self.h, self.w = h, w
@@ -136,20 +136,22 @@ class HybridLaneTracker:
         self.l_stale, self.r_stale = 0, 0
         self.l_conf, self.r_conf = 0.0, 0.0
         self.lane_width_px = 280.0
-        self._lost_frames = 0   # consecutive frames with no lane at all
+        self._lost_frames = 0
 
     def get_curvature(self, fit, y_eval):
-        if fit is None: return 0.0
+        if fit is None:
+            return 0.0
         a, b = fit[0], fit[1]
-        denom = (1.0 + (2.0 * a * y_eval + b)**2)**1.5
+        denom = (1.0 + (2.0 * a * y_eval + b) ** 2) ** 1.5
         return abs(2.0 * a) / max(denom, 1e-6)
 
     def _ema(self, prev, new):
-        if prev is None: return new.copy()
+        if prev is None:
+            return new.copy()
         return self.EMA_ALPHA * new + (1.0 - self.EMA_ALPHA) * prev
 
     def _sliding_window(self, warped, nzx, nzy, wide=False):
-        dbg = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+        dbg  = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
         hist = np.sum(warped[self.h // 2:, :], axis=0)
 
         mid    = int(self.w * 0.40)
@@ -162,7 +164,7 @@ class HybridLaneTracker:
             smoothed = np.convolve(hist.astype(float), np.ones(20) / 20, mode='same')
             p1 = int(np.argmax(smoothed))
             tmp = smoothed.copy()
-            tmp[max(0, p1-40):min(self.w, p1+40)] = 0
+            tmp[max(0, p1 - 40):min(self.w, p1 + 40)] = 0
             p2 = int(np.argmax(tmp))
             lb, rb = (min(p1, p2), max(p1, p2))
 
@@ -182,14 +184,19 @@ class HybridLaneTracker:
             gl = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xl0) & (nzx < xl1)).nonzero()[0]
             gr = ((nzy >= y_lo) & (nzy < y_hi) & (nzx >= xr0) & (nzx < xr1)).nonzero()[0]
 
-            li.append(gl); ri.append(gr)
+            li.append(gl)
+            ri.append(gr)
 
-            if len(gl) > self.MINPIX: lx = int(np.mean(nzx[gl]))
-            if len(gr) > self.MINPIX: rx = int(np.mean(nzx[gr]))
+            if len(gl) > self.MINPIX:
+                lx = int(np.mean(nzx[gl]))
+            if len(gr) > self.MINPIX:
+                rx = int(np.mean(nzx[gr]))
 
         li, ri = np.concatenate(li), np.concatenate(ri)
-        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
-        if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
+        if len(li):
+            dbg[nzy[li], nzx[li]] = [255, 80, 80]
+        if len(ri):
+            dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
         return li, ri, dbg
 
     def _poly_search(self, warped, nzx, nzy, curvature=0.0):
@@ -207,8 +214,10 @@ class HybridLaneTracker:
             self.mode = "SEARCH"
             return self._sliding_window(warped, nzx, nzy)
 
-        if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
-        if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
+        if len(li):
+            dbg[nzy[li], nzx[li]] = [255, 80, 80]
+        if len(ri):
+            dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
         return li, ri, dbg
 
     def _width_sane(self, lf, rf, y=400):
@@ -220,7 +229,6 @@ class HybridLaneTracker:
         nzy = np.array(nz[0])
         nzx = np.array(nz[1])
 
-        # Lost-lane recovery: widen search when both fits have been None for too long
         both_lost = (self.sl is None and self.sr is None)
         if both_lost:
             self._lost_frames += 1
@@ -229,7 +237,8 @@ class HybridLaneTracker:
         do_wide_sweep = (self._lost_frames >= self.LOST_RECOVERY_THRESH)
 
         if self.mode == "TRACKING" and (self.sl is not None or self.sr is not None):
-            curv = self.get_curvature(self.sl if self.sl is not None else self.sr, self.h // 2)
+            curv = self.get_curvature(
+                self.sl if self.sl is not None else self.sr, self.h // 2)
             li, ri, dbg = self._poly_search(warped, nzx, nzy, curvature=curv)
             mode_label  = "POLY"
         else:
@@ -246,7 +255,7 @@ class HybridLaneTracker:
             self.left_fit = fl
             self.sl = self._ema(self.sl, fl)
             self.l_stale = 0
-            self.l_conf = min(1.0, len(li) / 1000)
+            self.l_conf  = min(1.0, len(li) / 1000)
         else:
             self.l_stale += 1
             if self.l_stale > self.STALE_FIT_FRAMES:
@@ -259,7 +268,7 @@ class HybridLaneTracker:
             self.right_fit = fr
             self.sr = self._ema(self.sr, fr)
             self.r_stale = 0
-            self.r_conf = min(1.0, len(ri) / 1000)
+            self.r_conf  = min(1.0, len(ri) / 1000)
         else:
             self.r_stale += 1
             if self.r_stale > self.STALE_FIT_FRAMES:
@@ -280,7 +289,7 @@ class HybridLaneTracker:
                     self.r_stale = self.STALE_FIT_FRAMES
                     has_r = False
             else:
-                y_pos = [100, 200, 300, 400]
+                y_pos  = [100, 200, 300, 400]
                 widths = []
                 for y in y_pos:
                     lx_v = np.polyval(self.sl, y)
@@ -290,57 +299,39 @@ class HybridLaneTracker:
                 self.lane_width_px = 0.8 * self.lane_width_px + 0.2 * w
 
         self.lane_width_px = max(150.0, min(self.lane_width_px, 400.0))
-        self.mode = "TRACKING" if (has_l or has_r or self.sl is not None or self.sr is not None) else "SEARCH"
-
+        self.mode = ("TRACKING" if (has_l or has_r
+                                    or self.sl is not None
+                                    or self.sr is not None) else "SEARCH")
         return dbg
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
 class VisionPipeline:
-    # ── v3 lane-centre offsets (pixels) ───────────────────────────────────────
-    # DUAL        : mathematical midpoint — no offset needed
-    # SINGLE_DIV  : only centre-divider visible → offset right to stay in lane
-    # SINGLE_EDGE : only outer edge visible → offset left to stay in lane
-    # These match bfmc_pilot_v3_yolo.py constants exactly.
-    DUAL_OFFSET_PX        =   0    # both lines: perfect maths centre
-    SINGLE_DIV_OFFSET_PX  =  40    # right-divider only: nudge right
-    SINGLE_EDGE_OFFSET_PX = -40    # left-edge only: nudge left
-
-    Y_EVAL = 400   # BEV row used for immediate steering target
+    DUAL_OFFSET_PX        =   0
+    SINGLE_DIV_OFFSET_PX  =  40
+    SINGLE_EDGE_OFFSET_PX = -40
+    Y_EVAL = 400
 
     def __init__(self):
         self.tracker = HybridLaneTracker()
-        # Default BEV transform — will be auto-calibrated by VisualCalibrator
         self.SRC_PTS = np.float32([[200, 260], [440, 260], [40, 450], [600, 450]])
-        self.DST_PTS = np.float32([[150, 0], [490, 0], [150, 480], [490, 480]])
+        self.DST_PTS = np.float32([[150, 0],   [490, 0],   [150, 480], [490, 480]])
         self.M = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
         self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         self.bev_calibrated = False
-        self._last_target_x  = 320.0   # dead-reckoning memory
+        self._last_target_x = 320.0
 
     def update_bev_transform(self, src_pts):
-        """Called by VisualCalibrator after vanishing-point detection."""
         self.SRC_PTS = np.float32(src_pts)
         self.M = cv2.getPerspectiveTransform(self.SRC_PTS, self.DST_PTS)
         self.bev_calibrated = True
 
     def process(self, frame_bgr, extra_offset_px: float = 0.0,
                 nav_state: str = "NORMAL"):
-        """
-        Process one camera frame.
-
-        extra_offset_px : lateral nudge from controller (evasion, junction)
-        nav_state       : "NORMAL" | "ROUNDABOUT" | "JUNCTION_LEFT" | "JUNCTION_RIGHT"
-
-        Returns PerceptionResult with v3-aligned lateral_error_px:
-            error > 0  → target is RIGHT of image centre → steer right
-            error < 0  → target is LEFT of image centre  → steer left
-        """
-        # ── 1. BEV warp ───────────────────────────────────────────────────────
         if frame_bgr.shape[:2] != (480, 640):
             frame_bgr = cv2.resize(frame_bgr, (640, 480))
         warped = cv2.warpPerspective(frame_bgr, self.M, (640, 480))
 
-        # ── 2. LAB + CLAHE + adaptive lighting (identical to v3) ─────────────
         lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
         L   = self.clahe.apply(lab[:, :, 0])
 
@@ -354,27 +345,22 @@ class VisionPipeline:
             b = -(mean_l - 180) * 0.4
             L = cv2.convertScaleAbs(L, alpha=a, beta=int(b))
 
-        # ── 3. Adaptive threshold + morphology (identical to v3) ─────────────
-        # Track=WHITE, lane-lines=BLACK. C=+15 aggressively rejects shadows.
         binary = cv2.adaptiveThreshold(
             L, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY_INV, 31, 15)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-        # ── 4. Lane tracking ──────────────────────────────────────────────────
         dbg = self.tracker.update(binary)
-
-        sl = self.tracker.sl
-        sr = self.tracker.sr
-        lw = self.tracker.lane_width_px
-        hw = lw / 2.0
-        y  = self.Y_EVAL
+        sl  = self.tracker.sl
+        sr  = self.tracker.sr
+        lw  = self.tracker.lane_width_px
+        hw  = lw / 2.0
+        y   = self.Y_EVAL
 
         def ev(fit):
             return float(np.polyval(fit, y))
 
-        # ── 5. Target-x: exact v3 get_target_x() logic ───────────────────────
         if nav_state == "ROUNDABOUT":
             if sl is not None:
                 tx     = ev(sl) + hw + extra_offset_px
@@ -409,25 +395,18 @@ class VisionPipeline:
                 anchor = "JCT_LEFT_BLIND"
 
         else:
-            # ── NORMAL driving — v3 "BRUTE FORCE MIDDLE-LANE PRIORITY" ───────
             if sl is None and sr is None:
-                # Dead-reckoning: hold last valid target
                 tx     = self._last_target_x + extra_offset_px
                 anchor = "DEAD_RECKONING"
             elif sl is not None and sr is not None:
-                # Both lines: mathematical centre — no offset, no bias
                 tx     = (ev(sl) + ev(sr)) / 2.0 + self.DUAL_OFFSET_PX + extra_offset_px
                 anchor = "CENTERED_DUAL"
                 self._last_target_x = tx - extra_offset_px
             elif sr is not None:
-                # Right-divider (centre/dashed line): project centre leftward
-                # +SINGLE_DIV_OFFSET_PX nudges car slightly right (right-lane rule)
                 tx     = ev(sr) - hw + self.SINGLE_DIV_OFFSET_PX + extra_offset_px
                 anchor = "CENTERED_FROM_RIGHT"
                 self._last_target_x = tx - extra_offset_px
             elif sl is not None:
-                # Left edge (outer white line): project centre rightward
-                # +SINGLE_EDGE_OFFSET_PX nudges car slightly left (stay off edge)
                 tx     = ev(sl) + hw + self.SINGLE_EDGE_OFFSET_PX + extra_offset_px
                 anchor = "CENTERED_FROM_LEFT"
                 self._last_target_x = tx - extra_offset_px
@@ -435,8 +414,6 @@ class VisionPipeline:
                 tx     = self._last_target_x + extra_offset_px
                 anchor = "DEAD_RECKONING"
 
-        # ── 6. Confidence & curvature ─────────────────────────────────────────
-        # Normalised pixel count: ≥ MIN_PIX_OK pixels → conf 1.0
         MIN_PIX = self.tracker.MIN_PIX_OK
         if sl is not None and sr is not None:
             conf = min(1.0, (self.tracker.l_conf + self.tracker.r_conf) / (2.0 * MIN_PIX))
@@ -463,5 +440,5 @@ class VisionPipeline:
             lane_width_px=lw,
             curvature=curv,
             l_conf=self.tracker.l_conf,
-            r_conf=self.tracker.r_conf
+            r_conf=self.tracker.r_conf,
         )
