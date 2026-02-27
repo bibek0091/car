@@ -1031,8 +1031,11 @@ class Orchestrator:
 
                 perc = self.vision.process(
                     raw_frame,
-                    extra_offset_px=extra_offset,
-                    nav_state=self._nav_state)
+                    extra_offset_px = extra_offset,
+                    nav_state       = self._nav_state,
+                    velocity_ms     = velocity_ms,
+                    curvature_hint  = getattr(self._last_ctrl, 'curvature_used', 0.0)
+                )
 
                 self._last_conf = perc.confidence   # exposed to GUI
 
@@ -1055,8 +1058,8 @@ class Orchestrator:
                     else:
                         self._nav_state = "JUNCTION_STRAIGHT"
 
-                # ── 8. Camera heading (FIX VL-02: pass raw un-negated value) ──
-                cam_heading = estimate_heading_from_lanes(perc.sl, perc.sr)
+                # ── 8. Camera heading (LANE-07: use heading_rad from PerceptionResult) ──
+                cam_heading = perc.heading_rad   # already computed robustly in perception
 
                 # ── 9 + 10. Localizer update (cursor is self-managed inside) ──
                 # NOTE: update() internally calls _update_cursor_internal() so we
@@ -1064,11 +1067,12 @@ class Orchestrator:
                 # double-advance that broke map-snap segment selection (Bug #2).
                 # NOTE: path_cursor kwarg removed — not in update() signature (Bug #1).
                 self.localizer.update(
-                    velocity_ms       = velocity_ms,
-                    dt                = dt,
-                    camera_heading_rad= cam_heading,
-                    camera_confidence = perc.confidence,
-                    path              = self._planned_path,
+                    velocity_ms        = velocity_ms,
+                    dt                 = dt,
+                    camera_heading_rad = cam_heading,
+                    camera_confidence  = perc.confidence,
+                    heading_conf       = perc.heading_conf,   # LOC-A
+                    path               = self._planned_path,
                 )
                 # Sync orchestrator cursor from the authoritative localizer value
                 self._path_cursor = self.localizer.path_cursor

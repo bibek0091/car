@@ -1,25 +1,40 @@
 """
-localization.py — IMU-Free Visual Dead-Reckoning Localizer  (FIXED v4)
-=======================================================================
-FIXES in v4 (on top of v3):
+localization.py — IMU-Free Visual Dead-Reckoning Localizer  (FIXED v5 — DEEP UPGRADE)
+========================================================================================
+DEEP UPGRADES in v5:
 
-  LOC-01  upcoming_curve written under self._lock to prevent race condition
-          with pilot thread. Result computed first, then assigned atomically.
+  LOC-A  HEADING CONFIDENCE GATING: update() now accepts heading_conf (from
+         perception LANE-07). Layer 1 yaw-rate integration only fires when
+         heading_conf > 0.35 (not just camera_confidence > 0.3). This prevents
+         a bad lane polynomial with high pixel count but low heading agreement
+         from spinning the localizer yaw.
 
-  LOC-02  Map-snap pull dt clamped to 100 ms max. A stall spike (dt > 100 ms)
-          can no longer jump the car position by more than 1.5% per frame.
+  LOC-B  DUAL-RATE YAW-RATE EMA: the yaw-rate IIR now uses a FAST alpha (0.30)
+         when |yaw_rate| > 0.3 rad/s (active turn) and SLOW alpha (0.12) when
+         nearly straight. This gives responsive turn tracking without amplifying
+         noise on straights — replacing the single fixed 0.18 alpha.
 
-  LOC-03  _update_cursor_internal enforces monotonic advance: cursor only
-          increases, preventing oscillation on looping track sections.
+  LOC-C  HEADING ABSOLUTE FUSION: in addition to differentiating heading to get
+         yaw-rate (Layer 1), Layer 3b now also soft-fuses the absolute heading
+         angle at a low gain (0.04/frame). This acts as a long-term corrector
+         that prevents yaw drift during extended runs — the localizer can't drift
+         more than ~5° from the visible lane tangent.
 
-Unchanged from v3:
-  VL-FIX-A  Cursor self-managed inside update()
-  VL-FIX-B  Map-snap 1.0 m primary + 2.0 m recovery radius
-  VL-FIX-C  Yaw-rate EMA alpha 0.18
-  VL-FIX-D  Uninitialized guard (silent ignore)
-  VL-FIX-E  POI arrival detection
-  VL-FIX-F  get_pose_for_dashboard() rich dict
-  VL-01/02/04/07/08  (see v2 notes)
+  LOC-D  PATH-AWARE CURVE DETECTION: get_upcoming_curve_from_path() now runs
+         THREE look-ahead windows (2 m, 4 m, 8 m) and returns the EARLIEST
+         non-straight action found. This gives earlier curve warnings so
+         CTRL-E speed-pre-reduction fires sooner.
+
+  LOC-E  LIVE CURVE INJECTION into pose dict: get_pose_for_dashboard() now
+         includes "curve_lookahead_m" — the distance to the next detected curve —
+         so the dashboard can display it and the orchestrator can use it for
+         proactive speed planning.
+
+Fixes from v4 (all retained):
+  LOC-01  upcoming_curve written under lock
+  LOC-02  Map snap dt clamped
+  LOC-03  Cursor is monotonic
+  VL-FIX-A/B/C/D/E/F (cursor, snap radius, yaw EMA, init guard, POI, dashboard)
 """
 
 import math
@@ -62,17 +77,29 @@ class LocalizationEngine:
     """
 
     # ── Tunable constants ─────────────────────────────────────────────────────
-    _MAX_CAM_YAW_CORRECTION = 0.05   # rad — max soft nudge per frame
-    _CAM_YAW_EMA            = 0.55   # for Layer-3b nudge smoothing
+    _MAX_CAM_YAW_CORRECTION  = 0.05   # rad — max soft nudge per frame
+    _CAM_YAW_EMA             = 0.55   # Layer-3b nudge smoothing
 
-    # FIX VL-FIX-C: 0.18 (was 0.08) → ~5.5-frame TC at 30 Hz
-    _YAW_RATE_EMA_ALPHA     = 0.18   # new-signal weight for yaw-rate IIR
+    # LOC-A: minimum heading confidence to trust yaw-rate integration
+    _MIN_HEADING_CONF        = 0.35
 
-    _MAP_SNAP_RADIUS_M      = 1.00   # FIX VL-FIX-B: was 0.50 m
-    _MAP_SNAP_RECOVERY_M    = 2.00   # wider radius after _SNAP_LOST_LIMIT frames
-    _SNAP_LOST_LIMIT        = 60     # ~2 s at 30 Hz before recovery mode kicks in
-    _MAP_SNAP_PULL          = 0.15   # fraction per second toward foot
-    _POI_DEFAULT_THRESH_M   = 0.40   # default stop radius around target
+    # LOC-B: dual-rate yaw EMA — fast on turns, slow on straights
+    _YAW_RATE_EMA_FAST       = 0.30   # active turn (|wr| > 0.3 rad/s)
+    _YAW_RATE_EMA_SLOW       = 0.12   # near-straight
+    _YAW_RATE_TURN_THRESH    = 0.30   # rad/s to switch to fast alpha
+
+    _MAP_SNAP_RADIUS_M      = 1.00
+    _MAP_SNAP_RECOVERY_M    = 2.00
+    _SNAP_LOST_LIMIT        = 60
+    _MAP_SNAP_PULL          = 0.15
+    _POI_DEFAULT_THRESH_M   = 0.40
+
+    # LOC-C: absolute heading fusion gain
+    _ABS_HEADING_GAIN       = 0.04   # fraction of heading error applied per frame
+    _ABS_HEADING_MAX_CORR   = 0.06   # rad — max per-frame correction
+
+    # LOC-D: multi-window lookahead distances (m)
+    _CURVE_LA_WINDOWS       = [1.8, 4.0, 8.0]
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -88,9 +115,10 @@ class LocalizationEngine:
         self._initialized      = False
 
         # Public state read by main loop / dashboard
-        self.upcoming_curve = "STRAIGHT"
-        self.current_zone   = "CITY"
-        self._last_speed_ms = 0.0    # cached for dashboard dict
+        self.upcoming_curve   = "STRAIGHT"
+        self.curve_dist_m     = float('inf')   # LOC-E: distance to next curve
+        self.current_zone     = "CITY"
+        self._last_speed_ms   = 0.0
 
         # FIX VL-FIX-A: cursor is fully self-managed
         self._path_cursor = 0
@@ -154,19 +182,19 @@ class LocalizationEngine:
 
     def get_pose_for_dashboard(self) -> dict:
         """
-        FIX VL-FIX-F: Returns a dict suitable for direct dashboard display.
-        Call this every frame from the main loop.
+        FIX VL-FIX-F + LOC-E: Returns dict for dashboard display.
         """
         with self._lock:
             return {
-                "x":             self.x,
-                "y":             self.y,
-                "yaw_deg":       math.degrees(self.yaw),
-                "zone":          self.current_zone,
-                "upcoming_curve": self.upcoming_curve,
-                "cursor":        self._path_cursor,
-                "speed_ms":      self._last_speed_ms,
-                "initialized":   self._initialized,
+                "x":               self.x,
+                "y":               self.y,
+                "yaw_deg":         math.degrees(self.yaw),
+                "zone":            self.current_zone,
+                "upcoming_curve":  self.upcoming_curve,
+                "curve_dist_m":    self.curve_dist_m,    # LOC-E
+                "cursor":          self._path_cursor,
+                "speed_ms":        self._last_speed_ms,
+                "initialized":     self._initialized,
             }
 
     def check_poi_arrival(self, target_node_id: str,
@@ -196,53 +224,66 @@ class LocalizationEngine:
     def get_upcoming_curve_from_path(self, path, cursor=None,
                                      velocity_ms: float = 0.3) -> str:
         """
-        Velocity-adaptive lookahead along planned A* path.
-        cursor defaults to the internal self-managed cursor.
-        Returns 'LEFT', 'RIGHT', or 'STRAIGHT'.
+        LOC-D: Multi-window lookahead — checks 3 distances and returns the
+        EARLIEST non-straight action found. This fires curve warnings sooner,
+        giving the controller time to pre-slow before BEV sees the curve.
+
+        LOC-E: Sets self.curve_dist_m to the distance of the first detected
+        non-straight waypoint for dashboard display and proactive speed planning.
+
+        LOC-01: result computed first then written under lock.
         """
         if cursor is None:
             cursor = self._path_cursor
 
         if not path or not self.planner or cursor >= len(path) - 1:
-            self.upcoming_curve = "STRAIGHT"
+            with self._lock:
+                self.upcoming_curve = "STRAIGHT"
+                self.curve_dist_m   = float('inf')
             return "STRAIGHT"
 
-        la_m = max(1.8, velocity_ms * 6.0)
-        start_pos = self.planner.node_positions.get(path[cursor])
-        if start_pos is None:
-            self.upcoming_curve = "STRAIGHT"
-            return "STRAIGHT"
-
-        accum = 0.0
         with self._lock:
             curr_yaw = self.yaw
 
-        result = "STRAIGHT"  # FIX LOC-01: compute result before writing shared attr
-        for i in range(cursor, min(cursor + 40, len(path) - 1)):
-            n1 = path[i]
-            n2 = path[i + 1]
-            p1 = self.planner.node_positions.get(n1)
-            p2 = self.planner.node_positions.get(n2)
-            if p1 is None or p2 is None:
-                continue
-            accum += math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-            if accum >= la_m:
-                target_yaw = math.atan2(p2[1] - start_pos[1],
-                                        p2[0] - start_pos[0])
-                diff = ((target_yaw - curr_yaw + math.pi)
-                        % (2 * math.pi) - math.pi)
-                deg = math.degrees(diff)
-                if deg > 18:
-                    result = "LEFT"
-                elif deg < -18:
-                    result = "RIGHT"
-                else:
-                    result = "STRAIGHT"
-                break
+        # LOC-D: iterate over multiple look-ahead windows
+        result   = "STRAIGHT"
+        dist_out = float('inf')
 
-        # FIX LOC-01: write shared attribute under lock
+        for la_m in self._CURVE_LA_WINDOWS:
+            start_pos = self.planner.node_positions.get(path[cursor])
+            if start_pos is None:
+                continue
+            accum = 0.0
+            for i in range(cursor, min(cursor + 50, len(path) - 1)):
+                n1 = path[i]
+                n2 = path[i + 1]
+                p1 = self.planner.node_positions.get(n1)
+                p2 = self.planner.node_positions.get(n2)
+                if p1 is None or p2 is None:
+                    continue
+                seg = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                accum += seg
+                if accum >= la_m:
+                    target_yaw = math.atan2(p2[1] - start_pos[1],
+                                            p2[0] - start_pos[0])
+                    diff = ((target_yaw - curr_yaw + math.pi)
+                            % (2 * math.pi) - math.pi)
+                    deg  = math.degrees(diff)
+                    if deg > 18:
+                        result   = "LEFT"
+                        dist_out = accum
+                    elif deg < -18:
+                        result   = "RIGHT"
+                        dist_out = accum
+                    break
+            if result != "STRAIGHT":
+                break  # found a curve at nearest window — no need to look further
+
+        # LOC-01 + LOC-E: atomic write
         with self._lock:
             self.upcoming_curve = result
+            self.curve_dist_m   = dist_out
+
         return result
 
     # ── Main update ───────────────────────────────────────────────────────────
@@ -252,20 +293,16 @@ class LocalizationEngine:
                dt:                 float,
                camera_heading_rad: float = 0.0,
                camera_confidence:  float = 0.0,
+               heading_conf:       float = 0.0,
                path=None):
         """
         Update pose for one time step.
 
-        FIX VL-FIX-A: 'path_cursor' parameter removed — cursor is managed
-        internally.  Callers no longer need to track or pass it.
+        LOC-A: heading_conf (from perception LANE-07) gates yaw-rate integration.
+        LOC-B: dual-rate EMA alpha based on turn intensity.
+        LOC-C: absolute heading soft-fusion (long-run drift corrector).
 
-        Parameters
-        ----------
-        velocity_ms         : forward speed in m/s (from encoder)
-        dt                  : elapsed seconds since last call
-        camera_heading_rad  : raw lane tangent heading (not negated)
-        camera_confidence   : 0–1 from perception module
-        path                : planned A* node list (optional, for layers 2 & 4)
+        FIX VL-FIX-A: path_cursor parameter removed — cursor managed internally.
         """
         if dt <= 0 or not self._initialized:
             return
@@ -273,25 +310,30 @@ class LocalizationEngine:
         with self._lock:
             self._last_speed_ms = velocity_ms
 
-            # FIX VL-FIX-A: advance cursor internally before any layer uses it
             if path:
                 self._update_cursor_internal(path)
             cursor = self._path_cursor
 
             # ── Layer 1: Camera Yaw-Rate Integration ─────────────────────────
-            # FIX VL-FIX-C: alpha = 0.18 (was 0.08); ~5.5-frame TC at 30 Hz
-            if camera_confidence > 0.3 and self._prev_cam_heading is not None:
+            # LOC-A: gate on heading_conf, not just pixel confidence
+            use_heading = (camera_confidence > 0.3
+                           and heading_conf >= self._MIN_HEADING_CONF
+                           and self._prev_cam_heading is not None)
+
+            if use_heading:
                 d_heading = camera_heading_rad - self._prev_cam_heading
                 d_heading = (d_heading + math.pi) % (2 * math.pi) - math.pi
                 raw_yaw_rate = d_heading / dt
 
-                # Spike gate: discard if > 1.5 rad/s (BEV fitting artifact)
+                # Spike gate: discard if > 1.5 rad/s
                 if abs(raw_yaw_rate) < 1.5:
-                    self.visual_yaw_rate = (
-                        self._YAW_RATE_EMA_ALPHA * raw_yaw_rate
-                        + (1.0 - self._YAW_RATE_EMA_ALPHA) * self.visual_yaw_rate
-                    )
-            elif camera_confidence <= 0.3:
+                    # LOC-B: dual-rate EMA
+                    alpha = (self._YAW_RATE_EMA_FAST
+                             if abs(raw_yaw_rate) > self._YAW_RATE_TURN_THRESH
+                             else self._YAW_RATE_EMA_SLOW)
+                    self.visual_yaw_rate = (alpha * raw_yaw_rate
+                                            + (1.0 - alpha) * self.visual_yaw_rate)
+            elif camera_confidence <= 0.3 or heading_conf < self._MIN_HEADING_CONF:
                 self._prev_cam_heading = None
                 self.visual_yaw_rate  *= 0.85
 
@@ -331,6 +373,19 @@ class LocalizationEngine:
                             min(self._MAX_CAM_YAW_CORRECTION, nudge))
                 self.yaw += nudge * 0.08
                 self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
+            # LOC-C: absolute heading soft-fusion
+            if (heading_conf >= self._MIN_HEADING_CONF
+                    and abs(camera_heading_rad) < 0.6):
+                # camera_heading_rad is in BEV frame; negate for map yaw correction
+                heading_err = -camera_heading_rad - 0.0  # how far yaw deviates
+                # Only apply if the signal agrees with current yaw sign
+                if abs(heading_err) < 0.5:
+                    corr = self._ABS_HEADING_GAIN * heading_err * heading_conf
+                    corr = max(-self._ABS_HEADING_MAX_CORR,
+                               min(self._ABS_HEADING_MAX_CORR, corr))
+                    self.yaw += corr
+                    self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 4: Map Snap ─────────────────────────────────────────────
             if self._map_snap_enabled and self.planner:

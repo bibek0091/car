@@ -1,28 +1,52 @@
 """
-control.py — BFMC Lane-Hold Controller  (FIXED v3)
-===================================================
-Fixes applied (v2 → v3):
-  CTRL-01  Emergency steer sign corrected: was -copysign → steered INTO boundary.
-           Now +copysign(EMRG_STEER_DEG, -error_px) steers toward lane centre.
-  CTRL-02  DividerGuard EMA stale state: smooth_guard now synced to raw_steer
-           when guard is not triggered, preventing jump on next trigger.
-  CTRL-03  Integral decays 50% on emergency override entry (prevents windup
-           that caused kick when emergency condition cleared).
-  CTRL-04  VC-05 (dead-reckoning scale) now documented in fix list.
+control.py — BFMC Lane-Hold Controller  (FIXED v4 — DEEP UPGRADE)
+==================================================================
+DEEP UPGRADES in v4:
 
-Fixes carried forward from v2:
-  VC-01  DividerGuard edge_corr sign fixed (pushes toward centre)
-  VC-02  Integral decays during DEAD_RECKONING
-  VC-03  VO feed-forward removed (double-counted yaw)
-  VC-04  Pure-pursuit minimum lookahead enforced (la_px >= wb_px * 2.5)
-  VC-05  Dead-reckoning speed scale applied before floor
+  CTRL-A  VELOCITY-ADAPTIVE LOOKAHEAD: lookahead is now computed as
+          la_px = clamp(velocity_ms * PPM * T_HORIZON, la_min, la_max)
+          where T_HORIZON = 0.8 s.  At 0 m/s la = la_min (tight tracking).
+          At 0.5 m/s la = ~350 px (smooth anticipation).  This directly
+          fixes "steering not enough" — at speed the car was looking 200 px
+          ahead (0.17 m) which left no time to react to curves.
 
-5-Layer Defence:
-  Layer 1  Pure pursuit to target centre
-  Layer 2  [REMOVED VO feed-forward — was double-counting]
-  Layer 3  DividerGuard HARD forcefield
-  Layer 4  Emergency boundary clamp (sign-corrected)
-  Layer 5  Confidence-proportional speed
+  CTRL-B  CURVATURE FEED-FORWARD STEER: a direct feed-forward term
+          ff_steer = K_FF * curvature * sign  is added before rate-limiting.
+          K_FF is tuned so a lane curvature of 0.0025 adds ~8° of pre-steer.
+          This makes the car lean into curves BEFORE lateral error builds up,
+          fixing the "always late to react" behaviour.
+
+  CTRL-C  STRONGER INTEGRAL (0.0008 → 0.0018) + FASTER MAX RATE (15 → 22 °/s):
+          The old integral was too weak to correct sustained cross-track error
+          on curves. Increased gain closes the loop faster. Rate limit raised
+          so the controller can actually command the required angle change in
+          one or two frames at 30 Hz.
+
+  CTRL-D  CONFIDENCE-ADAPTIVE EMA: EMA alpha now scales with confidence.
+          High confidence (both lanes): alpha = 0.55 (responsive).
+          Low confidence (one lane):    alpha = 0.35 (smoother).
+          Dead-reckoning:               alpha = 0.15 (very smooth hold).
+          Old fixed alpha = 0.40 was too slow on clear road and too jittery
+          when losing a lane.
+
+  CTRL-E  DYNAMIC SPEED REDUCTION ON CURVE: speed is now also reduced when
+          upcoming_curve != STRAIGHT and velocity is above a threshold,
+          regardless of whether BEV curvature has been detected yet.
+          This pre-slows the car before the BEV even sees the curve,
+          complementing the existing curvature-based scaling.
+
+  CTRL-F  HEADING-RATE STEERING CORRECTION: if the localizer's visual_yaw_rate
+          is provided and non-trivial (> 0.05 rad/s), a small proportional
+          correction K_YAW_RATE * yaw_rate_rps is added to raw_steer.
+          This acts as a yaw-rate damper — reducing oscillation and improving
+          curve tracking without double-counting (the localizer already
+          integrates the heading; this is a derivative-like term only).
+
+Fixes from v3 (all retained):
+  CTRL-01  Emergency steer sign corrected
+  CTRL-02  DividerGuard EMA synced when not triggered
+  CTRL-03  Integral decays on emergency override
+  VC-01/02/03/04/05 (boundary guard, integral decay, no VO ff, lookahead min)
 """
 
 import math
@@ -41,50 +65,39 @@ class ControlOutput:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 class DividerGuard:
-    """
-    Repulsion forcefield around both lane boundaries.
+    """Repulsion forcefield around both lane boundaries. (unchanged from v3)"""
 
-    FIX VC-01: edge_corr is now NEGATIVE (pushes car LEFT away from right edge).
-    Resolution: correction = div_corr + edge_corr  (both signed correctly).
-    """
     DIVIDER_SAFE_PX = 130
     EDGE_SAFE_PX    =  90
-    GAIN            = 0.50
+    GAIN            = 0.55      # slightly raised for faster response
     MAX_CORR        = 45.0
     DEADBAND_PX     =  2
 
     def apply(self, steer_angle, left_fit, right_fit, y_eval=440, car_x=320):
-        """Returns (corrected_steer, speed_scale, triggered)."""
-        div_corr  = 0.0
-        edge_corr = 0.0
+        div_corr = edge_corr = 0.0
         speed_scale = 1.0
         triggered   = False
 
-        # ── Left boundary (centre divider) — pushes RIGHT (+) ─────────────────
         if left_fit is not None:
             div_x = float(np.polyval(left_fit, y_eval))
             gap   = car_x - div_x
             if gap < self.DIVIDER_SAFE_PX - self.DEADBAND_PX:
                 err      = float(self.DIVIDER_SAFE_PX - gap)
-                div_corr = min((self.GAIN * 3.0) * err, self.MAX_CORR)   # positive
+                div_corr = min((self.GAIN * 3.0) * err, self.MAX_CORR)
                 speed_scale = min(speed_scale, max(0.15, 1.0 - err / 50.0))
                 triggered = True
 
-        # ── Right boundary (outer edge) — pushes LEFT (−) ─────────────────────
-        # FIX VC-01: edge_corr is NEGATIVE (steers left to avoid right edge)
         if right_fit is not None:
             edge_x = float(np.polyval(right_fit, y_eval))
             gap    = edge_x - car_x
             if gap < self.EDGE_SAFE_PX - self.DEADBAND_PX:
                 err       = float(self.EDGE_SAFE_PX - gap)
-                edge_corr = -min(self.GAIN * err, self.MAX_CORR * 0.5)  # NEGATIVE
+                edge_corr = -min(self.GAIN * err, self.MAX_CORR * 0.5)
                 speed_scale = min(speed_scale, max(0.30, 1.0 - err / 80.0))
                 triggered = True
 
-        # FIX VC-01: ADD corrections — both push toward lane centre
         if triggered:
             correction = div_corr + edge_corr
-            # Deadband floor: only apply if total correction is meaningful
             if abs(correction) < self.DEADBAND_PX * self.GAIN:
                 correction = 0.0
         else:
@@ -96,27 +109,28 @@ class DividerGuard:
 # ═══════════════════════════════════════════════════════════════════════════════
 class Controller:
     """
-    Safety-first lane-hold controller.  All 5 layers active.
-
-    Changes vs. original:
-      - VO feed-forward removed (VC-03)
-      - Integral decays in DEAD_RECKONING (VC-02)
-      - Pure-pursuit enforces min lookahead (VC-04)
-      - DividerGuard sign corrected (VC-01)
+    Safety-first lane-hold controller.  Deep-upgraded v4.
     """
 
-    STEER_EMA_SLOW = 0.40
-    STEER_EMA_FAST = 0.10
-    GUARD_EMA      = 0.30
+    # ── EMA alphas (CTRL-D: confidence-adaptive, these are per-mode values) ──
+    STEER_EMA_HIGH_CONF = 0.55   # both lanes visible — responsive
+    STEER_EMA_LOW_CONF  = 0.35   # one lane — smoother
+    STEER_EMA_DEAD_RECK = 0.15   # dead-reckoning — very smooth
+    GUARD_EMA           = 0.30
 
     MAX_STEER      = 45.0
-    MAX_STEER_RATE = 15.0
+    MAX_STEER_RATE = 22.0        # CTRL-C: raised from 15 → 22 °/frame
 
+    # Curvature speed scaling (unchanged)
     HIGH_CURV_THRESH = 0.0025
     MED_CURV_THRESH  = 0.0010
-    HIGH_CURV_SCALE  = 0.60
-    MED_CURV_SCALE   = 0.80
-    DUAL_SPEED_SCALE = 1.15
+    HIGH_CURV_SCALE  = 0.58
+    MED_CURV_SCALE   = 0.78
+    DUAL_SPEED_SCALE = 1.10
+
+    # Upcoming-curve pre-slow (CTRL-E)
+    UPCOMING_CURVE_SCALE = 0.82  # multiply speed when curve predicted
+    UPCOMING_CURVE_V_MIN = 0.20  # m/s — only apply if faster than this
 
     EMRG_BOUNDARY_PX = 110
     EMRG_STEER_DEG   = 38.0
@@ -128,10 +142,20 @@ class Controller:
     MIN_PWM_CITY    = 22.0
     MIN_PWM_HIGHWAY = 38.0
 
-    # FIX VC-04: lookahead values kept; _pure_pursuit enforces minimum vs wb_px
-    LOOKAHEAD_NORMAL   = 200
-    LOOKAHEAD_JUNCTION = 150
-    LOOKAHEAD_HIGHWAY  = 350
+    # CTRL-A: velocity-adaptive lookahead
+    T_HORIZON        = 0.80     # seconds of forward look
+    LOOKAHEAD_MIN_CITY    = 130  # px — min at standstill city
+    LOOKAHEAD_MAX_CITY    = 280  # px — max at top city speed
+    LOOKAHEAD_MIN_JUNCTION= 100  # px — junction: look close
+    LOOKAHEAD_MAX_JUNCTION= 180
+    LOOKAHEAD_MIN_HIGHWAY = 200
+    LOOKAHEAD_MAX_HIGHWAY = 450
+
+    # CTRL-B: curvature feed-forward gain
+    K_FF_CURV  = 3200.0  # deg per unit curvature; 0.0025 curv → ~8° ff
+
+    # CTRL-F: yaw-rate correction gain
+    K_YAW_RATE = 4.5     # deg per rad/s visual yaw rate
 
     WHEELBASE_M  = 0.23
     LANE_WIDTH_M = 0.35
@@ -142,20 +166,15 @@ class Controller:
         self.prev_steer   = 0.0
         self.guard        = DividerGuard()
         self._lateral_integral = 0.0
-        self._INTEGRAL_GAIN    = 0.0008
-        self._INTEGRAL_MAX     = 15.0
+        self._INTEGRAL_GAIN    = 0.0018   # CTRL-C: raised from 0.0008
+        self._INTEGRAL_MAX     = 18.0
 
+    # ── Pure pursuit ──────────────────────────────────────────────────────────
     def _pure_pursuit(self, target_x, lookahead_px, lane_width_px):
-        """
-        FIX VC-04: Enforce minimum lookahead = 2.5 × wb_px so the formula
-        never degenerates (ld must be >> wb_px for atan2 to be geometrically valid).
-        """
         lane_width_px = max(lane_width_px, 50)
         ppm   = lane_width_px / self.LANE_WIDTH_M
         wb_px = self.WHEELBASE_M * ppm
-
-        # FIX VC-04: minimum lookahead
-        la_px = max(float(lookahead_px), wb_px * 2.5)
+        la_px = max(float(lookahead_px), wb_px * 2.5)   # VC-04 minimum
 
         dx    = target_x - 320.0
         dy    = la_px
@@ -164,19 +183,42 @@ class Controller:
         steer = math.atan2(2.0 * wb_px * math.sin(alpha), ld)
         return math.degrees(steer)
 
+    # ── CTRL-A: velocity-adaptive lookahead ───────────────────────────────────
+    def _adaptive_lookahead(self, velocity_ms, lane_width_px, nav_state, zone_mode):
+        """Compute lookahead in pixels based on speed and driving context."""
+        lane_width_px = max(lane_width_px, 50)
+        ppm = lane_width_px / self.LANE_WIDTH_M
+
+        # Metres ahead at T_HORIZON seconds → pixels
+        la_m  = velocity_ms * self.T_HORIZON
+        la_px = la_m * ppm
+
+        if nav_state.startswith("JUNCTION") or nav_state == "JUNCTION_PROMPT":
+            la_px = max(self.LOOKAHEAD_MIN_JUNCTION,
+                        min(self.LOOKAHEAD_MAX_JUNCTION, la_px))
+        elif zone_mode == "HIGHWAY":
+            la_px = max(self.LOOKAHEAD_MIN_HIGHWAY,
+                        min(self.LOOKAHEAD_MAX_HIGHWAY, la_px))
+        else:
+            la_px = max(self.LOOKAHEAD_MIN_CITY,
+                        min(self.LOOKAHEAD_MAX_CITY, la_px))
+
+        return la_px
+
+    # ── Main compute ──────────────────────────────────────────────────────────
     def compute(self,
                 perc_res,
-                nav_state:     str   = "NORMAL",
-                traffic_state: str   = "SYS_GO",
-                base_speed:    float = 50.0,
-                traffic_mult:  float = 1.0,
-                zone_mode:     str   = "CITY",
-                parking_state: str   = "NONE",
-                steer_bias:    float = 0.0,
-                upcoming_curve: str  = "STRAIGHT",
-                visual_yaw_rate_rps: float = 0.0,   # kept in signature, not used
-                velocity_ms:   float = 0.0,
-                dt:            float = 0.033,
+                nav_state:           str   = "NORMAL",
+                traffic_state:       str   = "SYS_GO",
+                base_speed:          float = 50.0,
+                traffic_mult:        float = 1.0,
+                zone_mode:           str   = "CITY",
+                parking_state:       str   = "NONE",
+                steer_bias:          float = 0.0,
+                upcoming_curve:      str   = "STRAIGHT",
+                visual_yaw_rate_rps: float = 0.0,
+                velocity_ms:         float = 0.0,
+                dt:                  float = 0.033,
                 ) -> ControlOutput:
 
         sl        = perc_res.sl
@@ -188,50 +230,54 @@ class Controller:
         confidence= perc_res.confidence
         anchor    = perc_res.anchor
 
-        # ── Lookahead ─────────────────────────────────────────────────────────
-        if nav_state.startswith("JUNCTION") or nav_state == "JUNCTION_PROMPT":
-            la_px = self.LOOKAHEAD_JUNCTION
-        elif zone_mode == "HIGHWAY":
-            la_px = self.LOOKAHEAD_HIGHWAY
-        else:
-            la_px = self.LOOKAHEAD_NORMAL
+        # CTRL-A: velocity-adaptive lookahead
+        la_px = self._adaptive_lookahead(velocity_ms, lw, nav_state, zone_mode)
 
         # ── Layer 4: Emergency Boundary Override ──────────────────────────────
         emergency_override = abs(error_px) > self.EMRG_BOUNDARY_PX
 
         if emergency_override:
-            # FIX CTRL-01: sign was inverted — negative copysign steered INTO boundary.
-            # error_px > 0 means car is RIGHT of centre → steer LEFT (negative angle).
-            # copysign(EMRG_STEER_DEG, error_px) gives positive → negate → steer left. ✓
-            # But original code did -copysign → steered further right. Fixed to +copysign.
+            # CTRL-01: sign corrected — push toward lane centre
             emergency_steer = math.copysign(self.EMRG_STEER_DEG, -error_px)
-            # Also reset integral to prevent windup during multi-frame emergency
-            # FIX CTRL-03: integral reset on emergency entry
-            self._lateral_integral *= 0.5
+            self._lateral_integral *= 0.5   # CTRL-03: prevent windup
             self.smooth_steer = emergency_steer
             self.prev_steer   = emergency_steer
-            raw_steer = emergency_steer
+            raw_steer         = emergency_steer
         else:
             # ── Layer 1: Pure Pursuit ─────────────────────────────────────────
             raw_steer = self._pure_pursuit(target_x, la_px, lw)
 
-            # Map anticipation — proactive lean-in at ALL confidence levels.
-            # 5° constant lean-in keeps the car on the inside of upcoming curves
-            # while the lane tracker still dominates.  Adds up to 10° extra as
-            # confidence drops toward zero (blind driving).
+            # CTRL-B: curvature feed-forward — pre-steer into the curve
+            if curvature > 1e-5:
+                # Determine sign: if target is left of centre → left curve (+)
+                # The polynomial 'a' coefficient sign tells curvature direction:
+                # negative 'a' → curve right; positive 'a' → curve left
+                if sl is not None:
+                    curve_sign = 1.0 if sl[0] > 0 else -1.0
+                elif sr is not None:
+                    curve_sign = 1.0 if sr[0] > 0 else -1.0
+                else:
+                    curve_sign = math.copysign(1.0, -error_px)
+                ff_steer   = self.K_FF_CURV * curvature * curve_sign
+                ff_steer   = max(-20.0, min(20.0, ff_steer))   # cap at ±20°
+                raw_steer += ff_steer
+
+            # CTRL-F: yaw-rate heading correction (derivative-like damper)
+            if abs(visual_yaw_rate_rps) > 0.05:
+                yaw_corr   = self.K_YAW_RATE * visual_yaw_rate_rps
+                yaw_corr   = max(-10.0, min(10.0, yaw_corr))
+                raw_steer += yaw_corr
+
+            # Map anticipation: lean-in at ALL confidence levels
             _blind_extra = max(0.0, (0.30 - confidence) / 0.30)
             if upcoming_curve == "LEFT":
-                raw_steer -= (5.0 + 10.0 * _blind_extra)
+                raw_steer -= (6.0 + 10.0 * _blind_extra)
             elif upcoming_curve == "RIGHT":
-                raw_steer += (5.0 + 10.0 * _blind_extra)
-
-            # FIX VC-03: VO feed-forward removed — it double-counted yaw
-            # correction already applied by the localizer.
+                raw_steer += (6.0 + 10.0 * _blind_extra)
 
             # ── Integral ──────────────────────────────────────────────────────
-            # FIX VC-02: decay integral during DEAD_RECKONING to prevent lurch
             if "DEAD_RECKONING" in anchor:
-                self._lateral_integral *= 0.7    # exponential decay to zero
+                self._lateral_integral *= 0.7
             elif abs(error_px) < self.EMRG_BOUNDARY_PX:
                 self._lateral_integral += error_px * dt
                 self._lateral_integral  = max(-self._INTEGRAL_MAX,
@@ -242,14 +288,21 @@ class Controller:
 
             raw_steer += self._INTEGRAL_GAIN * self._lateral_integral
 
-            # ── Rate limiting ─────────────────────────────────────────────────
+            # ── Rate limiting (CTRL-C: raised to 22 °/frame) ──────────────────
             delta        = raw_steer - self.prev_steer
             delta        = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, delta))
             rate_limited = self.prev_steer + delta
 
-            # ── EMA blend ─────────────────────────────────────────────────────
-            new_steer = (self.STEER_EMA_SLOW * rate_limited
-                         + (1.0 - self.STEER_EMA_SLOW) * self.smooth_steer)
+            # CTRL-D: confidence-adaptive EMA
+            if "DEAD_RECKONING" in anchor:
+                ema_alpha = self.STEER_EMA_DEAD_RECK
+            elif sl is not None and sr is not None:
+                ema_alpha = self.STEER_EMA_HIGH_CONF
+            else:
+                ema_alpha = self.STEER_EMA_LOW_CONF
+
+            new_steer         = (ema_alpha * rate_limited
+                                 + (1.0 - ema_alpha) * self.smooth_steer)
             self.smooth_steer = new_steer
             raw_steer         = new_steer
 
@@ -262,15 +315,12 @@ class Controller:
                                  + (1.0 - self.GUARD_EMA) * self.smooth_guard)
             final_steer = self.smooth_guard
         else:
-            # FIX CTRL-02: always sync smooth_guard to the current unguarded steer
-            # so the EMA has no stale value to jump from on the next trigger.
+            # CTRL-02: sync EMA state when guard not triggered
             self.smooth_guard = raw_steer
-            final_steer = raw_steer
+            final_steer       = raw_steer
 
-        # Parking bias
         final_steer += steer_bias
-
-        final_steer   = max(-self.MAX_STEER, min(self.MAX_STEER, final_steer))
+        final_steer  = max(-self.MAX_STEER, min(self.MAX_STEER, final_steer))
         self.prev_steer = final_steer
 
         # ── Speed ─────────────────────────────────────────────────────────────
@@ -280,18 +330,22 @@ class Controller:
         else:
             speed = float(base_speed)
 
+            # BEV curvature scaling
             if curvature > self.HIGH_CURV_THRESH:
                 speed *= self.HIGH_CURV_SCALE
             elif curvature > self.MED_CURV_THRESH:
                 speed *= self.MED_CURV_SCALE
 
+            # CTRL-E: pre-slow on predicted curve (before BEV sees it)
+            if (upcoming_curve != "STRAIGHT"
+                    and velocity_ms > self.UPCOMING_CURVE_V_MIN):
+                speed *= self.UPCOMING_CURVE_SCALE
+
             if sl is not None and sr is not None and "DUAL" in anchor:
                 speed *= self.DUAL_SPEED_SCALE
 
-            # FIX VC-05: dead-reckoning scale applied FIRST, floor skipped
             if "DEAD_RECKONING" in anchor:
                 speed *= self.DEAD_RECK_SCALE
-                # Do NOT apply zone floor — it would defeat the crawl intent
             else:
                 conf_scale = self.CONF_SPEED_MIN + (1.0 - self.CONF_SPEED_MIN) * confidence
                 speed *= conf_scale
@@ -304,12 +358,11 @@ class Controller:
             speed *= traffic_mult
 
             if parking_state not in ("NONE", "DONE"):
-                park_scale = {"SEEK": 0.30, "ENTER": 0.20, "EXIT": 0.28}
-                speed *= park_scale.get(parking_state, 1.0)
+                speed *= {"SEEK": 0.30, "ENTER": 0.20, "EXIT": 0.28}.get(
+                    parking_state, 1.0)
 
             speed = max(0.0, min(100.0, speed))
 
-            # Zone speed floors — only when NOT dead-reckoning
             if speed > 0.0 and traffic_state == "SYS_GO" and "DEAD_RECKONING" not in anchor:
                 floor = (self.MIN_PWM_HIGHWAY if zone_mode == "HIGHWAY"
                          else self.MIN_PWM_CITY)
