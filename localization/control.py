@@ -87,7 +87,7 @@ class DividerGuard:
     """
 
     DIVIDER_SAFE_PX = 130   # raised from 110: stronger push away from centre divider
-    EDGE_SAFE_PX    =  70
+    EDGE_SAFE_PX    = 100   # raised from 70: more buffer from right outer edge marking
     GAIN            = 0.35
     MAX_CORR        = 25.0
     DEADBAND_PX     =  2

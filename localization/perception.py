@@ -131,7 +131,7 @@ class HybridLaneTracker:
     # DIVIDER_FOLLOW_OFFSET_PX: when sr is lost, track this many px right of sl.
     WIDE_ROAD_PX             = 420   # full-road threshold (both lanes visible in BEV)
     SINGLE_LANE_PX           = 200   # minimum plausible single-lane width
-    RIGHT_LANE_BIAS_PX       =  30   # comfort rightward bias within own lane (px)
+    RIGHT_LANE_BIAS_PX       = -15   # target shifted LEFT of lane centre — buffer from right edge
     DIVIDER_FOLLOW_OFFSET_PX =  80   # px right of divider when right edge is lost
 
     def __init__(self, img_shape=(480, 640)):
