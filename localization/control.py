@@ -20,6 +20,8 @@ class ControlOutput:
     target_x:        float
     anchor:          str
     lookahead_px:    float
+    steer_ff_deg:    float = 0.0   # Feed-forward contribution (map curvature)
+    steer_react_deg: float = 0.0   # Reactive contribution (Stanley visual)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -50,8 +52,8 @@ class StanleyController:
 
     def compute(self, target_x_px: float, heading_rad: float,
                 velocity_ms: float, lane_width_px: float,
-                map_curvature: float = 0.0) -> float:
-        """Returns steering angle in degrees."""
+                map_curvature: float = 0.0):
+        """Returns (total_deg, reactive_deg, ff_deg) tuple for telemetry."""
         ppm  = max(lane_width_px, 50) / 0.35    # pixels per metre
         ce_m = (320.0 - target_x_px) / ppm      # cross-track error (metres)
 
@@ -61,7 +63,10 @@ class StanleyController:
         # Predictive map feed-forward term  (atan(L·κ) = Ackermann relationship)
         feed_forward_rad = math.atan(self.L * map_curvature)
 
-        return math.degrees(reactive_rad + feed_forward_rad)
+        total_deg    = math.degrees(reactive_rad + feed_forward_rad)
+        reactive_deg = math.degrees(reactive_rad)
+        ff_deg       = math.degrees(feed_forward_rad)
+        return total_deg, reactive_deg, ff_deg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,8 +119,8 @@ class Controller:
     MED_CURV_THRESH  = 0.0010
 
     # Smooth curve braking parameters
-    BRAKING_DISTANCE_M = 1.5   # metres before apex to start braking
-    MIN_CURVE_SPEED_F  = 0.45  # fraction of base_speed at apex
+    BRAKING_DISTANCE_M = 1.8   # metres before apex to start braking
+    MIN_CURVE_SPEED_F  = 0.45  # fraction of base_speed at apex (45%)
 
     def __init__(self):
         self.prev_steer = 0.0
@@ -134,46 +139,39 @@ class Controller:
 
         curvature = perc_res.curvature
 
-        # ── 1. Stanley Steering (with map feed-forward) ───────────────────────
-        raw_steer = self.stanley.compute(
+        # ── 1. Stanley Steering (with map feed-forward) ─────────────────────────
+        raw_steer, react_steer_deg, ff_steer_deg = self.stanley.compute(
             perc_res.target_x, perc_res.heading_rad,
             velocity_ms, perc_res.lane_width_px,
             map_curvature=map_curvature)
 
-        # ── 2. Hardware Rate Limiting ─────────────────────────────────────────
+        # ── 2. Hardware Rate Limiting ──────────────────────────────────────────
         rate_delta  = max(-self.MAX_STEER_RATE,
                           min(self.MAX_STEER_RATE, raw_steer - self.prev_steer))
         steer_angle = self.prev_steer + rate_delta
         self.prev_steer = steer_angle
 
-        # ── 3. Divider Guard ──────────────────────────────────────────────────
+        # ── 3. Divider Guard ────────────────────────────────────────────────
         steer_guarded, guard_spd_mult, _ = self.guard.apply(
             steer_angle, perc_res.sl, perc_res.sr, y_eval=perc_res.y_eval)
         steer_angle = max(-self.MAX_STEER, min(self.MAX_STEER, steer_guarded))
 
-        # ── 4. Speed Profiling ────────────────────────────────────────────────
-        speed = float(base_speed)
+        # ── 4. Speed Profiling ──────────────────────────────────────────────
+        speed           = float(base_speed)
         min_curve_speed = base_speed * self.MIN_CURVE_SPEED_F
 
-        # 4a. BEV curvature
+        # 4a. Roundabout override
         if nav_state == "ROUNDABOUT":
-            speed *= 0.50
-        elif curvature > self.HIGH_CURV_THRESH:
-            speed *= 0.45
-        elif curvature > self.MED_CURV_THRESH:
-            speed *= 0.65
-        elif abs(steer_angle) < 5:
-            speed *= 1.15
-        elif abs(steer_angle) > 15:
-            speed *= 0.70
+            speed = min(speed, base_speed * 0.50)
 
-        # 4b. Smooth distance-to-curve braking profile
-        # Linearly ramp speed from base → min_curve_speed as the car
-        # closes in on the curve apex, hitting peak braking exactly at entry.
+        # 4b. Smooth distance-to-curve braking (replaces hard curvature step-multipliers)
+        # Ramp from base_speed → min_curve_speed linearly as curve approaches.
         if upcoming_curve != "STRAIGHT" and curve_dist_m < self.BRAKING_DISTANCE_M:
-            decel_factor  = max(0.0, curve_dist_m / self.BRAKING_DISTANCE_M)
-            braked_speed  = min_curve_speed + (base_speed - min_curve_speed) * decel_factor
+            decel_factor = max(0.0, curve_dist_m / self.BRAKING_DISTANCE_M)
+            braked_speed = min_curve_speed + (base_speed - min_curve_speed) * decel_factor
             speed = min(speed, braked_speed)
+        elif abs(steer_angle) < 5:
+            speed = min(speed * 1.15, base_speed * 1.20)   # straight-line boost, capped
 
         # 4c. Dead-reckoning speed penalty
         if "DEAD_RECKONING" in perc_res.anchor:
@@ -191,4 +189,6 @@ class Controller:
             target_x        = perc_res.target_x,
             anchor          = perc_res.anchor,
             lookahead_px    = 0.0,
+            steer_ff_deg    = ff_steer_deg,
+            steer_react_deg = react_steer_deg,
         )

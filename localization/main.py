@@ -886,17 +886,33 @@ class Orchestrator:
 
     def _pilot_loop(self):
         log.info("Pilot loop started")
+        startup_time = time.time()   # reference for calibration phases
         t_prev = time.time()
         _ll = 0; _LLC = 15; _LLS = 90; _zmf = 0
         try:
             while self.running:
                 ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
+                elapsed_run = ts - startup_time
 
                 # Always read camera & velocity so dashboard stays live
                 raw_frame   = self.hw.read_camera()
                 if raw_frame is None:
                     raw_frame = np.zeros((480, 640, 3), np.uint8)
                 velocity_ms = self.hw.get_velocity_ms()
+
+                # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
+                upcoming_curve = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
+                curve_dist_m   = getattr(self.localizer, 'curve_dist_m',   99.0)
+                map_curvature  = 0.0
+                if self._planned_path and self.localizer.planner:
+                    try:
+                        map_curvature = self.localizer.planner.get_path_curvature(
+                            self.localizer.x, self.localizer.y,
+                            self._planned_path,
+                            cursor=self._path_cursor,
+                            window_m=1.0)
+                    except Exception:
+                        pass
 
                 if not self._estop:
                     self._fps = 0.7*self._fps + 0.3*(1.0/dt)
@@ -1008,9 +1024,25 @@ class Orchestrator:
                         base_speed=float(self.base_speed),
                         traffic_mult=t_res.speed_multiplier,
                         velocity_ms=velocity_ms, dt=dt,
-                        map_curvature=getattr(self.localizer,'_last_path_curvature',0.0),
-                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
-                        curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0))
+                        map_curvature=map_curvature,
+                        upcoming_curve=upcoming_curve,
+                        curve_dist_m=curve_dist_m)
+
+                    # --- STARTUP CALIBRATION OVERRIDE ---
+                    # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
+                    # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
+                    if elapsed_run < 3.0:
+                        ctrl.speed_pwm       = 0.0
+                        ctrl.steer_angle_deg = 0.0
+                        cv2.putText(perc.lane_dbg,
+                            f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
+                            (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                    elif elapsed_run < 6.0:
+                        ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
+                        cv2.putText(perc.lane_dbg,
+                            f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
+                            (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
+
                     self._last_ctrl = ctrl
 
                     _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
