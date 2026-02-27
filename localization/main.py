@@ -535,10 +535,11 @@ class Orchestrator:
         _LANE_LOST_CRAWL  = 15   # frames: start crawling (speed cap 20 PWM)
         _LANE_LOST_STOP   = 90   # frames (~3 s): full stop + E-STOP if no recovery
 
-        while self.running:
-            t_start = time.time()
-            dt      = max(t_start - t_prev, 0.001)
-            t_prev  = t_start
+        try:
+            while self.running:
+                t_start = time.time()
+                dt      = max(t_start - t_prev, 0.001)
+                t_prev  = t_start
 
             # ── FPS ──────────────────────────────────────────────────────────
             self._fps = 0.7 * self._fps + 0.3 * (1.0 / dt)
@@ -641,6 +642,7 @@ class Orchestrator:
                 parking_state = t_res.parking_state,
                 steer_bias    = t_res.steer_bias,
                 upcoming_curve= map_ahead,
+                visual_yaw_rate_rps = self.localizer.visual_yaw_rate,
                 velocity_ms   = velocity_ms,
                 dt            = dt,
             )
@@ -681,11 +683,14 @@ class Orchestrator:
 
             # ── Frame rate throttle ──────────────────────────────────────────
             elapsed = time.time() - t_start
-            sleep_t = FRAME_PERIOD - elapsed
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+            sleep_time = max(0.001, FRAME_PERIOD - elapsed)
+            time.sleep(sleep_time)
 
-        log.info("Pilot loop stopped")
+        except Exception as e:
+            log.error(f"FATAL Pilot loop crash: {e}", exc_info=True)
+            self._estop = True
+
+        log.info("Pilot loop exited")
         self.hw.set_speed(0)
         self.hw.set_steering(0)
 
