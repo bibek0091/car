@@ -13,7 +13,15 @@ After that the pose drifts via dead-reckoning; no map snap is needed.
 import math
 import threading
 import logging
+import time
 from collections import deque
+
+try:
+    from map_planner import PathPlanner
+    _PLANNER_AVAILABLE = True
+except ImportError:
+    _PLANNER_AVAILABLE = False
+
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +52,18 @@ class LocalizationEngine:
 
         self._cam_yaw_smoothed = 0.0
         self._initialized      = False   # True once user clicks start position
+
+        self.upcoming_curve = "STRAIGHT"
+        self.current_zone   = "CITY"
+
+        # Load GraphML map for Snapping and Look-ahead
+        self.planner = None
+        self._map_snap_enabled = _PLANNER_AVAILABLE
+        if self._map_snap_enabled:
+            self.planner = PathPlanner()
+            if self.planner.graph is None or len(self.planner.graph.nodes) == 0:
+                log.warning("GraphML map empty! Disabling map snapping.")
+                self._map_snap_enabled = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -118,3 +138,96 @@ class LocalizationEngine:
                             min(self._MAX_CAM_YAW_CORRECTION, nudge))
                 self.yaw += nudge * 0.15   # very gentle — IMU is primary
                 self.yaw = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
+            # ── Layer 4: GraphML Map Snapping & Lookahead ─────────────────────
+            if self._map_snap_enabled and self.planner:
+                self._apply_map_snap(effective_v, dt, camera_confidence)
+                self._update_upcoming_curve()
+
+        return self.get_pose()
+
+    def _apply_map_snap(self, velocity, dt, cam_conf):
+        """Soft snap to the nearest edge if driving normally (to cancel lateral drift)."""
+        if velocity < 0.05 or cam_conf < 0.2:
+            return
+
+        nearest_node = self.planner.get_nearest_node(self.x, self.y)
+        if not nearest_node:
+            return
+
+        min_dist = float('inf')
+        best_mid = None
+        for u, v in self.planner.graph.edges(nearest_node):
+            if v in self.planner.node_positions:
+                p1 = self.planner.node_positions[u]
+                p2 = self.planner.node_positions[v]
+                mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+                dist = math.hypot(mx - self.x, my - self.y)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_mid = (mx, my)
+
+        if best_mid and min_dist < 0.6:  # snap within 60 cm
+            pull_alpha = 0.20 * dt  # 20% / second
+            self.x = self.x * (1 - pull_alpha) + best_mid[0] * pull_alpha
+            self.y = self.y * (1 - pull_alpha) + best_mid[1] * pull_alpha
+
+        self.current_zone = self.planner.get_zone(self.x, self.y)
+
+    def _update_upcoming_curve(self, lookahead_m=0.8):
+        """Walks the directed graph forward by ~0.8m to anticipate heading change."""
+        nearest_node = self.planner.get_nearest_node(self.x, self.y)
+        if not nearest_node:
+            self.upcoming_curve = "STRAIGHT"
+            return
+        
+        curr_node = nearest_node
+        accum_dist = 0.0
+        
+        for _ in range(5):
+            out_edges = list(self.planner.graph.out_edges(curr_node))
+            if not out_edges:
+                break
+            best_edge = None
+            best_cos = -2.0
+            p1 = self.planner.node_positions[curr_node]
+            for u, v in out_edges:
+                p2 = self.planner.node_positions[v]
+                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                mag = math.hypot(dx, dy)
+                if mag == 0: continue
+                align = (dx/mag)*math.cos(self.yaw) + (dy/mag)*math.sin(self.yaw)
+                if align > best_cos:
+                    best_cos = align
+                    best_edge = v
+                    
+            if not best_edge:
+                break
+                
+            p2 = self.planner.node_positions[best_edge]
+            dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            accum_dist += dist
+            curr_node = best_edge
+            
+            if accum_dist >= lookahead_m:
+                break
+                
+        p_start = self.planner.node_positions[nearest_node]
+        p_end   = self.planner.node_positions[curr_node]
+        dx = p_end[0] - p_start[0]
+        dy = p_end[1] - p_start[1]
+        
+        if math.hypot(dx, dy) < 0.1:
+            self.upcoming_curve = "STRAIGHT"
+            return
+            
+        target_yaw = math.atan2(dy, dx)
+        diff = (target_yaw - self.yaw + math.pi) % (2*math.pi) - math.pi
+        deg_diff = math.degrees(diff)
+        
+        if deg_diff > 18.0:
+            self.upcoming_curve = "LEFT"
+        elif deg_diff < -18.0:
+            self.upcoming_curve = "RIGHT"
+        else:
+            self.upcoming_curve = "STRAIGHT"

@@ -201,6 +201,7 @@ class Controller:
                 zone_mode:    str   = "CITY",
                 parking_state: str  = "NONE",
                 steer_bias:   float = 0.0,
+                upcoming_curve: str = "STRAIGHT",
                 imu_yaw_rate_rps: float = 0.0,
                 velocity_ms:  float = 0.0,
                 dt:           float = 0.033,
@@ -239,8 +240,15 @@ class Controller:
             self.prev_steer   = emergency_steer
             raw_steer = emergency_steer
         else:
-            # ── Layer 1: Pure Pursuit ─────────────────────────────────────
+            # ── Layer 1: Pure Pursuit + Map Anticipation ──────────────────
             raw_steer = self._pure_pursuit(target_x, la_px, lw)
+
+            # Proactive steering: if camera is blind, steer toward the map curve
+            if confidence < 0.30:
+                if upcoming_curve == "LEFT":
+                    raw_steer -= 15.0  # gentle left pull
+                elif upcoming_curve == "RIGHT":
+                    raw_steer += 15.0  # gentle right pull
 
             # ── Layer 2: IMU feed-forward ─────────────────────────────────
             imu_ff    = math.degrees(imu_yaw_rate_rps) * dt * 0.35

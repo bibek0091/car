@@ -359,13 +359,14 @@ class Orchestrator:
         self._sv_steer  = tk.StringVar(value="Steer: ---")
         self._sv_anchor = tk.StringVar(value="Mode: INIT")
         self._sv_nav    = tk.StringVar(value="Nav: ---")
+        self._sv_map    = tk.StringVar(value="Map: ---")
         self._sv_pose   = tk.StringVar(value="Pose: not set")
         self._sv_imu    = tk.StringVar(value="IMU: ---")
         self._sv_fps    = tk.StringVar(value="FPS: ---")
 
         style_lbl = dict(bg="#111", fg="#eee", font=("Courier", 9))
         for sv in [self._sv_speed, self._sv_steer, self._sv_anchor,
-                   self._sv_nav, self._sv_pose, self._sv_imu, self._sv_fps]:
+                   self._sv_nav, self._sv_map, self._sv_pose, self._sv_imu, self._sv_fps]:
             tk.Label(status, textvariable=sv, **style_lbl).pack(side=tk.LEFT, padx=10)
 
         # E-STOP / RESUME buttons
@@ -488,6 +489,11 @@ class Orchestrator:
             self._sv_steer.set( f"Steer: {ctrl.steer_angle_deg:+5.1f}°")
             self._sv_anchor.set(f"Anchor: {ctrl.anchor}")
             self._sv_nav.set(   f"Nav: {self._nav_state}")
+            
+            ahead_str = getattr(self.localizer, "upcoming_curve", "UNKNOWN")
+            dir_icon = "⤴" if ahead_str == "LEFT" else "⤵" if ahead_str == "RIGHT" else "⬆"
+            self._sv_map.set(f"Map-Ahead: {ahead_str} {dir_icon}")
+            
             self._sv_fps.set(   f"FPS: {self._fps:.1f}")
 
             imu_y, imu_r = self.imu.get_yaw_data()
@@ -589,6 +595,8 @@ class Orchestrator:
             )
 
             # ── 9. Controller ────────────────────────────────────────────────
+            map_ahead = getattr(self.localizer, "upcoming_curve", "STRAIGHT")
+            
             ctrl = self.controller.compute(
                 perc_res      = perc,
                 nav_state     = self._nav_state,
@@ -598,6 +606,7 @@ class Orchestrator:
                 zone_mode     = t_res.zone_mode,
                 parking_state = t_res.parking_state,
                 steer_bias    = t_res.steer_bias,
+                upcoming_curve= map_ahead,
                 imu_yaw_rate_rps = imu_gz_rps,
                 velocity_ms   = velocity_ms,
                 dt            = dt,

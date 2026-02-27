@@ -144,6 +144,8 @@ class MPU9250_Thread:
 
     def _loop(self):
         prev_time = time.time()
+        fail_count = 0
+        
         while self.running:
             now = time.time()
             dt = max(now - prev_time, 0.001)
@@ -162,9 +164,21 @@ class MPU9250_Thread:
                 with self.state_lock:
                     self.yaw_deg = yaw
                     self.yaw_rate_deg_s = gz
+                fail_count = 0  # reset on success
                     
             except Exception as e:
-                # Occasional I2C failures can happen, just ignore step
+                fail_count += 1
+                if fail_count > 5:
+                    log.error(f"MPU IMU -> Bus dropped 5 times. Attempting auto-reconnect...")
+                    self.is_connected = False
+                    try:
+                        self.bus.close()
+                    except Exception:
+                        pass
+                    # Hard reconnect block
+                    time.sleep(0.5)
+                    self._init_sensor()
+                    fail_count = 0
                 pass
                 
             # Sleep to maintain roughly ~100Hz loop
