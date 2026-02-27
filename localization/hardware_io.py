@@ -1,18 +1,8 @@
 """
-hardware_io.py — Hardware Abstraction Layer  (FIXED v3)
-=======================================================
-Fixes applied (v2 → v3):
-  HW-01  get_sim_heading_deg now uses actual elapsed time (time.time() delta)
-         instead of hardcoded 0.033 s. dt clamped to [1 ms, 100 ms].
-  HW-02  set_speed logs a WARNING when the 500 mm/s physical cap clips the
-         command, making calibration regressions immediately visible.
-  HW-03  get_velocity_ms tracks consecutive encoder read failures. After
-         _ENCODER_FAIL_LIMIT (30) consecutive failures it logs an ERROR
-         so a disconnected encoder is not silently masked as zero velocity.
-
-Fixes carried forward from v2:
-  HW-01(v2)  SPEED_CALIB corrected to 0.00568 m/s/PWM
-  HW-02(v2)  Duplicate class/instance attribute removed
+hardware_io.py — Hardware Abstraction Layer (Thread-Safe Daemon)
+================================================================
+Camera I/O is isolated in a daemon thread so picamera2 latency
+never stalls the main control loop.
 """
 
 import sys
@@ -20,6 +10,8 @@ import math
 import time
 import numpy as np
 import logging
+import threading
+import queue
 
 log = logging.getLogger(__name__)
 
@@ -32,10 +24,10 @@ except ImportError:
     log.warning("STM32_SerialHandler not found. Using simulation mode for STM32.")
 
     class STM32_SerialHandler:
-        def connect(self):     return False
+        def connect(self):      return False
         def set_speed(self, s): pass
         def set_steering(self, s): pass
-        def disconnect(self):  pass
+        def disconnect(self):   pass
 
 # ── Camera ────────────────────────────────────────────────────────────────────
 try:
@@ -68,33 +60,34 @@ class HardwareIO:
         self.video_cap = None
         self.serial    = STM32_SerialHandler()
 
-        # FIX HW-01: corrected calibration constant
-        #   MAX_SPEED_MS = 0.50 m/s at PWM=100
-        #   SPEED_CALIB  = 0.50 / (100 - 12) = 0.00568  (was 0.014)
-        # FIX HW-02: constants defined ONLY here (no class-level duplicates)
         self.DEADBAND_PWM  = 12.0
         self.SPEED_CALIB   = 0.00568   # m/s per PWM unit above deadband
-        self.MAX_SPEED_MS  = 0.50      # physical top speed
+        self.MAX_SPEED_MS  = 0.50
 
         self._vel_filtered    = 0.0
         self._sim_yaw         = 0.0
         self._last_sim_time   = time.time()
         self._last_cmd_speed  = 0.0
         self._last_cmd_steer  = 0.0
-        # FIX HW-03: track consecutive encoder read failures for escalation
         self._encoder_fail_count = 0
-        self._ENCODER_FAIL_LIMIT = 30   # ~1 s at 30 Hz before ERROR log
+        self._ENCODER_FAIL_LIMIT = 30
 
-        # Initialize STM32
+        # ── Thread-safe frame queue (maxsize=1 → always freshest frame) ───────
+        self._frame_queue = queue.Queue(maxsize=1)
+        self._running     = True
+
+        # ── STM32 init ────────────────────────────────────────────────────────
         if not self.sim_mode and _SERIAL_AVAILABLE:
             connected = self.serial.connect()
             if not connected:
                 log.error("Failed to connect to STM32. Motor commands will be ignored.")
 
-        # Initialize Camera or Video
+        # ── Camera / video init + daemon thread ───────────────────────────────
         if self.sim_video and _CV2_AVAILABLE:
             self.video_cap = cv2.VideoCapture(self.sim_video)
             log.info(f"Loaded simulation video: {self.sim_video}")
+            threading.Thread(target=self._video_worker, daemon=True,
+                             name="video_worker").start()
         elif not self.sim_mode and _CAM_AVAILABLE:
             try:
                 self.camera = Picamera2()
@@ -111,44 +104,74 @@ class HardwareIO:
                 self.camera.configure(cfg)
                 self.camera.start()
                 log.info("PiCamera2 initialized with manual ColourGains.")
+                threading.Thread(target=self._camera_worker, daemon=True,
+                                 name="camera_worker").start()
             except Exception as e:
                 log.error(f"PiCamera2 init error: {e}")
                 self.camera = None
 
-    # ── Input ─────────────────────────────────────────────────────────────────
+    # ── Frame queue helper ────────────────────────────────────────────────────
 
-    def read_camera(self):
-        """Returns a 640×480 BGR image."""
-        if self.video_cap and _CV2_AVAILABLE:
+    def _push_frame(self, frame):
+        """Drop the oldest frame and push the newest — always keep latest."""
+        if self._frame_queue.full():
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        self._frame_queue.put(frame)
+
+    # ── Daemon workers ────────────────────────────────────────────────────────
+
+    def _camera_worker(self):
+        """Runs in background thread: continually captures and enqueues frames."""
+        while self._running:
+            try:
+                frame = self.camera.capture_array()
+                if frame is not None and _CV2_AVAILABLE:
+                    # XRGB8888 → BGR
+                    if frame.ndim == 3 and frame.shape[2] == 4:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    else:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    self._push_frame(cv2.resize(frame, (640, 480)))
+            except Exception as e:
+                log.warning(f"Camera worker error: {e}")
+            time.sleep(0.01)   # ~100 Hz capture ceiling — pi camera handles pacing
+
+    def _video_worker(self):
+        """Runs in background thread: reads sim video at 30 Hz and enqueues."""
+        while self._running:
+            if not _CV2_AVAILABLE or self.video_cap is None:
+                time.sleep(0.033)
+                continue
             ret, frame = self.video_cap.read()
             if not ret:
                 self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = self.video_cap.read()
             if ret:
-                return cv2.resize(frame, (640, 480))
+                self._push_frame(cv2.resize(frame, (640, 480)))
+            time.sleep(0.033)   # 30 Hz
 
-        if self.camera and _CV2_AVAILABLE:
-            frame = self.camera.capture_array()
-            if frame is not None:
-                if frame.ndim == 3 and frame.shape[2] == 4:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                else:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                return cv2.resize(frame, (640, 480))
+    # ── Public camera read ────────────────────────────────────────────────────
 
-        return np.zeros((480, 640, 3), dtype=np.uint8)
+    def read_camera(self):
+        """Returns the latest 640×480 BGR frame. Never blocks — returns black if queue empty."""
+        try:
+            return self._frame_queue.get_nowait()
+        except queue.Empty:
+            return np.zeros((480, 640, 3), dtype=np.uint8)
 
     def capture_frame(self):
         return self.read_camera()
 
+    # ── Sim heading ───────────────────────────────────────────────────────────
+
     def get_sim_heading_deg(self):
         if self.sim_mode:
             now = time.time()
-            # FIX HW-01: use actual elapsed time instead of hardcoded 0.033 s
-            dt_actual = now - self._last_sim_time
+            dt_actual = max(0.001, min(now - self._last_sim_time, 0.10))
             self._last_sim_time = now
-            dt_actual = max(0.001, min(dt_actual, 0.10))  # clamp 1–100 ms
-
             v = max(0.0, (self._last_cmd_speed - self.DEADBAND_PWM) * self.SPEED_CALIB)
             yaw_rate = 0.0
             if v > 0.05:
@@ -158,14 +181,13 @@ class HardwareIO:
             return math.degrees(self._sim_yaw)
         return 0.0
 
-    # ── Output ────────────────────────────────────────────────────────────────
+    # ── Motor commands ────────────────────────────────────────────────────────
 
     def set_steering(self, steer_angle_deg):
-        steer_angle_deg = max(-45.0, min(45.0, steer_angle_deg))
-        self._last_cmd_steer = steer_angle_deg
+        self._last_cmd_steer = max(-45.0, min(45.0, steer_angle_deg))
         if self.sim_mode:
             return
-        self.serial.set_steering(steer_angle_deg)
+        self.serial.set_steering(self._last_cmd_steer)
 
     def set_speed(self, speed_pwm):
         speed_pwm = max(0.0, min(100.0, speed_pwm))
@@ -176,7 +198,6 @@ class HardwareIO:
             speed_mm_s = 0.0
         else:
             speed_ms   = max(0.0, (speed_pwm - self.DEADBAND_PWM) * self.SPEED_CALIB)
-            # FIX HW-02: warn if physical cap clips the command so tuning issues are visible
             raw_mm_s   = speed_ms * 1000.0
             speed_mm_s = min(500.0, raw_mm_s)
             if raw_mm_s > 500.0:
@@ -185,12 +206,12 @@ class HardwareIO:
                     f"(pwm={speed_pwm:.1f}). Check SPEED_CALIB or DEADBAND_PWM.")
         self.serial.set_speed(speed_mm_s)
 
+    # ── Encoder velocity ──────────────────────────────────────────────────────
+
     def get_velocity_ms(self):
         """IIR-filtered encoder speed in m/s."""
         if self.sim_mode:
-            cmd = self._last_cmd_speed
-            raw = max(0.0, (cmd - self.DEADBAND_PWM) * self.SPEED_CALIB)
-            # FIX HW-03: reset fail counter in sim (no real encoder)
+            raw = max(0.0, (self._last_cmd_speed - self.DEADBAND_PWM) * self.SPEED_CALIB)
             self._encoder_fail_count = 0
         else:
             try:
@@ -202,7 +223,6 @@ class HardwareIO:
                                  contextlib.nullcontext()):
                         raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
                 raw = max(0.0, raw_mms / 1000.0)
-                # FIX HW-03: successful read clears failure counter
                 self._encoder_fail_count = 0
             except Exception as e:
                 self._encoder_fail_count += 1
@@ -212,7 +232,7 @@ class HardwareIO:
                     log.error(
                         f"Encoder read failed {self._encoder_fail_count} consecutive "
                         f"times — velocity locked at 0. Check STM32 connection.")
-                    self._encoder_fail_count = 0   # reset to avoid log spam
+                    self._encoder_fail_count = 0
                 raw = 0.0
 
         self._vel_filtered = 0.80 * self._vel_filtered + 0.20 * raw
@@ -229,7 +249,10 @@ class HardwareIO:
             log.warning(f"get_encoder_steer_deg error: {e}")
             return 0.0
 
+    # ── Shutdown ──────────────────────────────────────────────────────────────
+
     def shutdown(self):
+        self._running = False
         self.set_speed(0)
         time.sleep(0.1)
         self.serial.disconnect()

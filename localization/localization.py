@@ -297,16 +297,18 @@ class LocalizationEngine:
                camera_confidence:  float = 0.0,
                heading_conf:       float = 0.0,
                imu_heading_rad:    float = None,
-               path=None):
+               path=None,
+               optical_yaw_rate:   float = 0.0,
+               optical_vel:        float = 0.0):
         """
         Update pose for one time step.
 
-        LOC-A: heading_conf (from perception LANE-07) gates yaw-rate integration.
+        LOC-A: heading_conf gates yaw-rate integration.
         LOC-B: dual-rate EMA alpha based on turn intensity.
         LOC-C: absolute heading soft-fusion (long-run drift corrector).
-        EKF:   When imu_heading_rad is provided (e.g. from a BNO055), a static
-               Kalman correction (gain=0.15) is applied after dead-reckoning.
-               This eliminates yaw drift completely on hardware that has an IMU.
+        EKF:   imu_heading_rad static Kalman correction (gain=0.15).
+        OPT:   optical_yaw_rate from VisualOdometry used as fallback when
+               lane lines are absent; optical_vel used when encoder dies.
 
         FIX VL-FIX-A: path_cursor parameter removed — cursor managed internally.
         """
@@ -314,13 +316,17 @@ class LocalizationEngine:
             return
 
         with self._lock:
+            # OPT: use optical_vel as velocity fallback when encoder is dead
+            if velocity_ms < 0.01 and optical_vel > 0.05:
+                velocity_ms = optical_vel
+
             self._last_speed_ms = velocity_ms
 
             if path:
                 self._update_cursor_internal(path)
             cursor = self._path_cursor
 
-            # ── Layer 1: Camera Yaw-Rate Integration ─────────────────────────
+            # ── Layer 1: Camera Yaw-Rate Integration (Hybrid Optical Fallback) ─
             # LOC-A: gate on heading_conf, not just pixel confidence
             use_heading = (camera_confidence > 0.3
                            and heading_conf >= self._MIN_HEADING_CONF
@@ -339,9 +345,11 @@ class LocalizationEngine:
                              else self._YAW_RATE_EMA_SLOW)
                     self.visual_yaw_rate = (alpha * raw_yaw_rate
                                             + (1.0 - alpha) * self.visual_yaw_rate)
-            elif camera_confidence <= 0.3 or heading_conf < self._MIN_HEADING_CONF:
-                self._prev_cam_heading = None
-                self.visual_yaw_rate  *= 0.85
+            else:
+                # OPT: fall back to ground-plane optical flow yaw rate
+                self.visual_yaw_rate = optical_yaw_rate
+                if camera_confidence <= 0.3 or heading_conf < self._MIN_HEADING_CONF:
+                    self._prev_cam_heading = None
 
             if camera_confidence > 0.3:
                 self._prev_cam_heading = camera_heading_rad
@@ -404,10 +412,10 @@ class LocalizationEngine:
                 self.yaw += kalman_gain * innovation
                 self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
-            # ── Layer 4: Map Snap ─────────────────────────────────────────────
+            # ── Layer 4: Map Snap (Heading-Gated) ────────────────────────────
             if self._map_snap_enabled and self.planner:
-                self._apply_map_snap(effective_v, dt, camera_confidence,
-                                     path, cursor)
+                self._apply_map_snap_gated(effective_v, dt, camera_confidence,
+                                           path, cursor)
                 self.current_zone = self.planner.get_zone(self.x, self.y)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -529,4 +537,77 @@ class LocalizationEngine:
             if self._snap_miss_frames >= self._SNAP_LOST_LIMIT:
                 log.warning(
                     f"Map snap lost for {self._snap_miss_frames} frames "
+                    f"(dist={best_dist:.2f}m). Recovery radius active.")
+
+    def _apply_map_snap_gated(self, velocity, dt, cam_conf, path, cursor):
+        """
+        Heading-gated map snap (OPT upgrade).
+
+        Identical foot-point search to _apply_map_snap but adds a 25° heading
+        gate before committing the pull.  This prevents snapping to cross-traffic
+        path segments at intersections, which could cause sudden position jumps
+        perpendicular to the car's actual direction of travel.
+        """
+        if velocity < 0.05 or cam_conf < 0.3:
+            return
+        if not path or cursor >= len(path) - 1:
+            return
+
+        curvature = self.planner.get_path_curvature(
+            self.x, self.y, path, cursor=cursor, window_m=0.8)
+        if curvature > 0.005:
+            return
+
+        snap_radius = (self._MAP_SNAP_RECOVERY_M
+                       if self._snap_miss_frames >= self._SNAP_LOST_LIMIT
+                       else self._MAP_SNAP_RADIUS_M)
+
+        best_dist   = float('inf')
+        best_foot   = None
+        best_seg_yaw = self.yaw  # default: no heading info
+
+        search_start = max(0,             cursor - 2)
+        search_end   = min(len(path) - 1, cursor + 6)
+
+        for i in range(search_start, search_end):
+            n1 = path[i]
+            n2 = path[i + 1]
+            p1 = self.planner.node_positions.get(n1)
+            p2 = self.planner.node_positions.get(n2)
+            if p1 is None or p2 is None:
+                continue
+
+            ex, ey = p2[0] - p1[0], p2[1] - p1[1]
+            seg_len_sq = ex * ex + ey * ey
+            if seg_len_sq < 1e-8:
+                continue
+            t = ((self.x - p1[0]) * ex + (self.y - p1[1]) * ey) / seg_len_sq
+            t = max(0.0, min(1.0, t))
+            foot_x = p1[0] + t * ex
+            foot_y = p1[1] + t * ey
+            d = math.hypot(self.x - foot_x, self.y - foot_y)
+            if d < best_dist:
+                best_dist    = d
+                best_foot    = (foot_x, foot_y)
+                best_seg_yaw = math.atan2(ey, ex)  # heading of this segment
+
+        if best_foot and best_dist < snap_radius:
+            # ── HEADING GATE ──────────────────────────────────────────────────
+            # Reject snap if the path segment is more than 25° off the car's yaw.
+            # This catches cross-traffic segments at T/X intersections.
+            heading_err = (best_seg_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(math.degrees(heading_err)) > 25.0:
+                self._snap_miss_frames += 1
+                return   # don't snap — segment is perpendicular or divergent
+
+            dt_clamped = min(dt, 0.10)
+            pull = self._MAP_SNAP_PULL * dt_clamped
+            self.x = self.x + pull * (best_foot[0] - self.x)
+            self.y = self.y + pull * (best_foot[1] - self.y)
+            self._snap_miss_frames = 0
+        else:
+            self._snap_miss_frames += 1
+            if self._snap_miss_frames >= self._SNAP_LOST_LIMIT:
+                log.warning(
+                    f"Map snap (gated) lost for {self._snap_miss_frames} frames "
                     f"(dist={best_dist:.2f}m). Recovery radius active.")

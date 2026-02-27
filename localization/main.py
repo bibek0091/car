@@ -970,6 +970,7 @@ class Orchestrator:
 
                     perc = self.vision.process(
                         raw_frame,
+                        dt=dt,
                         extra_offset_px=extra_offset,
                         nav_state=self._nav_state,
                         velocity_ms=velocity_ms,
@@ -993,7 +994,9 @@ class Orchestrator:
                         camera_heading_rad=perc.heading_rad,
                         camera_confidence=perc.confidence,
                         heading_conf=perc.heading_conf,
-                        path=self._planned_path)
+                        path=self._planned_path,
+                        optical_yaw_rate=perc.optical_yaw_rate,
+                        optical_vel=perc.optical_vel)
                     self._path_cursor = self.localizer.path_cursor
 
                     self.localizer.get_upcoming_curve_from_path(
