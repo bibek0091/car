@@ -202,7 +202,7 @@ class Controller:
                 parking_state: str  = "NONE",
                 steer_bias:   float = 0.0,
                 upcoming_curve: str = "STRAIGHT",
-                imu_yaw_rate_rps: float = 0.0,
+                visual_yaw_rate_rps: float = 0.0,
                 velocity_ms:  float = 0.0,
                 dt:           float = 0.033,
                 ) -> ControlOutput:
@@ -250,9 +250,9 @@ class Controller:
                 elif upcoming_curve == "RIGHT":
                     raw_steer += 15.0  # gentle right pull
 
-            # ── Layer 2: IMU feed-forward ─────────────────────────────────
-            imu_ff    = math.degrees(imu_yaw_rate_rps) * dt * 0.35
-            raw_steer += imu_ff
+            # ── Layer 2: Visual Odometry feed-forward ──────────────────────
+            vo_ff = math.degrees(visual_yaw_rate_rps) * dt * 0.45
+            raw_steer += vo_ff
 
             # ── Integral term for persistent offset ───────────────────────
             # Accumulate only when error is moderate (not during emergencies)

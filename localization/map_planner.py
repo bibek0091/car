@@ -264,3 +264,39 @@ class PathPlanner:
         if not target_path or cursor >= len(target_path) - 1:
             return node_id
         return target_path[cursor + 1]
+
+    def get_next_action(self, current_x, current_y, current_yaw, path, cursor=0):
+        """
+        Determines the required turn (LEFT, RIGHT, STRAIGHT) at an upcoming junction
+        by comparing the car's current heading with the vector to a node further 
+        down the A* path.
+        """
+        if not path or cursor >= len(path) - 1:
+            return "STRAIGHT"
+
+        # Look roughly 1.0 meter ahead along the path to determine the turn
+        waypoints, _ = self.get_lookahead_waypoints(
+            current_x, current_y, path, cursor=cursor, lookahead_m=1.0
+        )
+        
+        if len(waypoints) < 2:
+            return "STRAIGHT"
+
+        # Vector from car to the target waypoint
+        target_wp = waypoints[-1]
+        dx = target_wp[0] - current_x
+        dy = target_wp[1] - current_y
+
+        target_yaw = math.atan2(dy, dx)
+        
+        # Angle difference mapped to [-pi, pi]
+        angle_diff = (target_yaw - current_yaw + math.pi) % (2 * math.pi) - math.pi
+        
+        # Convert to degrees for easier thresholding
+        diff_deg = math.degrees(angle_diff)
+
+        if diff_deg > 25.0:
+            return "LEFT"
+        elif diff_deg < -25.0:
+            return "RIGHT"
+        return "STRAIGHT"

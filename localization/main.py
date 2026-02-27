@@ -58,7 +58,6 @@ from localization import LocalizationEngine
 from control      import Controller, ControlOutput
 from hardware_io  import HardwareIO
 from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector
-from mpu9250_imu  import MPU9250_Thread
 
 logging.basicConfig(
     level   = logging.INFO,
@@ -251,18 +250,13 @@ class Orchestrator:
         self.svg_path  = svg_path or SVG_PATH_DEFAULT
         self.running   = False
         self._estop    = False
-        self._pilot_thread = None
-
         # ── Hardware ──────────────────────────────────────────────────────────
         self.hw = HardwareIO(sim_mode=sim_mode)
 
-        # ── IMU ───────────────────────────────────────────────────────────────
-        self.imu = MPU9250_Thread()
-        if self.imu.is_connected:
-            self.imu.start()
-            log.info("IMU started")
-        else:
-            log.warning("IMU not connected — yaw will be 0.0")
+        # ── 2-Click Routing State ─────────────────────────────────────────────
+        self._start_node   = None
+        self._target_node  = None
+        self._planned_path = []
 
         # ── Perception ────────────────────────────────────────────────────────
         self.vision = VisionPipeline()
@@ -389,27 +383,40 @@ class Orchestrator:
         self._gui_update()
 
     def _on_map_click(self, event):
-        """Left-click on SVG map → set localizer pose."""
+        """2-Click Routing: First click sets Start, second sets Destination."""
+        if not self.localizer.planner:
+            log.warning("No PathPlanner available - cannot map-click.")
+            return
+
         x_m, y_m = pixel_to_map(event.x, event.y, self.MAP_W, self.MAP_H)
+        nearest = self.localizer.planner.get_nearest_node(x_m, y_m)
+        if not nearest:
+            return
 
-        # Estimate initial yaw from IMU (or 0 if not connected)
-        imu_yaw, _ = self.imu.get_yaw_data()
-        init_yaw = imu_yaw if imu_yaw is not None else 0.0
+        if self._start_node is None:
+            self._start_node = nearest
+            # Assume 0 yaw for now
+            self.localizer.set_pose(x_m, y_m, 0.0)
+            if hasattr(self, '_click_hint'):
+                self._click_hint.config(text=f"Start: Node {nearest}. Now click Destination.")
+            log.info(f"Start set to {nearest} at x={x_m:.1f} y={y_m:.1f}")
+            
+        elif self._target_node is None:
+            self._target_node = nearest
+            self._planned_path = self.localizer.planner.plan_route(self._start_node, self._target_node)
+            
+            if hasattr(self, '_click_hint'):
+                self._click_hint.config(text=f"Route Planned! ({len(self._planned_path)} nodes). Driving...")
+            
+            self._start_clicked = True
+            log.info(f"Target set to {nearest}. Path nodes: {len(self._planned_path)}")
 
-        self.localizer.set_pose(x_m, y_m, init_yaw)
-        self._start_clicked = True
-
-        # Hide the hint
-        if hasattr(self, '_click_hint'):
-            self._click_hint.config(text=f"Start: ({x_m:.1f} m, {y_m:.1f} m) — driving…")
-
-        # Launch pilot thread on first click
-        if self._pilot_thread is None or not self._pilot_thread.is_alive():
-            self.running = True
-            self._pilot_thread = threading.Thread(
-                target=self._pilot_loop, daemon=True)
-            self._pilot_thread.start()
-            log.info(f"Pilot started from x={x_m:.2f} y={y_m:.2f} yaw={math.degrees(init_yaw):.1f}°")
+            # Launch pilot thread on second click
+            if self._pilot_thread is None or not self._pilot_thread.is_alive():
+                self.running = True
+                self._pilot_thread = threading.Thread(
+                    target=self._pilot_loop, daemon=True)
+                self._pilot_thread.start()
 
     def _estop_cb(self):
         self._estop = True
@@ -429,8 +436,6 @@ class Orchestrator:
             self.hw.set_steering(0)
         except Exception:
             pass
-        if self.imu.is_connected:
-            self.imu.stop()
         if self._threaded_yolo:
             self._threaded_yolo.stop()
         self.hw.close()
@@ -444,6 +449,18 @@ class Orchestrator:
         try:
             # ── SVG map with car dot ──────────────────────────────────────────
             map_img = self._svg_base.copy()
+            
+            if self._planned_path and self.localizer.planner:
+                pts = []
+                for n in self._planned_path:
+                    pos = self.localizer.planner.node_positions.get(n)
+                    if pos:
+                        px, py = map_to_pixel(pos[0], pos[1], self.MAP_W, self.MAP_H)
+                        pts.append([px, py])
+                if len(pts) > 1:
+                    pts = np.array(pts, np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(map_img, [pts], False, (200, 50, 255), 3, cv2.LINE_AA)
+
             if self.localizer.is_initialized():
                 x, y, yaw = self.localizer.get_pose()
                 px, py = map_to_pixel(x, y, self.MAP_W, self.MAP_H)
@@ -496,12 +513,7 @@ class Orchestrator:
             
             self._sv_fps.set(   f"FPS: {self._fps:.1f}")
 
-            imu_y, imu_r = self.imu.get_yaw_data()
-            if imu_y is not None:
-                self._sv_imu.set(
-                    f"IMU yaw={math.degrees(imu_y):.0f}° gz={math.degrees(imu_r):.1f}°/s")
-            else:
-                self._sv_imu.set("IMU: not connected")
+            self._sv_imu.set("IMU: OFF (Visual Odometry)")
 
         except Exception as e:
             log.debug(f"GUI update error: {e}")
@@ -540,11 +552,8 @@ class Orchestrator:
             if raw_frame is None:
                 raw_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-            # ── 2. IMU data ──────────────────────────────────────────────────
-            imu_yaw_rad, imu_gz_rps = self.imu.get_yaw_data()
-            if imu_yaw_rad is None:
-                imu_yaw_rad = 0.0
-                imu_gz_rps  = 0.0
+            # ── 2. IMU data (Removed - Visual Odometry Active) ───────────────
+            pass
 
             # ── 3. Hardware velocity ─────────────────────────────────────────
             velocity_ms = self.hw.get_velocity_ms()
@@ -574,7 +583,7 @@ class Orchestrator:
                 nav_state=self._nav_state
             )
 
-            # ── 6. Junction detection ────────────────────────────────────────
+            # ── 6. Junction detection & Path Routing ──────────────────────────
             self._nav_state = self.jct_detector.update(
                 perc.warped_binary,
                 perc.sl, perc.sr,
@@ -582,13 +591,35 @@ class Orchestrator:
                 t_res.active_labels
             )
 
+            # If the detector prompts us for a choice at a junction, query A* path
+            if self._nav_state == "JUNCTION_PROMPT":
+                if self._planned_path and self.localizer.planner:
+                    x, y, yaw = self.localizer.get_pose()
+                    
+                    # Find our current nearest node cursor
+                    nearest = self.localizer.planner.get_nearest_node(x, y)
+                    cursor = 0
+                    if nearest in self._planned_path:
+                        cursor = self._planned_path.index(nearest)
+
+                    # Determine turn direction
+                    action = self.localizer.planner.get_next_action(
+                        current_x=x, current_y=y, current_yaw=yaw,
+                        path=self._planned_path, cursor=cursor
+                    )
+                    
+                    # E.g. "LEFT" -> "JUNCTION_LEFT"
+                    self._nav_state = f"JUNCTION_{action}"
+                    log.info(f"📍 Junction Reached at {nearest}. Routing: {action}")
+                else:
+                    self._nav_state = "JUNCTION_STRAIGHT"  # default fail-safe
+
             # ── 7. Camera heading for localizer ─────────────────────────────
             cam_heading = estimate_heading_from_lanes(perc.sl, perc.sr)
 
             # ── 8. Localizer update ──────────────────────────────────────────
             self.localizer.update(
                 velocity_ms       = velocity_ms,
-                imu_yaw_rate_rps  = imu_gz_rps,
                 dt                = dt,
                 camera_heading_rad= cam_heading,
                 camera_confidence = perc.confidence
@@ -607,7 +638,6 @@ class Orchestrator:
                 parking_state = t_res.parking_state,
                 steer_bias    = t_res.steer_bias,
                 upcoming_curve= map_ahead,
-                imu_yaw_rate_rps = imu_gz_rps,
                 velocity_ms   = velocity_ms,
                 dt            = dt,
             )
