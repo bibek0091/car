@@ -87,18 +87,26 @@ class VisualOdometry:
 
 class DeadReckoningNavigator:
     def __init__(self):
-        self.last_valid_target = 320.0
+        self.last_valid_target    = 320.0
         self.last_valid_curvature = 0.0
+        self._lost_time_s         = 0.0   # A-03: wall-clock accumulator
 
-    def predict_target(self, frames_lost, last_speed, last_steering):
-        # Fallback target generator when lines are completely lost
-        time_lost = frames_lost / max(30, 1) # Assuming 30 FPS
-        lateral_drift = last_steering * 2.0 * time_lost
+    def reset_lost_timer(self):
+        self._lost_time_s = 0.0
+
+    def accumulate(self, dt: float):
+        """Call each frame lanes are lost to accumulate real elapsed time."""
+        self._lost_time_s += dt
+
+    def predict_target(self, last_speed, last_steering):
+        """A-03: Uses wall-clock lost time, not frame count."""
+        t = max(0.0, self._lost_time_s)
+        lateral_drift   = last_steering * 2.0 * t
         predicted_target = self.last_valid_target + lateral_drift
         if abs(self.last_valid_curvature) > 0.001:
-            predicted_target += self.last_valid_curvature * 5000 * time_lost
-        predicted_target = np.clip(predicted_target, 150, 490)
-        confidence = max(0.0, 1.0 - frames_lost / 30.0)
+            predicted_target += self.last_valid_curvature * 5000 * t
+        predicted_target = float(np.clip(predicted_target, 150, 490))
+        confidence       = max(0.0, 1.0 - t / 2.0)   # full confidence lost after 2 s
         return predicted_target, confidence
 
 
@@ -109,8 +117,22 @@ class HybridLaneTracker:
     POLY_MARGIN_BASE = 60
     POLY_MARGIN_CURV = 120
     MIN_PIX_OK       = 200
-    EMA_ALPHA        = 0.50
-    STALE_FIT_FRAMES = 5
+    EMA_ALPHA        = 0.65   # F-12: base alpha (was 0.50 — too slow)
+    EMA_ALPHA_TURN   = 0.85   # F-12: fast alpha when curvature is high
+    STALE_FIT_FRAMES = 12     # F-07: was 5 (167 ms) — now 12 (400 ms)
+
+    # ── Right-lane driving constants ──────────────────────────────────────────
+    # In BFMC (drives on the right):
+    #   sl  = LEFT boundary of car's lane  (usually the centre dashed line)
+    #   sr  = RIGHT boundary of car's lane (the solid white outer edge)
+    #
+    # WIDE_ROAD_PX: if estimated lane width exceeds this, the camera is seeing
+    #   BOTH lanes (full road). We must explicitly target the RIGHT half.
+    # SINGLE_LANE_PX: below this width the camera sees only its own lane;
+    #   a small rightward comfort bias keeps the car away from the divider.
+    WIDE_ROAD_PX       = 420   # full-road threshold (both lanes visible in BEV)
+    SINGLE_LANE_PX     = 200   # minimum plausible single-lane width
+    RIGHT_LANE_BIAS_PX = 30    # comfort right-ward bias within own lane (px)
 
     def __init__(self, img_shape=(480, 640)):
         self.h, self.w = img_shape
@@ -149,7 +171,10 @@ class HybridLaneTracker:
         if has_l:
             fl = np.polyfit(nzy[li], nzx[li], 2)
             self.left_fit  = fl
-            self.sl        = self._ema(self.sl, fl)
+            # F-12: adaptive EMA — faster on curves for responsive tracking
+            curv_now = self.get_curvature(self.h // 2)
+            alpha = self.EMA_ALPHA_TURN if curv_now > 0.002 else self.EMA_ALPHA
+            self.sl        = self._ema(self.sl, fl, alpha)
             self.left_stale = 0
         else:
             self.left_stale += 1
@@ -159,7 +184,9 @@ class HybridLaneTracker:
         if has_r:
             fr = np.polyfit(nzy[ri], nzx[ri], 2)
             self.right_fit  = fr
-            self.sr         = self._ema(self.sr, fr)
+            curv_now = self.get_curvature(self.h // 2)
+            alpha = self.EMA_ALPHA_TURN if curv_now > 0.002 else self.EMA_ALPHA
+            self.sr         = self._ema(self.sr, fr, alpha)
             self.right_stale = 0
         else:
             self.right_stale += 1
@@ -203,17 +230,48 @@ class HybridLaneTracker:
                 else: return 320.0 - (lane_width_px * 0.8) + extra_offset_px, "JCT_LEFT_BLIND"
             return 320.0 + extra_offset_px, "JCT_WAITING_CHOICE"
 
-        # NORMAL DRIVING (Middle-lane priority)
+        # ── RIGHT-LANE NORMAL DRIVING ─────────────────────────────────────────
+        # Three cases based on what the camera can see:
+        #
+        #  Case A – FULL ROAD VISIBLE (lane_width_px > WIDE_ROAD_PX):
+        #    sl = left outer edge, sr = right outer edge.
+        #    Right lane centre = 3/4 from left edge = (sl + 3*sr) / 4.
+        #
+        #  Case B – OWN LANE ONLY (both sl and sr, normal width):
+        #    sl = centre divider, sr = outer edge.
+        #    Right lane centre = midpoint + small rightward comfort bias.
+        #
+        #  Case C – ONE LINE ONLY:
+        #    From right edge: sr - hw         (already right-lane correct)
+        #    From divider:    sl + hw         (already right-lane correct)
+        #    In both cases add the comfort bias toward the outer edge.
         if sl is None and sr is None:
-            predicted_x, conf = self.dead_reckoner.predict_target(frames_lost, last_speed, last_steering)
+            # A-03: predict_target now uses wall-clock time instead of frame count
+            predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
             return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
-        
-        if sl is not None and sr is not None: base_x, anchor = (ev(sl) + ev(sr)) / 2.0, "CENTERED_DUAL"
-        elif sr is not None: base_x, anchor = ev(sr) - hw, "CENTERED_FROM_RIGHT"
-        elif sl is not None: base_x, anchor = ev(sl) + hw, "CENTERED_FROM_LEFT"
-            
+
+        if sl is not None and sr is not None:
+            if lane_width_px >= self.WIDE_ROAD_PX:
+                # Case A: full road — drive in the right quarter of the image
+                base_x = (ev(sl) + 3.0 * ev(sr)) / 4.0
+                anchor = "RL_WIDE_ROAD"
+            else:
+                # Case B: own lane visible — centre + rightward comfort margin
+                base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
+                anchor = "RL_DUAL"
+        elif sr is not None:
+            # Case C-right: anchored from outer (right) edge
+            base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
+            anchor = "RL_FROM_EDGE"
+        else:
+            # Case C-left: anchored from centre divider (left line)
+            # No extra bias — divider already defines right lane boundary
+            base_x = ev(sl) + hw
+            anchor = "RL_FROM_DIVIDER"
+
         self.dead_reckoner.last_valid_target = base_x
         self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
+        self.dead_reckoner.reset_lost_timer()   # A-03: reset timer when lines visible
         return base_x + extra_offset_px, anchor
 
     def get_curvature(self, y_eval):
@@ -291,15 +349,23 @@ class HybridLaneTracker:
         return li, ri, dbg
 
     def _width_sane(self, lf, rf, y=400):
+        # F-06: tightened from 80<w<560 to 180<w<420
+        # BFMC lanes are ~280-350 px wide in BEV. 560 was accepting cross-lane noise.
         w = np.polyval(rf, y) - np.polyval(lf, y)
-        return 80 < w < 560
+        return 180 < w < 420
 
-    def _ema(self, prev, new):
+    def _ema(self, prev, new, alpha=None):
+        if alpha is None:
+            alpha = self.EMA_ALPHA
         if prev is None: return new.copy()
-        return self.EMA_ALPHA * new + (1.0 - self.EMA_ALPHA) * prev
+        return alpha * new + (1.0 - alpha) * prev
 
 
 class VisionPipeline:
+    # F-13: VO calibration scale factors as named constants (measure against known motion)
+    VO_YAW_SCALE = 0.015   # rad/s per px/frame lateral — calibrate on a 1 m straight run
+    VO_VEL_SCALE = 0.008   # m/s per px/frame forward  — calibrate against encoder
+
     def __init__(self):
         self.SRC_PTS = np.float32([[200, 260], [440, 260], [40, 450], [600, 450]])
         self.DST_PTS = np.float32([[150, 0], [490, 0], [150, 480], [490, 480]])
@@ -312,7 +378,8 @@ class VisionPipeline:
 
     def process(self, raw_frame, dt: float = 0.033, extra_offset_px=0.0,
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
-                upcoming_curve: str = "STRAIGHT") -> PerceptionResult:
+                upcoming_curve: str = "STRAIGHT",
+                pitch_rad: float = 0.0) -> PerceptionResult:
         if raw_frame.shape[:2] != (480, 640):
             process_frame = cv2.resize(raw_frame, (640, 480))
         else:
@@ -321,7 +388,18 @@ class VisionPipeline:
         # Run Visual Odometry on raw frame (ground-plane features)
         opt_yaw_rate, opt_vel = self.vo.update(process_frame, dt)
 
-        warped_colour = cv2.warpPerspective(process_frame, self.M_forward, (640, 480))
+        # F-01: Dynamic BEV transform — shift top src points by pitch to compensate
+        # camera tilt during acceleration/braking. pitch_rad > 0 = nose down.
+        if abs(pitch_rad) > 0.001:
+            shift_px  = int(pitch_rad * 400)    # ~400 px/rad empirical
+            dyn_src   = self.SRC_PTS.copy()
+            dyn_src[0][1] += shift_px           # top-left
+            dyn_src[1][1] += shift_px           # top-right
+            M_use = cv2.getPerspectiveTransform(dyn_src, self.DST_PTS)
+        else:
+            M_use = self.M_forward              # no pitch — use cached matrix
+
+        warped_colour = cv2.warpPerspective(process_frame, M_use, (640, 480))
         lab = cv2.cvtColor(warped_colour, cv2.COLOR_BGR2LAB)
         L = self.clahe.apply(lab[:, :, 0])
         
@@ -350,6 +428,7 @@ class VisionPipeline:
         
         if target_x is None:
             self.lost_frames += 1
+            self.tracker.dead_reckoner.accumulate(dt)   # A-03: accumulate real time
             target_x = self.last_target_x
         else:
             self.lost_frames = 0
@@ -359,10 +438,17 @@ class VisionPipeline:
         curv = self.tracker.get_curvature(y_eval)
         conf = 1.0 if (sl is not None and sr is not None) else 0.5 if (sl is not None or sr is not None) else 0.0
         
-        # Calculate pseudo-heading for Localizer mapping
+        # F-02: heading averaged from BOTH lane lines when available
+        # Left-only heading is unreliable when sl has a noisy 2nd-order coefficient.
         heading_rad = 0.0
+        def _lane_heading(fit, y):
+            return math.atan2(np.polyval(fit, y - 50) - np.polyval(fit, y), 50)
         if sl is not None and sr is not None:
-            heading_rad = math.atan2(np.polyval(sl, y_eval-50) - np.polyval(sl, y_eval), 50)
+            heading_rad = (_lane_heading(sl, y_eval) + _lane_heading(sr, y_eval)) / 2.0
+        elif sl is not None:
+            heading_rad = _lane_heading(sl, y_eval)
+        elif sr is not None:
+            heading_rad = _lane_heading(sr, y_eval)
 
         return PerceptionResult(
             warped_binary=warped_binary,

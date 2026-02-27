@@ -124,10 +124,14 @@ class HardwareIO:
     # ── Daemon workers ────────────────────────────────────────────────────────
 
     def _camera_worker(self):
-        """Runs in background thread: continually captures and enqueues frames."""
+        """Runs in background thread: continually captures and enqueues frames.
+        F-16: capture_array() is a blocking call — it returns only when the sensor
+        delivers a new frame. No sleep needed; the sensor naturally rate-limits us
+        to ~30-60 FPS without burning CPU cycles between captures.
+        """
         while self._running:
             try:
-                frame = self.camera.capture_array()
+                frame = self.camera.capture_array()   # blocks until new frame ready
                 if frame is not None and _CV2_AVAILABLE:
                     # XRGB8888 → BGR
                     if frame.ndim == 3 and frame.shape[2] == 4:
@@ -137,7 +141,7 @@ class HardwareIO:
                     self._push_frame(cv2.resize(frame, (640, 480)))
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")
-            time.sleep(0.01)   # ~100 Hz capture ceiling — pi camera handles pacing
+                time.sleep(0.033)   # brief pause only on error, then retry
 
     def _video_worker(self):
         """Runs in background thread: reads sim video at 30 Hz and enqueues."""

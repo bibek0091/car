@@ -312,8 +312,20 @@ class LocalizationEngine:
 
         FIX VL-FIX-A: path_cursor parameter removed — cursor managed internally.
         """
-        if dt <= 0 or not self._initialized:
+        if dt <= 0:
             return
+
+        # F-03: Auto-init on first valid perception frame.
+        # If set_pose() was never called (operator forgot), snap to nearest map node
+        # so we don't dead-reckon from (0,0) which is off the BFMC track.
+        if not self._initialized:
+            if camera_confidence > 0.5 and self.planner:
+                nn = self.planner.get_nearest_node(self.x, self.y)
+                if nn:
+                    px, py = self.planner.node_positions[nn]
+                    self.set_pose(px, py)
+                    log.info(f"F-03 auto-init: snapped to nearest node {nn} ({px:.2f}, {py:.2f})")
+            return   # always skip this frame after init attempt
 
         with self._lock:
             # OPT: use optical_vel as velocity fallback when encoder is dead
@@ -358,8 +370,9 @@ class LocalizationEngine:
             self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 2: A* Path Heading Nudge ───────────────────────────────
+            # F-14: gate raised from 0.5 → 0.7 to prevent this fighting optical fallback
             if (path and cursor < len(path) - 1
-                    and camera_confidence > 0.5
+                    and camera_confidence > 0.7
                     and self.planner):
                 n1 = path[cursor]
                 n2 = path[min(cursor + 1, len(path) - 1)]
@@ -445,8 +458,15 @@ class LocalizationEngine:
                 best_d  = d
                 best_idx = i
 
-        # FIX LOC-03: only advance cursor, never go backwards
-        self._path_cursor = max(self._path_cursor, best_idx)
+        # FIX LOC-03 + F-09: monotonic advance with lap wrap-around detection.
+        # If best_idx is far behind (> half the path length), the car has looped
+        # around — allow cursor reset instead of staying stuck at end-of-path.
+        lap_wrap_thresh = max(1, len(path) // 2)
+        if best_idx < self._path_cursor - lap_wrap_thresh:
+            self._path_cursor = best_idx   # lap wrap — reset allowed
+            log.info(f"F-09: Lap wrap detected, cursor reset to {best_idx}")
+        else:
+            self._path_cursor = max(self._path_cursor, best_idx)
 
     def update_cursor(self, path, x, y):
         """
@@ -554,14 +574,14 @@ class LocalizationEngine:
             return
 
         # ── Topology freeze ───────────────────────────────────────────────────
-        # Roundabout nodes: planner exposes is_roundabout_node().
-        # Junction nodes: detected via 'junction' attribute in GraphML graph.
+        # F-08: Use is_at_junction() and is_roundabout_node() directly — these
+        # do proper edge-count analysis. The old GraphML attribute check was fragile
+        # because BFMC nodes only have x,y attributes (no 'junction' field).
         current_node = path[cursor]
         if self.planner:
-            if getattr(self.planner, 'is_roundabout_node', lambda n: False)(current_node):
+            if self.planner.is_roundabout_node(current_node):
                 return  # inside roundabout — freeze snap
-            node_data = self.planner.graph.nodes.get(current_node, {}) if hasattr(self.planner, 'graph') else {}
-            if node_data.get('junction') or node_data.get('type') in ('junction', 'intersection'):
+            if self.planner.is_at_junction(current_node):
                 return  # inside intersection — freeze snap
 
         curvature = self.planner.get_path_curvature(

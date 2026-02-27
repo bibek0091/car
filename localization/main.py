@@ -936,6 +936,17 @@ class Orchestrator:
                     perc = self._last_perc if self._last_perc else self.vision.process(raw_frame)
                     ctrl = self._last_ctrl
 
+                    # F-15: Auto-recovery — attempt re-detection every loop tick.
+                    # If lanes are visible again, clear E-STOP and resume driving.
+                    try:
+                        recovery_perc = self.vision.process(raw_frame, dt=dt)
+                        if recovery_perc.confidence > 0.4:
+                            self._estop = False
+                            _ll = 0
+                            log.info("F-15: E-STOP cleared — lanes re-detected (conf=%.2f)", recovery_perc.confidence)
+                    except Exception:
+                        pass
+
                 else:
                     # --- NORMAL DRIVING ---
                     now = time.time()

@@ -57,8 +57,12 @@ class StanleyController:
         ppm  = max(lane_width_px, 50) / 0.35    # pixels per metre
         ce_m = (320.0 - target_x_px) / ppm      # cross-track error (metres)
 
-        # Reactive Stanley term
-        reactive_rad = heading_rad + math.atan2(self.k * ce_m, velocity_ms + self.ks)
+        # F-04: velocity-scaled cross-track gain to prevent startup oscillation.
+        # k ramps from 0 → full over 0–0.25 m/s so large CTE at v≈0 doesn't jerk.
+        k_eff = self.k * min(1.0, velocity_ms / 0.25)
+
+        # Reactive Stanley term (with velocity-scaled gain)
+        reactive_rad = heading_rad + math.atan2(k_eff * ce_m, velocity_ms + self.ks)
 
         # Predictive map feed-forward term  (atan(L·κ) = Ackermann relationship)
         feed_forward_rad = math.atan(self.L * map_curvature)
@@ -71,9 +75,18 @@ class StanleyController:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 class DividerGuard:
-    """Repulsion force-field around lane boundaries — unchanged."""
+    """
+    Repulsion force-field around lane boundaries.
 
-    DIVIDER_SAFE_PX = 110
+    Right-lane driving convention:
+      left_fit  = sl  = centre dashed line  (divider — car MUST stay right of it)
+      right_fit = sr  = outer solid edge     (wall — car must not hit it)
+
+    DIVIDER_SAFE_PX is set higher than EDGE_SAFE_PX because wandering over the
+    centre line into oncoming traffic is worse than clipping the outer edge.
+    """
+
+    DIVIDER_SAFE_PX = 130   # raised from 110: stronger push away from centre divider
     EDGE_SAFE_PX    =  70
     GAIN            = 0.35
     MAX_CORR        = 25.0
@@ -182,6 +195,12 @@ class Controller:
             speed *= (0.4 + 0.4 * dr_conf)
 
         final_speed = speed * traffic_mult * guard_spd_mult
+
+        # F-10: minimum speed floor — prevents stacked multipliers stalling mid-track.
+        # 18 PWM = just above the 12 PWM deadband. Only applies in normal driving.
+        MINIMUM_DRIVE_PWM = 18.0
+        if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0:
+            final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
 
         return ControlOutput(
             steer_angle_deg = steer_angle,

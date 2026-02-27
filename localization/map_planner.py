@@ -31,7 +31,7 @@ _ROUNDABOUT_CENTRES = [
     (4.94,  3.83),
     (15.48, 3.83),
 ]
-_ROUNDABOUT_RADIUS = 1.0
+_ROUNDABOUT_RADIUS = 0.70   # A-04: tightened from 1.0 m — avoids misclassifying bypass nodes
 
 
 class PathPlanner:
@@ -229,24 +229,27 @@ class PathPlanner:
         if len(waypoints) < 3:
             return 0.0
 
+        # F-11: Menger circumradius curvature κ = 1/R = 4·Area / (|p1p2|·|p2p3|·|p1p3|)
+        # Eliminates the angle/avg_length approximation that over-amplified short segments.
         total_curvature = 0.0
+        count           = 0
         for i in range(1, len(waypoints) - 1):
             p1 = np.array(waypoints[i - 1])
             p2 = np.array(waypoints[i])
             p3 = np.array(waypoints[i + 1])
-            v1 = p2 - p1
-            v2 = p3 - p2
-            l1 = np.linalg.norm(v1)
-            l2 = np.linalg.norm(v2)
-            if l1 < 1e-4 or l2 < 1e-4:
+            l1 = np.linalg.norm(p2 - p1)
+            l2 = np.linalg.norm(p3 - p2)
+            l3 = np.linalg.norm(p3 - p1)
+            if l1 < 1e-4 or l2 < 1e-4 or l3 < 1e-4:
                 continue
-            dot   = np.clip(np.dot(v1, v2) / (l1 * l2), -1.0, 1.0)
-            angle = math.acos(dot)
-            total_curvature += angle / ((l1 + l2) / 2.0)
+            # Signed area of triangle (cross product magnitude)
+            area = abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p3[0]-p1[0])*(p2[1]-p1[1])) / 2.0
+            # Circumradius R = (l1*l2*l3) / (4*Area); curvature κ = 1/R
+            curvature_i = (4.0 * area) / max(l1 * l2 * l3, 1e-8)
+            total_curvature += curvature_i
+            count += 1
 
-        # FIX MAP-03: loop runs (len-2) iterations; dividing by (len-2) gives
-        # the mean curvature per triplet. max(1,...) guards the 3-point edge case.
-        return total_curvature / max(1, len(waypoints) - 2)
+        return total_curvature / max(count, 1)
 
     def is_at_junction(self, node_id):
         if not self.graph or node_id not in self.graph:
