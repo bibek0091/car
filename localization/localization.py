@@ -1,41 +1,25 @@
 """
-localization.py — IMU-Free Visual Dead-Reckoning Localizer  (FIXED v3)
+localization.py — IMU-Free Visual Dead-Reckoning Localizer  (FIXED v4)
 =======================================================================
-FIXES in v3 (on top of v2):
+FIXES in v4 (on top of v3):
 
-  VL-FIX-A  Cursor is now self-managed inside update().
-             update_cursor() is called internally every frame so callers
-             never need to track or pass a cursor — it just works.
-             The cursor is exposed as the read-only property `path_cursor`.
+  LOC-01  upcoming_curve written under self._lock to prevent race condition
+          with pilot thread. Result computed first, then assigned atomically.
 
-  VL-FIX-B  Map-snap search radius: 0.5 m → 1.0 m (primary)
-             Added a "recovery snap" at 2.0 m that fires when the car
-             hasn't snapped for > 60 frames.  This re-anchors the car
-             after long DEAD_RECKONING stretches.
+  LOC-02  Map-snap pull dt clamped to 100 ms max. A stall spike (dt > 100 ms)
+          can no longer jump the car position by more than 1.5% per frame.
 
-  VL-FIX-C  Yaw-rate EMA alpha raised: 0.08 → 0.18 (5.5-frame TC at 30 Hz).
-             Old 0.08 (11-frame TC) caused ~370 ms lag before a turn
-             registered, leading to systematic overshoot at every corner.
+  LOC-03  _update_cursor_internal enforces monotonic advance: cursor only
+          increases, preventing oscillation on looping track sections.
 
-  VL-FIX-D  _initialized guard relaxed: update() is silently ignored
-             while uninitialized (no crash), but set_pose() now also
-             accepts a partial call without yaw (defaults to current).
-
-  VL-FIX-E  POI arrival detection added: check_poi_arrival() compares
-             current (x,y) to a target node and returns True once the
-             car is within `threshold_m` (default 0.40 m).
-
-  VL-FIX-F  get_pose_for_dashboard() returns a rich dict that the
-             dashboard can directly display — x, y, yaw_deg, zone,
-             upcoming_curve, cursor, speed_ms.
-
-Unchanged from v2:
-  VL-01  VO EMA spike gate at 1.5 rad/s
-  VL-02  Heading sign convention (no negation on intake; Layer 3b negates)
-  VL-04  Map snap uses perpendicular-foot projection
-  VL-07  set_pose() seeds _cam_yaw_smoothed
-  VL-08  reset_cursor() available for new-route events
-  Layer 2 — A* path heading soft nudge (5 %)
+Unchanged from v3:
+  VL-FIX-A  Cursor self-managed inside update()
+  VL-FIX-B  Map-snap 1.0 m primary + 2.0 m recovery radius
+  VL-FIX-C  Yaw-rate EMA alpha 0.18
+  VL-FIX-D  Uninitialized guard (silent ignore)
+  VL-FIX-E  POI arrival detection
+  VL-FIX-F  get_pose_for_dashboard() rich dict
+  VL-01/02/04/07/08  (see v2 notes)
 """
 
 import math
@@ -233,6 +217,7 @@ class LocalizationEngine:
         with self._lock:
             curr_yaw = self.yaw
 
+        result = "STRAIGHT"  # FIX LOC-01: compute result before writing shared attr
         for i in range(cursor, min(cursor + 40, len(path) - 1)):
             n1 = path[i]
             n2 = path[i + 1]
@@ -248,15 +233,17 @@ class LocalizationEngine:
                         % (2 * math.pi) - math.pi)
                 deg = math.degrees(diff)
                 if deg > 18:
-                    self.upcoming_curve = "LEFT"
+                    result = "LEFT"
                 elif deg < -18:
-                    self.upcoming_curve = "RIGHT"
+                    result = "RIGHT"
                 else:
-                    self.upcoming_curve = "STRAIGHT"
-                return self.upcoming_curve
+                    result = "STRAIGHT"
+                break
 
-        self.upcoming_curve = "STRAIGHT"
-        return "STRAIGHT"
+        # FIX LOC-01: write shared attribute under lock
+        with self._lock:
+            self.upcoming_curve = result
+        return result
 
     # ── Main update ───────────────────────────────────────────────────────────
 
@@ -356,6 +343,8 @@ class LocalizationEngine:
     def _update_cursor_internal(self, path):
         """
         FIX VL-FIX-A: O(1) incremental cursor advance (±12 window).
+        FIX LOC-03: cursor only advances — never regresses — to prevent
+        oscillation on looping/revisited track sections.
         Mutates self._path_cursor directly (called under self._lock).
         """
         if not path or not self.planner:
@@ -376,7 +365,8 @@ class LocalizationEngine:
                 best_d  = d
                 best_idx = i
 
-        self._path_cursor = best_idx
+        # FIX LOC-03: only advance cursor, never go backwards
+        self._path_cursor = max(self._path_cursor, best_idx)
 
     def update_cursor(self, path, x, y):
         """
@@ -456,7 +446,9 @@ class LocalizationEngine:
                 best_foot = (foot_x, foot_y)
 
         if best_foot and best_dist < snap_radius:
-            pull = self._MAP_SNAP_PULL * dt
+            # FIX LOC-02: clamp dt to 100 ms max so a stall spike can't jump the car
+            dt_clamped = min(dt, 0.10)
+            pull = self._MAP_SNAP_PULL * dt_clamped
             self.x = self.x + pull * (best_foot[0] - self.x)
             self.y = self.y + pull * (best_foot[1] - self.y)
             self._snap_miss_frames = 0   # reset recovery counter

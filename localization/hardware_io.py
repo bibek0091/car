@@ -1,11 +1,18 @@
 """
-hardware_io.py — Hardware Abstraction Layer  (FIXED v2)
+hardware_io.py — Hardware Abstraction Layer  (FIXED v3)
 =======================================================
-Fixes applied:
-  HW-01  SPEED_CALIB corrected to 0.00568 m/s/PWM (was 0.014 — 2.5× too large)
-         Derived: MAX_SPEED_MS / (100 - DEADBAND_PWM) = 0.50 / 88 = 0.00568
-  HW-02  Duplicate class/instance attribute removed — constants defined once
-         in __init__ only
+Fixes applied (v2 → v3):
+  HW-01  get_sim_heading_deg now uses actual elapsed time (time.time() delta)
+         instead of hardcoded 0.033 s. dt clamped to [1 ms, 100 ms].
+  HW-02  set_speed logs a WARNING when the 500 mm/s physical cap clips the
+         command, making calibration regressions immediately visible.
+  HW-03  get_velocity_ms tracks consecutive encoder read failures. After
+         _ENCODER_FAIL_LIMIT (30) consecutive failures it logs an ERROR
+         so a disconnected encoder is not silently masked as zero velocity.
+
+Fixes carried forward from v2:
+  HW-01(v2)  SPEED_CALIB corrected to 0.00568 m/s/PWM
+  HW-02(v2)  Duplicate class/instance attribute removed
 """
 
 import sys
@@ -74,6 +81,9 @@ class HardwareIO:
         self._last_sim_time   = time.time()
         self._last_cmd_speed  = 0.0
         self._last_cmd_steer  = 0.0
+        # FIX HW-03: track consecutive encoder read failures for escalation
+        self._encoder_fail_count = 0
+        self._ENCODER_FAIL_LIMIT = 30   # ~1 s at 30 Hz before ERROR log
 
         # Initialize STM32
         if not self.sim_mode and _SERIAL_AVAILABLE:
@@ -133,12 +143,18 @@ class HardwareIO:
 
     def get_sim_heading_deg(self):
         if self.sim_mode:
+            now = time.time()
+            # FIX HW-01: use actual elapsed time instead of hardcoded 0.033 s
+            dt_actual = now - self._last_sim_time
+            self._last_sim_time = now
+            dt_actual = max(0.001, min(dt_actual, 0.10))  # clamp 1–100 ms
+
             v = max(0.0, (self._last_cmd_speed - self.DEADBAND_PWM) * self.SPEED_CALIB)
             yaw_rate = 0.0
             if v > 0.05:
                 steer_rad = math.radians(max(-45.0, min(45.0, self._last_cmd_steer)))
                 yaw_rate  = (v / 0.23) * math.tan(steer_rad)
-            self._sim_yaw += yaw_rate * 0.033
+            self._sim_yaw += yaw_rate * dt_actual
             return math.degrees(self._sim_yaw)
         return 0.0
 
@@ -160,7 +176,13 @@ class HardwareIO:
             speed_mm_s = 0.0
         else:
             speed_ms   = max(0.0, (speed_pwm - self.DEADBAND_PWM) * self.SPEED_CALIB)
-            speed_mm_s = min(500.0, speed_ms * 1000.0)
+            # FIX HW-02: warn if physical cap clips the command so tuning issues are visible
+            raw_mm_s   = speed_ms * 1000.0
+            speed_mm_s = min(500.0, raw_mm_s)
+            if raw_mm_s > 500.0:
+                log.warning(
+                    f"set_speed: command {raw_mm_s:.0f} mm/s clipped to 500 mm/s "
+                    f"(pwm={speed_pwm:.1f}). Check SPEED_CALIB or DEADBAND_PWM.")
         self.serial.set_speed(speed_mm_s)
 
     def get_velocity_ms(self):
@@ -168,6 +190,8 @@ class HardwareIO:
         if self.sim_mode:
             cmd = self._last_cmd_speed
             raw = max(0.0, (cmd - self.DEADBAND_PWM) * self.SPEED_CALIB)
+            # FIX HW-03: reset fail counter in sim (no real encoder)
+            self._encoder_fail_count = 0
         else:
             try:
                 if hasattr(self.serial, 'get_feedback'):
@@ -178,8 +202,17 @@ class HardwareIO:
                                  contextlib.nullcontext()):
                         raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
                 raw = max(0.0, raw_mms / 1000.0)
+                # FIX HW-03: successful read clears failure counter
+                self._encoder_fail_count = 0
             except Exception as e:
-                log.warning(f"get_velocity_ms error: {e}")
+                self._encoder_fail_count += 1
+                if self._encoder_fail_count == 1:
+                    log.warning(f"get_velocity_ms error: {e}")
+                elif self._encoder_fail_count >= self._ENCODER_FAIL_LIMIT:
+                    log.error(
+                        f"Encoder read failed {self._encoder_fail_count} consecutive "
+                        f"times — velocity locked at 0. Check STM32 connection.")
+                    self._encoder_fail_count = 0   # reset to avoid log spam
                 raw = 0.0
 
         self._vel_filtered = 0.80 * self._vel_filtered + 0.20 * raw

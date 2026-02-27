@@ -1,12 +1,16 @@
 """
-map_planner.py — GraphML Path Planner  (FIXED v2)
+map_planner.py — GraphML Path Planner  (FIXED v3)
 ==================================================
-Fixes applied:
-  MAP-01  get_nearest_node uses KDTree (unchanged) — O(log N)
-  MAP-02  get_next_action uses velocity-adaptive 2.5 m lookahead
-           (was 1.0 m — too short, always returned STRAIGHT)
-  MAP-03  get_current_edge_info roundabout check uses edge midpoint
-           for consistency with zone check (was nearest node)
+Fixes applied (v2 → v3):
+  MAP-01  Dead variable `start_pos` removed from get_next_action
+  MAP-02  is_at_junction now checks both in_edges and out_edges on DiGraph
+          so merge-only nodes (many incoming, one outgoing) are detected
+  MAP-03  get_path_curvature normalisation comment clarified
+
+Fixes carried forward from v2:
+  MAP-01(v2)  get_nearest_node uses KDTree — O(log N)
+  MAP-02(v2)  get_next_action uses velocity-adaptive 2.5 m lookahead
+  MAP-03(v2)  get_current_edge_info roundabout check uses edge midpoint
 """
 
 import networkx as nx
@@ -240,14 +244,21 @@ class PathPlanner:
             angle = math.acos(dot)
             total_curvature += angle / ((l1 + l2) / 2.0)
 
+        # FIX MAP-03: loop runs (len-2) iterations; dividing by (len-2) gives
+        # the mean curvature per triplet. max(1,...) guards the 3-point edge case.
         return total_curvature / max(1, len(waypoints) - 2)
 
     def is_at_junction(self, node_id):
         if not self.graph or node_id not in self.graph:
             return False
-        edges = [(u, v, d) for u, v, d in self.graph.edges(node_id, data=True)
-                 if not d.get('dotted', False)]
-        return len(edges) > 1
+        # FIX MAP-02: DiGraph.edges() returns only outgoing edges.
+        # A merge node (many incoming, one outgoing) was missed.
+        # Count non-dotted outgoing AND incoming edges for full detection.
+        out_edges = [(u, v, d) for u, v, d in self.graph.edges(node_id, data=True)
+                     if not d.get('dotted', False)]
+        in_edges  = [(u, v, d) for u, v, d in self.graph.in_edges(node_id, data=True)
+                     if not d.get('dotted', False)]
+        return len(out_edges) > 1 or len(in_edges) > 1
 
     def is_roundabout_node(self, node_id):
         return node_id in self._roundabout_nodes
@@ -277,7 +288,7 @@ class PathPlanner:
         if len(waypoints) < 2:
             return "STRAIGHT"
 
-        start_pos  = waypoints[0]
+        # FIX MAP-01: start_pos was computed but never used — removed dead variable
         target_wp  = waypoints[-1]
         dx = target_wp[0] - current_x
         dy = target_wp[1] - current_y

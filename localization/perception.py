@@ -1,12 +1,13 @@
 """
-perception.py — BFMC BEV Lane Tracker + Visual Odometry  (FIXED v2)
+perception.py — BFMC BEV Lane Tracker + Visual Odometry  (FIXED v3)
 ====================================================================
-Fix applied:
-  VL-02  estimate_heading_from_lanes() now returns +atan2(dxdy, 1.0)
-          — sign convention: positive tangent = road leans right = car
-          needs to yaw RIGHT (clockwise) = negative yaw delta in map frame.
-          The CALLER (localization.py Layer 3b) applies the negation for the
-          soft nudge.  Layer 1 (yaw-rate) uses the raw value directly.
+Fixes applied:
+  VL-02   estimate_heading_from_lanes() returns +atan2(dxdy, 1.0)
+  PERC-01 _poly_search fallback forwards wide flag for recovery sweep
+  PERC-02 Confidence normalised correctly (l_conf/r_conf are px/1000;
+          denominator was 2*MIN_PIX_OK instead of 2*(MIN_PIX_OK/1000))
+  PERC-03 CENTERED_FROM_RIGHT uses SINGLE_EDGE_OFFSET_PX (-40) not
+          SINGLE_DIV_OFFSET_PX (+40) so offset pushes left toward centre
 """
 
 import cv2
@@ -212,7 +213,9 @@ class HybridLaneTracker:
 
         if len(li) < self.MIN_PIX_OK and len(ri) < self.MIN_PIX_OK:
             self.mode = "SEARCH"
-            return self._sliding_window(warped, nzx, nzy)
+            # FIX PERC-01: forward wide flag so recovery sweep is used when needed
+            do_wide = getattr(self, '_lost_frames', 0) >= self.LOST_RECOVERY_THRESH
+            return self._sliding_window(warped, nzx, nzy, wide=do_wide)
 
         if len(li):
             dbg[nzy[li], nzx[li]] = [255, 80, 80]
@@ -403,7 +406,10 @@ class VisionPipeline:
                 anchor = "CENTERED_DUAL"
                 self._last_target_x = tx - extra_offset_px
             elif sr is not None:
-                tx     = ev(sr) - hw + self.SINGLE_DIV_OFFSET_PX + extra_offset_px
+                # FIX PERC-03: right-edge anchor must push LEFT toward lane centre.
+                # SINGLE_EDGE_OFFSET_PX = -40 (negative = left shift).
+                # Old code used SINGLE_DIV_OFFSET_PX (+40) which pushed further right.
+                tx     = ev(sr) - hw + self.SINGLE_EDGE_OFFSET_PX + extra_offset_px
                 anchor = "CENTERED_FROM_RIGHT"
                 self._last_target_x = tx - extra_offset_px
             elif sl is not None:
@@ -414,15 +420,20 @@ class VisionPipeline:
                 tx     = self._last_target_x + extra_offset_px
                 anchor = "DEAD_RECKONING"
 
-        MIN_PIX = self.tracker.MIN_PIX_OK
+        # FIX PERC-02: l_conf/r_conf are already normalised by 1000 (pixels/1000).
+        # MIN_PIX_OK = 200, so the normalised threshold = 200/1000 = 0.20.
+        # Old code divided by 2*MIN_PIX (=400) which made confidence ~1000x too small.
+        MIN_PIX      = self.tracker.MIN_PIX_OK
+        MIN_PIX_NORM = MIN_PIX / 1000.0   # 0.20 — matches l_conf/r_conf scale
+
         if sl is not None and sr is not None:
-            conf = min(1.0, (self.tracker.l_conf + self.tracker.r_conf) / (2.0 * MIN_PIX))
+            conf = min(1.0, (self.tracker.l_conf + self.tracker.r_conf) / (2.0 * MIN_PIX_NORM))
             curv = (self.tracker.get_curvature(sl, y) + self.tracker.get_curvature(sr, y)) / 2.0
         elif sr is not None:
-            conf = min(0.70, self.tracker.r_conf / MIN_PIX)
+            conf = min(0.70, self.tracker.r_conf / MIN_PIX_NORM)
             curv = self.tracker.get_curvature(sr, y)
         elif sl is not None:
-            conf = min(0.70, self.tracker.l_conf / MIN_PIX)
+            conf = min(0.70, self.tracker.l_conf / MIN_PIX_NORM)
             curv = self.tracker.get_curvature(sl, y)
         else:
             conf = 0.0

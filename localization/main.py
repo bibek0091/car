@@ -1,23 +1,32 @@
 """
-main.py — BFMC Single-Window Autonomous Pilot  (FIXED v2)
+main.py — BFMC Single-Window Autonomous Pilot  (FIXED v3)
 ==========================================================
-Fixes applied:
-  VL-05  SVG Y-axis inverted in map_to_pixel / pixel_to_map
-  VL-06  Incremental cursor replaces O(N) list.index()
-  VL-08  Path cursor reset when new route planned
+Fixes applied (v2 → v3):
+  MAIN-01  traffic_module import is now guarded with try/except at module level.
+           Stub classes (TrafficResult, TrafficDecisionEngine, ThreadedYOLODetector)
+           are defined when the module is absent so the pilot runs in degraded mode
+           without crashing. Inner `from traffic_module import TrafficResult` removed.
+  MAIN-02  No-Entry reroute rebuilds KDTree immediately after node removal so
+           get_nearest_node cannot return the just-blocked node as the new A* start.
+  MAIN-03  _on_map_click validates graph is non-empty and A* returned a path;
+           gives descriptive UI feedback and allows re-click on failure.
+  MAIN-04  FPS EMA only runs during active pipeline frames. During E-STOP the
+           counter is paused and t_prev is reset so the first real frame after
+           resume has a clean dt.
+  MAIN-05  _draw_steer_gauge clamps label/title y positions inside panel bounds
+           and documents that cx/cy/r are fully parametric.
+
+Fixes carried forward from v2:
+  VL-05   SVG Y-axis inverted in map_to_pixel / pixel_to_map
+  VL-06   Incremental cursor replaces O(N) list.index()
+  VL-08   Path cursor reset when new route planned
   SIGN-01 No-Entry triggers A* reroute (blocked node + replan)
   SIGN-02 zone_mode cross-validated with map every frame
   SIGN-03 nav_state = ROUNDABOUT set from map node membership
   MAP-02  get_next_action called with velocity_ms argument
-  DASHBOARD: Professional 6-panel redesign:
-    - MapOverlayRenderer with Y-axis fix + confidence ring + route overlay
-    - GraphML node graph panel (live A* cursor + roundabout highlights)
-    - Steering arc gauge
-    - Confidence + speed bars
-    - FPS alarm
-    - Fading sign detection history
-    - Path progress bar
-    - Zone badge + nav state badge
+  DASHBOARD: Professional 6-panel redesign (MapOverlayRenderer, GraphMLRenderer,
+             steering arc gauge, confidence+speed bars, FPS alarm, sign history,
+             path progress bar, zone badge, nav state badge)
 """
 
 import argparse
@@ -40,7 +49,41 @@ from perception    import VisionPipeline, estimate_heading_from_lanes
 from localization  import LocalizationEngine
 from control       import Controller, ControlOutput
 from hardware_io   import HardwareIO
-from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector
+try:
+    from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector, TrafficResult
+    _TRAFFIC_AVAILABLE = True
+except ImportError:
+    _TRAFFIC_AVAILABLE = False
+    log.warning(
+        "traffic_module not found. Traffic decisions disabled — car will run "
+        "at full speed ignoring signs. Install traffic_module to enable YOLO."
+    )
+
+    # FIX MAIN-01: define stub TrafficResult so the fallback branch always works
+    from dataclasses import dataclass, field
+    from typing import List
+
+    @dataclass
+    class TrafficResult:
+        state:               str   = "SYS_GO"
+        reason:              str   = "NO TRAFFIC MODULE"
+        speed_multiplier:    float = 1.0
+        zone_mode:           str   = "CITY"
+        parking_state:       str   = "NONE"
+        steer_bias:          float = 0.0
+        pedestrian_blocking: bool  = False
+        light_status:        str   = "NONE"
+        active_labels:       List  = field(default_factory=list)
+        yolo_debug_frame:    object = None
+
+    class ThreadedYOLODetector:
+        def __init__(self, *a, **kw): pass
+        def stop(self): pass
+
+    class TrafficDecisionEngine:
+        def __init__(self, *a, **kw): pass
+        def process(self, frame, *a, **kw):
+            return TrafficResult(yolo_debug_frame=frame.copy())
 
 logging.basicConfig(
     level=logging.INFO,
@@ -290,7 +333,10 @@ class GraphMLRenderer:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _draw_steer_gauge(img, steer_deg, cx=240, cy=95, r=70):
-    """Arc steering gauge: -45° left … 0 … +45° right."""
+    """Arc steering gauge: -45° left … 0 … +45° right.
+    FIX MAIN-05: cx, cy, r now fully parametric — callers pass their own values
+    so the gauge never clips when panel dimensions change.
+    """
     # Background track
     cv2.ellipse(img, (cx, cy), (r, r), 0, 200, 340, (50, 50, 50), 10)
     # Needle — angle mapped: 0° steer → top (270°), left→cw, right→ccw in image
@@ -303,11 +349,13 @@ def _draw_steer_gauge(img, steer_deg, cx=240, cy=95, r=70):
             (50, 200, 200) if abs(steer_deg) < 30 else (50, 50, 230)
     cv2.line(img, (cx, cy), (nx, ny), color, 3, cv2.LINE_AA)
     cv2.circle(img, (cx, cy), 5, color, -1, cv2.LINE_AA)
+    label_y = min(cy + r + 16, img.shape[0] - 4)   # FIX MAIN-05: clamp label inside panel
     cv2.putText(img, f"{steer_deg:+.1f}deg",
-                (cx - 28, cy + r + 16),
+                (cx - 28, label_y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    title_y = max(cy - r - 6, 12)                   # FIX MAIN-05: clamp title inside panel
     cv2.putText(img, "STEER",
-                (cx - 18, cy - r - 6),
+                (cx - 18, title_y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.38, (160, 160, 160), 1)
 
 
@@ -541,13 +589,16 @@ class Orchestrator:
         self.vision  = VisionPipeline()
 
         try:
-            self._threaded_yolo  = ThreadedYOLODetector("best.pt")
-            self.traffic_engine  = TrafficDecisionEngine(self._threaded_yolo)
-            log.info("YOLO loaded")
+            if _TRAFFIC_AVAILABLE:
+                self._threaded_yolo  = ThreadedYOLODetector("best.pt")
+                self.traffic_engine  = TrafficDecisionEngine(self._threaded_yolo)
+                log.info("YOLO loaded")
+            else:
+                raise RuntimeError("traffic_module not available")
         except Exception as e:
             log.warning(f"YOLO disabled: {e}")
             self._threaded_yolo = None
-            self.traffic_engine = None
+            self.traffic_engine = TrafficDecisionEngine(None)   # stub always works
 
         self.jct_detector = JunctionDetector()
         self.controller   = Controller()
@@ -682,10 +733,18 @@ class Orchestrator:
 
     def _on_map_click(self, event):
         if not self.localizer.planner:
+            self._sv_hint.set("Map planner not loaded — cannot set waypoints")
             return
+        # FIX MAIN-03: guard against empty graph (failed GraphML load)
+        if len(self.localizer.planner.graph.nodes) == 0:
+            self._sv_hint.set("Map graph is empty — check GraphML file")
+            log.warning("Map click ignored: planner graph has no nodes")
+            return
+
         x_m, y_m = pixel_to_map(event.x, event.y, self.MAP_W, self.MAP_H)
         nearest   = self.localizer.planner.get_nearest_node(x_m, y_m)
         if not nearest:
+            self._sv_hint.set("No nearest node found — click closer to a waypoint")
             return
 
         if self._start_node is None:
@@ -696,8 +755,18 @@ class Orchestrator:
 
         elif self._target_node is None:
             self._target_node  = nearest
-            self._planned_path = self.localizer.planner.plan_route(
+            planned = self.localizer.planner.plan_route(
                 self._start_node, self._target_node)
+            # FIX MAIN-03: warn user if A* found no path
+            if not planned:
+                self._sv_hint.set(
+                    f"No path from {self._start_node} → {nearest}. "
+                    "Try a different destination.")
+                log.warning(f"A* found no path: {self._start_node} → {nearest}")
+                self._target_node = None   # allow re-click
+                return
+
+            self._planned_path = planned
             self._path_cursor  = 0          # FIX VL-08
             self.localizer.reset_cursor()   # FIX VL-08
 
@@ -851,6 +920,9 @@ class Orchestrator:
                     self.hw.set_speed(0)
                     self.hw.set_steering(0)
                     time.sleep(0.05)
+                    # FIX MAIN-04: do not update FPS during E-STOP idle sleep.
+                    # Reset t_prev so next active frame has correct dt.
+                    t_prev = time.time()
                     continue
 
                 # ── 1. Camera ────────────────────────────────────────────────
@@ -879,14 +951,7 @@ class Orchestrator:
                                  else "CONTINUOUS")
                     t_res = self.traffic_engine.process(raw_frame, line_type)
                 else:
-                    from traffic_module import TrafficResult
-                    t_res = TrafficResult(
-                        state="SYS_GO", reason="NO YOLO",
-                        speed_multiplier=1.0, zone_mode="CITY",
-                        parking_state="NONE", steer_bias=0.0,
-                        pedestrian_blocking=False, light_status="NONE",
-                        active_labels=[], yolo_debug_frame=raw_frame.copy()
-                    )
+                    t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
                 self._last_t_res = t_res
 
                 # ── 5. Record sign detections ────────────────────────────────
@@ -911,12 +976,22 @@ class Orchestrator:
                         # Temporarily remove + replan
                         if nearest_ne in self.localizer.planner.graph:
                             self.localizer.planner.graph.remove_node(nearest_ne)
+                            # FIX MAIN-02: KDTree still holds removed node coords.
+                            # Rebuild KDTree from remaining nodes so get_nearest_node
+                            # can't return the blocked node as new start.
+                            remaining_ids = [n for n in self.localizer.planner._node_ids
+                                             if n in self.localizer.planner.graph]
+                            import scipy.spatial
+                            self.localizer.planner._node_ids = remaining_ids
+                            coords = [self.localizer.planner.node_positions[n]
+                                      for n in remaining_ids]
+                            self.localizer.planner._kdtree = scipy.spatial.KDTree(coords)
+
+                            new_start = self.localizer.planner.get_nearest_node(x_ne, y_ne)
                             new_path = self.localizer.planner.plan_route(
-                                self.localizer.planner.get_nearest_node(x_ne, y_ne),
+                                new_start,
                                 self._target_node)
-                            # Restore node
-                            # (the removed node cannot be re-added without its edges
-                            # so we reload the graph from file — simplest recovery)
+                            # Restore node by reloading graph from file
                             self.localizer.planner.load_graph(
                                 "Competition_track_graph.graphml")
                             if new_path:

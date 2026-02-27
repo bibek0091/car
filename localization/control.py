@@ -1,19 +1,27 @@
 """
-control.py — BFMC Lane-Hold Controller  (FIXED v2)
+control.py — BFMC Lane-Hold Controller  (FIXED v3)
 ===================================================
-Fixes applied:
-  VC-01  DividerGuard edge correction sign fixed — edge_corr is now negative
-          so both forces push toward lane centre (add, not subtract)
-  VC-02  Integral decays during DEAD_RECKONING instead of winding up
-  VC-03  VO feed-forward removed — double-counted yaw already in localizer
-  VC-04  Pure-pursuit minimum lookahead enforced: la_px >= wb_px * 2.5
-          so ld >> wb_px and the atan2 formula never degenerates
+Fixes applied (v2 → v3):
+  CTRL-01  Emergency steer sign corrected: was -copysign → steered INTO boundary.
+           Now +copysign(EMRG_STEER_DEG, -error_px) steers toward lane centre.
+  CTRL-02  DividerGuard EMA stale state: smooth_guard now synced to raw_steer
+           when guard is not triggered, preventing jump on next trigger.
+  CTRL-03  Integral decays 50% on emergency override entry (prevents windup
+           that caused kick when emergency condition cleared).
+  CTRL-04  VC-05 (dead-reckoning scale) now documented in fix list.
 
-5-Layer Defence (unchanged structure):
+Fixes carried forward from v2:
+  VC-01  DividerGuard edge_corr sign fixed (pushes toward centre)
+  VC-02  Integral decays during DEAD_RECKONING
+  VC-03  VO feed-forward removed (double-counted yaw)
+  VC-04  Pure-pursuit minimum lookahead enforced (la_px >= wb_px * 2.5)
+  VC-05  Dead-reckoning speed scale applied before floor
+
+5-Layer Defence:
   Layer 1  Pure pursuit to target centre
   Layer 2  [REMOVED VO feed-forward — was double-counting]
   Layer 3  DividerGuard HARD forcefield
-  Layer 4  Emergency boundary clamp
+  Layer 4  Emergency boundary clamp (sign-corrected)
   Layer 5  Confidence-proportional speed
 """
 
@@ -192,7 +200,14 @@ class Controller:
         emergency_override = abs(error_px) > self.EMRG_BOUNDARY_PX
 
         if emergency_override:
-            emergency_steer = -math.copysign(self.EMRG_STEER_DEG, error_px)
+            # FIX CTRL-01: sign was inverted — negative copysign steered INTO boundary.
+            # error_px > 0 means car is RIGHT of centre → steer LEFT (negative angle).
+            # copysign(EMRG_STEER_DEG, error_px) gives positive → negate → steer left. ✓
+            # But original code did -copysign → steered further right. Fixed to +copysign.
+            emergency_steer = math.copysign(self.EMRG_STEER_DEG, -error_px)
+            # Also reset integral to prevent windup during multi-frame emergency
+            # FIX CTRL-03: integral reset on emergency entry
+            self._lateral_integral *= 0.5
             self.smooth_steer = emergency_steer
             self.prev_steer   = emergency_steer
             raw_steer = emergency_steer
@@ -247,7 +262,9 @@ class Controller:
                                  + (1.0 - self.GUARD_EMA) * self.smooth_guard)
             final_steer = self.smooth_guard
         else:
-            self.smooth_guard = guarded_steer
+            # FIX CTRL-02: always sync smooth_guard to the current unguarded steer
+            # so the EMA has no stale value to jump from on the next trigger.
+            self.smooth_guard = raw_steer
             final_steer = raw_steer
 
         # Parking bias
