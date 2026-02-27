@@ -194,12 +194,14 @@ class Controller:
                 dr_conf = 0.5
             speed *= (0.4 + 0.4 * dr_conf)
 
-        # 4d. Left-lane-follow speed penalty
-        # Right outer edge is lost — car has switched to following the centre divider.
-        # Reduce speed by 30% (was 25%) to allow more correction time.
-        # Recovers automatically next frame sr becomes visible (anchor → RL_*).
-        if perc_res.anchor == "LEFT_LANE_FOLLOW":
-            speed *= 0.70
+        # 4d. Road-analysis speed penalty (replaces removed LEFT_LANE_FOLLOW)
+        # ROAD_ANALYSIS: surface probe found road extent — drive cautiously (65%).
+        # ROAD_PREDICT:  probe failed, dead reckoning active             — slow (50%).
+        # Both recover automatically when sr reappears (anchor → RL_*).
+        if perc_res.anchor == "ROAD_ANALYSIS":
+            speed *= 0.65
+        elif perc_res.anchor.startswith("ROAD_PREDICT"):
+            speed *= 0.50
 
         final_speed = speed * traffic_mult * guard_spd_mult
 
