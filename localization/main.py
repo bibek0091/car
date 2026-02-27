@@ -887,7 +887,9 @@ class Orchestrator:
                     self.hw.set_speed(0); self.hw.set_steering(0)
                     time.sleep(0.05); t_prev=time.time(); continue
 
-                raw_frame   = self.hw.read_camera() or np.zeros((480,640,3),np.uint8)
+                raw_frame   = self.hw.read_camera()
+                if raw_frame is None:
+                    raw_frame = np.zeros((480, 640, 3), np.uint8)
                 velocity_ms = self.hw.get_velocity_ms()
 
                 now = time.time()
