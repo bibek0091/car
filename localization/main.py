@@ -124,6 +124,16 @@ def pixel_to_map(px, py, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
     return px / img_w * map_w_m, (1.0 - py / img_h) * map_h_m
 
 
+def push_latest(q, item):
+    """Forcefully pushes the newest frame, dropping the oldest if full."""
+    if q.full():
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+    q.put(item)
+
+
 def _load_svg_as_cv2(svg_path, display_w=600, display_h=440):
     try:
         import cairosvg
@@ -881,21 +891,17 @@ class Orchestrator:
         try:
             while self.running:
                 ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
-                if not self._estop: self._fps = 0.7*self._fps + 0.3*(1.0/dt)
 
-                if self._estop:
-                    self.hw.set_speed(0); self.hw.set_steering(0)
-                    time.sleep(0.05); t_prev=time.time(); continue
-
+                # Always read camera & velocity so dashboard stays live
                 raw_frame   = self.hw.read_camera()
                 if raw_frame is None:
                     raw_frame = np.zeros((480, 640, 3), np.uint8)
                 velocity_ms = self.hw.get_velocity_ms()
 
-                now = time.time()
-                for n,t in list(self._blocked_nodes.items()):
-                    if now>=t: del self._blocked_nodes[n]
+                if not self._estop:
+                    self._fps = 0.7*self._fps + 0.3*(1.0/dt)
 
+                # --- TRAFFIC ENGINE (runs even in E-STOP for YOLO feed) ---
                 if self.traffic_engine:
                     x0,y0,_ = self.localizer.get_pose()
                     ei = {}
@@ -908,103 +914,118 @@ class Orchestrator:
                     t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
                 self._last_t_res = t_res
 
-                for lbl in t_res.active_labels:
-                    for kw in ("stop","traffic","highway","roundabout","parking",
-                               "crosswalk","priority","no-entry","speed"):
-                        if kw in lbl.lower():
-                            self._sign_history.append((lbl,0.9,time.time())); break
-
-                if ("NO-ENTRY" in t_res.reason and self._planned_path and self.localizer.planner):
-                    xne,yne,_ = self.localizer.get_pose()
-                    nn = self.localizer.planner.get_nearest_node(xne,yne)
-                    if nn and nn not in self._blocked_nodes:
-                        self._blocked_nodes[nn] = time.time()+30.0
-                        if nn in self.localizer.planner.graph:
-                            self.localizer.planner.graph.remove_node(nn)
-                            rem = [n for n in self.localizer.planner._node_ids
-                                   if n in self.localizer.planner.graph]
-                            import scipy.spatial
-                            self.localizer.planner._node_ids = rem
-                            self.localizer.planner._kdtree = scipy.spatial.KDTree(
-                                [self.localizer.planner.node_positions[n] for n in rem])
-                            ns2 = self.localizer.planner.get_nearest_node(xne,yne)
-                            np2 = self.localizer.planner.plan_route(ns2,self._target_node)
-                            self.localizer.planner.load_graph("Competition_track_graph.graphml")
-                            if np2:
-                                self._planned_path=np2; self._path_cursor=0
-                                self.localizer.reset_cursor()
-
-                if self.localizer.planner and self.localizer.is_initialized():
-                    xz,yz,_ = self.localizer.get_pose()
-                    mz = self.localizer.planner.get_zone(xz,yz)
-                    _zmf = _zmf+1 if mz!=t_res.zone_mode else 0
-                    if _zmf>=90 and self.traffic_engine:
-                        self.traffic_engine._zone_mode=mz; _zmf=0
-
-                extra_offset = -80.0 if t_res.state=="SYS_LANE_CHANGE_LEFT" else 0.0
-
-                if (self._planned_path and self.localizer.planner
-                        and 0<=self._path_cursor<len(self._planned_path)):
-                    node_now = self._planned_path[self._path_cursor]
-                    if self.localizer.planner.is_roundabout_node(node_now):
-                        if self._nav_state=="NORMAL": self._nav_state="ROUNDABOUT"
-                    elif self._nav_state=="ROUNDABOUT": self._nav_state="NORMAL"
-
-                perc = self.vision.process(
-                    raw_frame,
-                    extra_offset_px=extra_offset,
-                    nav_state=self._nav_state,
-                    velocity_ms=velocity_ms,
-                    curvature_hint=getattr(self._last_ctrl,'curvature_used',0.0))
-                self._last_conf = perc.confidence; self._last_perc = perc
-
-                self._nav_state = self.jct_detector.update(
-                    perc.warped_binary,perc.sl,perc.sr,perc.lane_width_px,t_res.active_labels)
-
-                if self._nav_state=="JUNCTION_PROMPT":
-                    if self._planned_path and self.localizer.planner:
-                        xj,yj,yj2 = self.localizer.get_pose()
-                        action = self.localizer.planner.get_next_action(
-                            xj,yj,yj2,path=self._planned_path,
-                            cursor=self._path_cursor,velocity_ms=velocity_ms)
-                        self._nav_state = f"JUNCTION_{action}"
-                    else: self._nav_state="JUNCTION_STRAIGHT"
-
-                self.localizer.update(
-                    velocity_ms=velocity_ms, dt=dt,
-                    camera_heading_rad=perc.heading_rad,
-                    camera_confidence=perc.confidence,
-                    heading_conf=perc.heading_conf,
-                    path=self._planned_path)
-                self._path_cursor = self.localizer.path_cursor
-
-                self.localizer.get_upcoming_curve_from_path(
-                    self._planned_path,self._path_cursor,velocity_ms)
-
-                ctrl = self.controller.compute(
-                    perc_res=perc, nav_state=self._nav_state,
-                    traffic_state=t_res.state, base_speed=float(self.base_speed),
-                    traffic_mult=t_res.speed_multiplier, zone_mode=t_res.zone_mode,
-                    parking_state=t_res.parking_state, steer_bias=t_res.steer_bias,
-                    upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
-                    visual_yaw_rate_rps=self.localizer.visual_yaw_rate,
-                    velocity_ms=velocity_ms, dt=dt)
-                self._last_ctrl = ctrl
-
-                _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
-                if _ll>=_LLS:
+                if self._estop:
+                    # Halted — keep motors off, reuse last perception for dashboard
                     self.hw.set_speed(0); self.hw.set_steering(0)
-                    self._estop=True; continue
+                    perc = self._last_perc if self._last_perc else self.vision.process(raw_frame)
+                    ctrl = self._last_ctrl
 
-                speed = ctrl.speed_pwm
-                if _ll>=_LLC: speed = min(speed,20.0)
-                if 0.0<speed<PWM_DEADBAND: speed=PWM_DEADBAND
-                self.hw.set_speed(speed); self.hw.set_steering(ctrl.steer_angle_deg)
+                else:
+                    # --- NORMAL DRIVING ---
+                    now = time.time()
+                    for n,t in list(self._blocked_nodes.items()):
+                        if now>=t: del self._blocked_nodes[n]
 
-                if not self._q_yolo.full(): self._q_yolo.put(t_res.yolo_debug_frame)
-                if not self._q_bev.full():  self._q_bev.put(_annotate_bev(perc,ctrl))
+                    for lbl in t_res.active_labels:
+                        for kw in ("stop","traffic","highway","roundabout","parking",
+                                   "crosswalk","priority","no-entry","speed"):
+                            if kw in lbl.lower():
+                                self._sign_history.append((lbl,0.9,time.time())); break
 
-                # VIZ-03: build localization panel
+                    if ("NO-ENTRY" in t_res.reason and self._planned_path and self.localizer.planner):
+                        xne,yne,_ = self.localizer.get_pose()
+                        nn = self.localizer.planner.get_nearest_node(xne,yne)
+                        if nn and nn not in self._blocked_nodes:
+                            self._blocked_nodes[nn] = time.time()+30.0
+                            if nn in self.localizer.planner.graph:
+                                self.localizer.planner.graph.remove_node(nn)
+                                rem = [n for n in self.localizer.planner._node_ids
+                                       if n in self.localizer.planner.graph]
+                                import scipy.spatial
+                                self.localizer.planner._node_ids = rem
+                                self.localizer.planner._kdtree = scipy.spatial.KDTree(
+                                    [self.localizer.planner.node_positions[n] for n in rem])
+                                ns2 = self.localizer.planner.get_nearest_node(xne,yne)
+                                np2 = self.localizer.planner.plan_route(ns2,self._target_node)
+                                self.localizer.planner.load_graph("Competition_track_graph.graphml")
+                                if np2:
+                                    self._planned_path=np2; self._path_cursor=0
+                                    self.localizer.reset_cursor()
+
+                    if self.localizer.planner and self.localizer.is_initialized():
+                        xz,yz,_ = self.localizer.get_pose()
+                        mz = self.localizer.planner.get_zone(xz,yz)
+                        _zmf = _zmf+1 if mz!=t_res.zone_mode else 0
+                        if _zmf>=90 and self.traffic_engine:
+                            self.traffic_engine._zone_mode=mz; _zmf=0
+
+                    extra_offset = -80.0 if t_res.state=="SYS_LANE_CHANGE_LEFT" else 0.0
+
+                    if (self._planned_path and self.localizer.planner
+                            and 0<=self._path_cursor<len(self._planned_path)):
+                        node_now = self._planned_path[self._path_cursor]
+                        if self.localizer.planner.is_roundabout_node(node_now):
+                            if self._nav_state=="NORMAL": self._nav_state="ROUNDABOUT"
+                        elif self._nav_state=="ROUNDABOUT": self._nav_state="NORMAL"
+
+                    perc = self.vision.process(
+                        raw_frame,
+                        extra_offset_px=extra_offset,
+                        nav_state=self._nav_state,
+                        velocity_ms=velocity_ms,
+                        curvature_hint=getattr(self._last_ctrl,'curvature_used',0.0))
+                    self._last_conf = perc.confidence; self._last_perc = perc
+
+                    self._nav_state = self.jct_detector.update(
+                        perc.warped_binary,perc.sl,perc.sr,perc.lane_width_px,t_res.active_labels)
+
+                    if self._nav_state=="JUNCTION_PROMPT":
+                        if self._planned_path and self.localizer.planner:
+                            xj,yj,yj2 = self.localizer.get_pose()
+                            action = self.localizer.planner.get_next_action(
+                                xj,yj,yj2,path=self._planned_path,
+                                cursor=self._path_cursor,velocity_ms=velocity_ms)
+                            self._nav_state = f"JUNCTION_{action}"
+                        else: self._nav_state="JUNCTION_STRAIGHT"
+
+                    self.localizer.update(
+                        velocity_ms=velocity_ms, dt=dt,
+                        camera_heading_rad=perc.heading_rad,
+                        camera_confidence=perc.confidence,
+                        heading_conf=perc.heading_conf,
+                        path=self._planned_path)
+                    self._path_cursor = self.localizer.path_cursor
+
+                    self.localizer.get_upcoming_curve_from_path(
+                        self._planned_path,self._path_cursor,velocity_ms)
+
+                    ctrl = self.controller.compute(
+                        perc_res=perc, nav_state=self._nav_state,
+                        traffic_state=t_res.state, base_speed=float(self.base_speed),
+                        traffic_mult=t_res.speed_multiplier, zone_mode=t_res.zone_mode,
+                        parking_state=t_res.parking_state, steer_bias=t_res.steer_bias,
+                        upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
+                        visual_yaw_rate_rps=self.localizer.visual_yaw_rate,
+                        velocity_ms=velocity_ms, dt=dt)
+                    self._last_ctrl = ctrl
+
+                    _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
+                    if _ll>=_LLS:
+                        self.hw.set_speed(0); self.hw.set_steering(0)
+                        self._estop=True
+                    else:
+                        speed = ctrl.speed_pwm
+                        if _ll>=_LLC: speed = min(speed,20.0)
+                        if 0.0<speed<PWM_DEADBAND: speed=PWM_DEADBAND
+                        self.hw.set_speed(speed); self.hw.set_steering(ctrl.steer_angle_deg)
+
+                # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
+                push_latest(self._q_yolo,
+                            t_res.yolo_debug_frame if t_res.yolo_debug_frame is not None
+                            else raw_frame)
+                push_latest(self._q_bev, _annotate_bev(perc, ctrl))
+
+                # VIZ-03: localization panel
                 sm     = getattr(self.localizer,'_snap_miss_frames',0)
                 lx,ly,lyaw = self.localizer.get_pose()
                 yr     = self.localizer.visual_yaw_rate
@@ -1020,7 +1041,7 @@ class Orchestrator:
                     l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
                     l2=bool(self._planned_path and perc.confidence>0.5),
                     l4=sm<5)
-                if not self._q_loc.full(): self._q_loc.put(loc_img)
+                push_latest(self._q_loc, loc_img)
 
                 elapsed = time.time()-ts
                 time.sleep(max(0.001, FRAME_PERIOD-elapsed))
@@ -1030,6 +1051,7 @@ class Orchestrator:
 
         log.info("Pilot loop exited")
         self.hw.set_speed(0); self.hw.set_steering(0)
+
 
     def _start_pilot(self):
         if self.running: return

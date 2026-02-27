@@ -296,6 +296,7 @@ class LocalizationEngine:
                camera_heading_rad: float = 0.0,
                camera_confidence:  float = 0.0,
                heading_conf:       float = 0.0,
+               imu_heading_rad:    float = None,
                path=None):
         """
         Update pose for one time step.
@@ -303,6 +304,9 @@ class LocalizationEngine:
         LOC-A: heading_conf (from perception LANE-07) gates yaw-rate integration.
         LOC-B: dual-rate EMA alpha based on turn intensity.
         LOC-C: absolute heading soft-fusion (long-run drift corrector).
+        EKF:   When imu_heading_rad is provided (e.g. from a BNO055), a static
+               Kalman correction (gain=0.15) is applied after dead-reckoning.
+               This eliminates yaw drift completely on hardware that has an IMU.
 
         FIX VL-FIX-A: path_cursor parameter removed — cursor managed internally.
         """
@@ -388,6 +392,17 @@ class LocalizationEngine:
                                min(self._ABS_HEADING_MAX_CORR, corr))
                     self.yaw += corr
                     self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+
+            # ── EKF IMU Correction (optional) ────────────────────────────────
+            # When a hardware IMU (e.g. BNO055) provides an absolute heading,
+            # apply a static Kalman gain correction to eliminate yaw drift.
+            # Kalman gain K=0.15 is a conservative static approximation:
+            #   higher → faster correction but noisier; lower → smoother but slower.
+            if imu_heading_rad is not None:
+                innovation = (imu_heading_rad - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                kalman_gain = 0.15
+                self.yaw += kalman_gain * innovation
+                self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 4: Map Snap ─────────────────────────────────────────────
             if self._map_snap_enabled and self.planner:

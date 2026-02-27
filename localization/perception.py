@@ -662,13 +662,29 @@ class VisionPipeline:
                 extra_offset_px: float = 0.0,
                 nav_state:       str   = "NORMAL",
                 velocity_ms:     float = 0.0,
-                curvature_hint:  float = 0.0) -> PerceptionResult:
+                curvature_hint:  float = 0.0,
+                pitch_rad:       float = 0.0) -> PerceptionResult:
         """
         LANE-08: velocity_ms and curvature_hint drive adaptive Y_EVAL.
+        PITCH: pitch_rad shifts the top BEV source points to compensate for
+               camera tilt caused by acceleration/braking.
         """
         if frame_bgr.shape[:2] != (480, 640):
             frame_bgr = cv2.resize(frame_bgr, (640, 480))
-        warped = cv2.warpPerspective(frame_bgr, self.M, (640, 480))
+
+        # --- DYNAMIC HORIZON COMPENSATION ---
+        # Shift the two upper source points vertically by pitch (px per radian).
+        # Positive pitch (nose-down on braking) moves horizon up → negative shift.
+        pitch_px_shift = int(pitch_rad * 400)
+        dynamic_src = np.float32([
+            [self.SRC_PTS[0][0], self.SRC_PTS[0][1] + pitch_px_shift],
+            [self.SRC_PTS[1][0], self.SRC_PTS[1][1] + pitch_px_shift],
+            self.SRC_PTS[2],
+            self.SRC_PTS[3],
+        ])
+        dynamic_M = cv2.getPerspectiveTransform(dynamic_src, self.DST_PTS)
+
+        warped = cv2.warpPerspective(frame_bgr, dynamic_M, (640, 480))
 
         # LANE-01 (v5): multi-cue binary with ROI mask (LANE-12)
         binary = _build_robust_binary(warped, self.clahe, roi_mask=self._roi_mask)
