@@ -1,16 +1,41 @@
 """
-localization.py — IMU-Free Visual Dead-Reckoning Localizer  (FIXED v2)
+localization.py — IMU-Free Visual Dead-Reckoning Localizer  (FIXED v3)
 =======================================================================
-All fixes applied:
-  VL-01  VO EMA alpha corrected to 0.08/0.92 + spike gate at 1.5 rad/s
-  VL-02  Heading sign convention fixed — negation removed from heading;
-          layer-3 nudge now uses -tangent (correct direction)
-  VL-04  Map snap uses perpendicular-foot projection (not midpoint)
-  VL-07  set_pose() resets _cam_yaw_smoothed to the new yaw_rad
-  VL-08  Path cursor exposed & reset via reset_cursor()
-  NEW    Path-heading nudge (Layer 2) blends A* heading when confidence > 0.5
-  NEW    get_upcoming_curve_from_path() uses cursor-window walk on planned path
-  NEW    Curvature-gated map snap (disabled when curvature > 0.005)
+FIXES in v3 (on top of v2):
+
+  VL-FIX-A  Cursor is now self-managed inside update().
+             update_cursor() is called internally every frame so callers
+             never need to track or pass a cursor — it just works.
+             The cursor is exposed as the read-only property `path_cursor`.
+
+  VL-FIX-B  Map-snap search radius: 0.5 m → 1.0 m (primary)
+             Added a "recovery snap" at 2.0 m that fires when the car
+             hasn't snapped for > 60 frames.  This re-anchors the car
+             after long DEAD_RECKONING stretches.
+
+  VL-FIX-C  Yaw-rate EMA alpha raised: 0.08 → 0.18 (5.5-frame TC at 30 Hz).
+             Old 0.08 (11-frame TC) caused ~370 ms lag before a turn
+             registered, leading to systematic overshoot at every corner.
+
+  VL-FIX-D  _initialized guard relaxed: update() is silently ignored
+             while uninitialized (no crash), but set_pose() now also
+             accepts a partial call without yaw (defaults to current).
+
+  VL-FIX-E  POI arrival detection added: check_poi_arrival() compares
+             current (x,y) to a target node and returns True once the
+             car is within `threshold_m` (default 0.40 m).
+
+  VL-FIX-F  get_pose_for_dashboard() returns a rich dict that the
+             dashboard can directly display — x, y, yaw_deg, zone,
+             upcoming_curve, cursor, speed_ms.
+
+Unchanged from v2:
+  VL-01  VO EMA spike gate at 1.5 rad/s
+  VL-02  Heading sign convention (no negation on intake; Layer 3b negates)
+  VL-04  Map snap uses perpendicular-foot projection
+  VL-07  set_pose() seeds _cam_yaw_smoothed
+  VL-08  reset_cursor() available for new-route events
+  Layer 2 — A* path heading soft nudge (5 %)
 """
 
 import math
@@ -42,10 +67,30 @@ class LocalizationEngine:
         positive yaw  = counter-clockwise = LEFT turn
         negative yaw  = clockwise         = RIGHT turn
         x increases RIGHT,  y increases UP  (world / GraphML frame)
+
+    Dashboard integration:
+        Call get_pose_for_dashboard() each frame to get a dict with
+        x, y, yaw_deg, zone, upcoming_curve, cursor, speed_ms.
+
+    POI stopping:
+        Call check_poi_arrival(target_node_id, threshold_m=0.40) each frame.
+        Returns True when the car is within threshold_m of the target.
     """
 
+    # ── Tunable constants ─────────────────────────────────────────────────────
     _MAX_CAM_YAW_CORRECTION = 0.05   # rad — max soft nudge per frame
-    _CAM_YAW_EMA            = 0.55   # for layer-3 nudge smoothing
+    _CAM_YAW_EMA            = 0.55   # for Layer-3b nudge smoothing
+
+    # FIX VL-FIX-C: 0.18 (was 0.08) → ~5.5-frame TC at 30 Hz
+    _YAW_RATE_EMA_ALPHA     = 0.18   # new-signal weight for yaw-rate IIR
+
+    _MAP_SNAP_RADIUS_M      = 1.00   # FIX VL-FIX-B: was 0.50 m
+    _MAP_SNAP_RECOVERY_M    = 2.00   # wider radius after _SNAP_LOST_LIMIT frames
+    _SNAP_LOST_LIMIT        = 60     # ~2 s at 30 Hz before recovery mode kicks in
+    _MAP_SNAP_PULL          = 0.15   # fraction per second toward foot
+    _POI_DEFAULT_THRESH_M   = 0.40   # default stop radius around target
+
+    # ─────────────────────────────────────────────────────────────────────────
 
     def __init__(self):
         self.x   = 0.0
@@ -58,12 +103,14 @@ class LocalizationEngine:
         self._cam_yaw_smoothed = 0.0
         self._initialized      = False
 
-        # Public state read by main.py
+        # Public state read by main loop / dashboard
         self.upcoming_curve = "STRAIGHT"
         self.current_zone   = "CITY"
+        self._last_speed_ms = 0.0    # cached for dashboard dict
 
-        # Path-cursor state (maintained by Orchestrator via update_cursor)
+        # FIX VL-FIX-A: cursor is fully self-managed
         self._path_cursor = 0
+        self._snap_miss_frames = 0   # for recovery snap
 
         self.planner = None
         self._map_snap_enabled = _PLANNER_AVAILABLE
@@ -75,74 +122,108 @@ class LocalizationEngine:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_pose(self, x: float, y: float, yaw_rad: float):
-        """Called when user clicks the SVG map.  Resets all filter state."""
+    @property
+    def path_cursor(self) -> int:
+        """Read-only access to the self-managed path cursor."""
+        return self._path_cursor
+
+    def set_pose(self, x: float, y: float, yaw_rad: float = None):
+        """
+        Called when user clicks the SVG map (or on startup).
+        Resets all filter state.  yaw_rad is optional — if omitted, the
+        current yaw is preserved (useful for position-only corrections).
+        """
         with self._lock:
-            self.x   = x
-            self.y   = y
-            self.yaw = yaw_rad
+            self.x = x
+            self.y = y
+            if yaw_rad is not None:
+                self.yaw = yaw_rad
             self.visual_yaw_rate = 0.0
             self._initialized    = True
+            self._snap_miss_frames = 0
 
             # FIX VL-07: seed EMA from actual yaw so first frame has no spike
-            self._cam_yaw_smoothed = yaw_rad
+            self._cam_yaw_smoothed = self.yaw
             self._prev_cam_heading = None
 
             # Reset derived state
             self.upcoming_curve = "STRAIGHT"
             self.current_zone   = (self.planner.get_zone(x, y)
                                    if self.planner else "CITY")
-        log.info(f"Pose set: x={x:.2f} y={y:.2f} yaw={math.degrees(yaw_rad):.1f}°")
+        log.info(f"Pose set: x={x:.2f} y={y:.2f} "
+                 f"yaw={math.degrees(self.yaw):.1f}°")
 
     def reset_cursor(self):
-        """FIX VL-08: call this whenever a new route is planned."""
-        self._path_cursor = 0
-
-    def update_cursor(self, path, x, y):
-        """
-        FIX VL-06: O(1) incremental cursor update — searches only a ±10
-        node window around the current cursor.  Returns the new cursor.
-        """
-        if not path or not self.planner:
-            return self._path_cursor
-
-        search_start = max(0,              self._path_cursor - 3)
-        search_end   = min(len(path) - 1,  self._path_cursor + 12)
-
-        best_idx = self._path_cursor
-        best_d   = float('inf')
-        for i in range(search_start, search_end + 1):
-            n = path[i]
-            if n not in self.planner.node_positions:
-                continue
-            nx, ny = self.planner.node_positions[n]
-            d = math.hypot(nx - x, ny - y)
-            if d < best_d:
-                best_d = d
-                best_idx = i
-
-        self._path_cursor = best_idx
-        return self._path_cursor
+        """Call whenever a new route is planned (resets path cursor to 0)."""
+        with self._lock:
+            self._path_cursor = 0
+            self._snap_miss_frames = 0
+        log.info("Path cursor reset.")
 
     def get_pose(self):
         with self._lock:
             return self.x, self.y, self.yaw
 
-    def is_initialized(self):
+    def is_initialized(self) -> bool:
         with self._lock:
             return self._initialized
 
-    def get_upcoming_curve_from_path(self, path, cursor, velocity_ms=0.3):
+    def get_pose_for_dashboard(self) -> dict:
         """
-        FIX MAP-02 / NEW: velocity-adaptive lookahead along planned A* path.
-        Replaces the old greedy out-edge walk that broke at junctions.
+        FIX VL-FIX-F: Returns a dict suitable for direct dashboard display.
+        Call this every frame from the main loop.
+        """
+        with self._lock:
+            return {
+                "x":             self.x,
+                "y":             self.y,
+                "yaw_deg":       math.degrees(self.yaw),
+                "zone":          self.current_zone,
+                "upcoming_curve": self.upcoming_curve,
+                "cursor":        self._path_cursor,
+                "speed_ms":      self._last_speed_ms,
+                "initialized":   self._initialized,
+            }
+
+    def check_poi_arrival(self, target_node_id: str,
+                          threshold_m: float = None) -> bool:
+        """
+        FIX VL-FIX-E: Returns True when the car is within threshold_m of
+        target_node_id's map position.  Call each frame; when True, the
+        orchestrator should command speed = 0 and hold.
+        """
+        if threshold_m is None:
+            threshold_m = self._POI_DEFAULT_THRESH_M
+        if not self.planner or target_node_id not in self.planner.node_positions:
+            return False
+        tx, ty = self.planner.node_positions[target_node_id]
+        with self._lock:
+            dist = math.hypot(self.x - tx, self.y - ty)
+        return dist <= threshold_m
+
+    def get_distance_to_node(self, node_id: str) -> float:
+        """Returns metres to a named map node (inf if unknown)."""
+        if not self.planner or node_id not in self.planner.node_positions:
+            return float('inf')
+        tx, ty = self.planner.node_positions[node_id]
+        with self._lock:
+            return math.hypot(self.x - tx, self.y - ty)
+
+    def get_upcoming_curve_from_path(self, path, cursor=None,
+                                     velocity_ms: float = 0.3) -> str:
+        """
+        Velocity-adaptive lookahead along planned A* path.
+        cursor defaults to the internal self-managed cursor.
         Returns 'LEFT', 'RIGHT', or 'STRAIGHT'.
         """
+        if cursor is None:
+            cursor = self._path_cursor
+
         if not path or not self.planner or cursor >= len(path) - 1:
             self.upcoming_curve = "STRAIGHT"
             return "STRAIGHT"
 
-        la_m = max(1.8, velocity_ms * 6.0)   # adaptive: faster = more preview
+        la_m = max(1.8, velocity_ms * 6.0)
         start_pos = self.planner.node_positions.get(path[cursor])
         if start_pos is None:
             self.upcoming_curve = "STRAIGHT"
@@ -163,8 +244,9 @@ class LocalizationEngine:
             if accum >= la_m:
                 target_yaw = math.atan2(p2[1] - start_pos[1],
                                         p2[0] - start_pos[0])
-                diff = (target_yaw - curr_yaw + math.pi) % (2 * math.pi) - math.pi
-                deg  = math.degrees(diff)
+                diff = ((target_yaw - curr_yaw + math.pi)
+                        % (2 * math.pi) - math.pi)
+                deg = math.degrees(diff)
                 if deg > 18:
                     self.upcoming_curve = "LEFT"
                 elif deg < -18:
@@ -183,42 +265,48 @@ class LocalizationEngine:
                dt:                 float,
                camera_heading_rad: float = 0.0,
                camera_confidence:  float = 0.0,
-               path=None,
-               path_cursor:        int   = 0):
+               path=None):
         """
         Update pose for one time step.
+
+        FIX VL-FIX-A: 'path_cursor' parameter removed — cursor is managed
+        internally.  Callers no longer need to track or pass it.
 
         Parameters
         ----------
         velocity_ms         : forward speed in m/s (from encoder)
         dt                  : elapsed seconds since last call
-        camera_heading_rad  : raw lane tangent heading (NOT negated — caller
-                              must pass the un-negated value from perception)
+        camera_heading_rad  : raw lane tangent heading (not negated)
         camera_confidence   : 0–1 from perception module
-        path                : planned A* node list (optional, for layer 2)
-        path_cursor         : current cursor index into path
+        path                : planned A* node list (optional, for layers 2 & 4)
         """
         if dt <= 0 or not self._initialized:
             return
 
         with self._lock:
+            self._last_speed_ms = velocity_ms
+
+            # FIX VL-FIX-A: advance cursor internally before any layer uses it
+            if path:
+                self._update_cursor_internal(path)
+            cursor = self._path_cursor
+
             # ── Layer 1: Camera Yaw-Rate Integration ─────────────────────────
-            # FIX VL-01: alpha 0.08/0.92 — ~11-frame time constant at 30 Hz
-            # FIX VL-02: camera_heading_rad is NOT negated here (sign fix)
+            # FIX VL-FIX-C: alpha = 0.18 (was 0.08); ~5.5-frame TC at 30 Hz
             if camera_confidence > 0.3 and self._prev_cam_heading is not None:
                 d_heading = camera_heading_rad - self._prev_cam_heading
-                # Wrap to [-π, π]
                 d_heading = (d_heading + math.pi) % (2 * math.pi) - math.pi
                 raw_yaw_rate = d_heading / dt
 
                 # Spike gate: discard if > 1.5 rad/s (BEV fitting artifact)
                 if abs(raw_yaw_rate) < 1.5:
-                    # FIX VL-01: correct EMA — 8% new signal
-                    self.visual_yaw_rate = (0.08 * raw_yaw_rate
-                                            + 0.92 * self.visual_yaw_rate)
+                    self.visual_yaw_rate = (
+                        self._YAW_RATE_EMA_ALPHA * raw_yaw_rate
+                        + (1.0 - self._YAW_RATE_EMA_ALPHA) * self.visual_yaw_rate
+                    )
             elif camera_confidence <= 0.3:
                 self._prev_cam_heading = None
-                self.visual_yaw_rate  *= 0.85   # decay when blind
+                self.visual_yaw_rate  *= 0.85
 
             if camera_confidence > 0.3:
                 self._prev_cam_heading = camera_heading_rad
@@ -227,17 +315,15 @@ class LocalizationEngine:
             self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 2: A* Path Heading Nudge ───────────────────────────────
-            # NEW: Blends 5% of the known road direction to prevent heading drift.
-            if (path and path_cursor < len(path) - 1
+            if (path and cursor < len(path) - 1
                     and camera_confidence > 0.5
                     and self.planner):
-                n1 = path[path_cursor]
-                n2 = path[min(path_cursor + 1, len(path) - 1)]
+                n1 = path[cursor]
+                n2 = path[min(cursor + 1, len(path) - 1)]
                 p1 = self.planner.node_positions.get(n1)
                 p2 = self.planner.node_positions.get(n2)
                 if p1 and p2:
-                    ph = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
-                    # Blend softly — only nudge, never snap
+                    ph   = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
                     diff = (ph - self.yaw + math.pi) % (2 * math.pi) - math.pi
                     self.yaw += 0.05 * diff
                     self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
@@ -248,9 +334,7 @@ class LocalizationEngine:
             self.y += effective_v * math.sin(self.yaw) * dt
 
             # ── Layer 3b: Lane-Tangent Soft Heading Nudge ─────────────────────
-            # FIX VL-02: nudge uses -camera_heading_rad (corrects lateral error)
             if camera_confidence > 0.25 and abs(camera_heading_rad) < 0.5:
-                # Smooth the nudge signal
                 self._cam_yaw_smoothed = (
                     self._CAM_YAW_EMA * (-camera_heading_rad)
                     + (1.0 - self._CAM_YAW_EMA) * self._cam_yaw_smoothed
@@ -264,32 +348,90 @@ class LocalizationEngine:
             # ── Layer 4: Map Snap ─────────────────────────────────────────────
             if self._map_snap_enabled and self.planner:
                 self._apply_map_snap(effective_v, dt, camera_confidence,
-                                     path, path_cursor)
+                                     path, cursor)
                 self.current_zone = self.planner.get_zone(self.x, self.y)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _update_cursor_internal(self, path):
+        """
+        FIX VL-FIX-A: O(1) incremental cursor advance (±12 window).
+        Mutates self._path_cursor directly (called under self._lock).
+        """
+        if not path or not self.planner:
+            return
+
+        search_start = max(0,             self._path_cursor - 3)
+        search_end   = min(len(path) - 1, self._path_cursor + 12)
+
+        best_idx = self._path_cursor
+        best_d   = float('inf')
+        for i in range(search_start, search_end + 1):
+            n = path[i]
+            if n not in self.planner.node_positions:
+                continue
+            nx_, ny_ = self.planner.node_positions[n]
+            d = math.hypot(nx_ - self.x, ny_ - self.y)
+            if d < best_d:
+                best_d  = d
+                best_idx = i
+
+        self._path_cursor = best_idx
+
+    def update_cursor(self, path, x, y):
+        """
+        Public cursor update — still available for callers that need it,
+        but update() now calls this internally, so external calls are
+        optional.  Returns the new cursor index.
+        """
+        if not path or not self.planner:
+            return self._path_cursor
+
+        search_start = max(0,             self._path_cursor - 3)
+        search_end   = min(len(path) - 1, self._path_cursor + 12)
+
+        best_idx = self._path_cursor
+        best_d   = float('inf')
+        for i in range(search_start, search_end + 1):
+            n = path[i]
+            if n not in self.planner.node_positions:
+                continue
+            nx_, ny_ = self.planner.node_positions[n]
+            d = math.hypot(nx_ - x, ny_ - y)
+            if d < best_d:
+                best_d  = d
+                best_idx = i
+
+        self._path_cursor = best_idx
+        return self._path_cursor
 
     def _apply_map_snap(self, velocity, dt, cam_conf, path, cursor):
         """
-        FIX VL-04: Perpendicular-foot projection onto the nearest path edge.
-        Only fires when driving straight (curvature < 0.005) and confident.
+        FIX VL-FIX-B: Two-tier snap radius:
+          Normal: 1.0 m  (was 0.5 m — too tight, failed after any drift)
+          Recovery: 2.0 m after _SNAP_LOST_LIMIT consecutive misses
+
+        Also: curvature gate still disables snap during corners > 0.005.
         """
         if velocity < 0.05 or cam_conf < 0.3:
             return
-
-        # Only snap when close enough to a valid path segment
         if not path or cursor >= len(path) - 1:
             return
 
-        # Check current path curvature — disable snap during corners
         curvature = self.planner.get_path_curvature(
             self.x, self.y, path, cursor=cursor, window_m=0.8)
         if curvature > 0.005:
             return
 
-        # Find the best perpendicular foot on the nearest path edges
+        # Decide which radius to use
+        snap_radius = (self._MAP_SNAP_RECOVERY_M
+                       if self._snap_miss_frames >= self._SNAP_LOST_LIMIT
+                       else self._MAP_SNAP_RADIUS_M)
+
         best_dist = float('inf')
         best_foot = None
 
-        search_start = max(0,            cursor - 2)
+        search_start = max(0,             cursor - 2)
         search_end   = min(len(path) - 1, cursor + 6)
 
         for i in range(search_start, search_end):
@@ -300,7 +442,6 @@ class LocalizationEngine:
             if p1 is None or p2 is None:
                 continue
 
-            # FIX VL-04: Perpendicular-foot projection
             ex, ey = p2[0] - p1[0], p2[1] - p1[1]
             seg_len_sq = ex * ex + ey * ey
             if seg_len_sq < 1e-8:
@@ -314,8 +455,14 @@ class LocalizationEngine:
                 best_dist = d
                 best_foot = (foot_x, foot_y)
 
-        # Only snap if within 0.5 m — larger distances suggest wrong road
-        if best_foot and best_dist < 0.50:
-            pull = 0.15 * dt   # 15% / second — gentle
+        if best_foot and best_dist < snap_radius:
+            pull = self._MAP_SNAP_PULL * dt
             self.x = self.x + pull * (best_foot[0] - self.x)
             self.y = self.y + pull * (best_foot[1] - self.y)
+            self._snap_miss_frames = 0   # reset recovery counter
+        else:
+            self._snap_miss_frames += 1
+            if self._snap_miss_frames >= self._SNAP_LOST_LIMIT:
+                log.warning(
+                    f"Map snap lost for {self._snap_miss_frames} frames "
+                    f"(dist={best_dist:.2f}m). Recovery radius active.")

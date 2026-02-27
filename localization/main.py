@@ -983,20 +983,20 @@ class Orchestrator:
                 # ── 8. Camera heading (FIX VL-02: pass raw un-negated value) ──
                 cam_heading = estimate_heading_from_lanes(perc.sl, perc.sr)
 
-                # ── 9. FIX VL-06: incremental cursor update ───────────────────
-                xc, yc, _ = self.localizer.get_pose()
-                self._path_cursor = self.localizer.update_cursor(
-                    self._planned_path, xc, yc)
-
-                # ── 10. Localizer update ──────────────────────────────────────
+                # ── 9 + 10. Localizer update (cursor is self-managed inside) ──
+                # NOTE: update() internally calls _update_cursor_internal() so we
+                # must NOT also call update_cursor() externally — that caused a
+                # double-advance that broke map-snap segment selection (Bug #2).
+                # NOTE: path_cursor kwarg removed — not in update() signature (Bug #1).
                 self.localizer.update(
                     velocity_ms       = velocity_ms,
                     dt                = dt,
                     camera_heading_rad= cam_heading,
                     camera_confidence = perc.confidence,
                     path              = self._planned_path,
-                    path_cursor       = self._path_cursor,
                 )
+                # Sync orchestrator cursor from the authoritative localizer value
+                self._path_cursor = self.localizer.path_cursor
 
                 # ── 11. Upcoming curve from path ──────────────────────────────
                 self.localizer.get_upcoming_curve_from_path(

@@ -200,12 +200,15 @@ class Controller:
             # ── Layer 1: Pure Pursuit ─────────────────────────────────────────
             raw_steer = self._pure_pursuit(target_x, la_px, lw)
 
-            # Map anticipation (blind driving only)
-            if confidence < 0.30:
-                if upcoming_curve == "LEFT":
-                    raw_steer -= 15.0
-                elif upcoming_curve == "RIGHT":
-                    raw_steer += 15.0
+            # Map anticipation — proactive lean-in at ALL confidence levels.
+            # 5° constant lean-in keeps the car on the inside of upcoming curves
+            # while the lane tracker still dominates.  Adds up to 10° extra as
+            # confidence drops toward zero (blind driving).
+            _blind_extra = max(0.0, (0.30 - confidence) / 0.30)
+            if upcoming_curve == "LEFT":
+                raw_steer -= (5.0 + 10.0 * _blind_extra)
+            elif upcoming_curve == "RIGHT":
+                raw_steer += (5.0 + 10.0 * _blind_extra)
 
             # FIX VC-03: VO feed-forward removed — it double-counted yaw
             # correction already applied by the localizer.

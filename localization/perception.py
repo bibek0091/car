@@ -307,7 +307,7 @@ class HybridLaneTracker:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 class VisionPipeline:
-    DUAL_OFFSET_PX        =   0
+    DUAL_OFFSET_PX        =  35   # right-hand traffic: aim right of centre divider
     SINGLE_DIV_OFFSET_PX  =  40
     SINGLE_EDGE_OFFSET_PX = -40
     Y_EVAL = 400
