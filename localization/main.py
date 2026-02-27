@@ -541,150 +541,150 @@ class Orchestrator:
                 dt      = max(t_start - t_prev, 0.001)
                 t_prev  = t_start
 
-            # ── FPS ──────────────────────────────────────────────────────────
-            self._fps = 0.7 * self._fps + 0.3 * (1.0 / dt)
+                # ── FPS ──────────────────────────────────────────────────────────
+                self._fps = 0.7 * self._fps + 0.3 * (1.0 / dt)
 
-            # ── E-STOP guard ─────────────────────────────────────────────────
-            if self._estop:
-                self.hw.set_speed(0)
-                self.hw.set_steering(0)
-                time.sleep(0.05)
-                continue
+                # ── E-STOP guard ─────────────────────────────────────────────────
+                if self._estop:
+                    self.hw.set_speed(0)
+                    self.hw.set_steering(0)
+                    time.sleep(0.05)
+                    continue
 
-            # ── 1. Capture frame ─────────────────────────────────────────────
-            raw_frame = self.hw.read_camera()
-            if raw_frame is None:
-                raw_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                # ── 1. Capture frame ─────────────────────────────────────────────
+                raw_frame = self.hw.read_camera()
+                if raw_frame is None:
+                    raw_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-            # ── 2. IMU data (Removed - Visual Odometry Active) ───────────────
-            pass
+                # ── 2. IMU data (Removed - Visual Odometry Active) ───────────────
+                pass
 
-            # ── 3. Hardware velocity ─────────────────────────────────────────
-            velocity_ms = self.hw.get_velocity_ms()
+                # ── 3. Hardware velocity ─────────────────────────────────────────
+                velocity_ms = self.hw.get_velocity_ms()
 
-            # ── 4. YOLO (traffic) ─────────────────────────────────────────────
-            if self.traffic_engine:
-                t_res = self.traffic_engine.process(raw_frame)
-            else:
-                from traffic_module import TrafficResult
-                t_res = TrafficResult(
-                    state="SYS_GO", reason="NO YOLO",
-                    speed_multiplier=1.0, zone_mode="CITY",
-                    parking_state="NONE", steer_bias=0.0,
-                    pedestrian_blocking=False, light_status="NONE",
-                    active_labels=[], yolo_debug_frame=raw_frame.copy()
-                )
-            self._last_t_res = t_res
-
-            # ── 5. Lane perception (V3 VisionPipeline) ──────────────────────
-            extra_offset = 0.0
-            if t_res.state == "SYS_LANE_CHANGE_LEFT":
-                extra_offset = -80.0    # shift target left
-
-            perc = self.vision.process(
-                raw_frame,
-                extra_offset_px=extra_offset,
-                nav_state=self._nav_state
-            )
-
-            # ── 6. Junction detection & Path Routing ──────────────────────────
-            self._nav_state = self.jct_detector.update(
-                perc.warped_binary,
-                perc.sl, perc.sr,
-                perc.lane_width_px,
-                t_res.active_labels
-            )
-
-            # If the detector prompts us for a choice at a junction, query A* path
-            if self._nav_state == "JUNCTION_PROMPT":
-                if self._planned_path and self.localizer.planner:
-                    x, y, yaw = self.localizer.get_pose()
-                    
-                    # Find our current nearest node cursor
-                    nearest = self.localizer.planner.get_nearest_node(x, y)
-                    cursor = 0
-                    if nearest in self._planned_path:
-                        cursor = self._planned_path.index(nearest)
-
-                    # Determine turn direction
-                    action = self.localizer.planner.get_next_action(
-                        current_x=x, current_y=y, current_yaw=yaw,
-                        path=self._planned_path, cursor=cursor
-                    )
-                    
-                    # E.g. "LEFT" -> "JUNCTION_LEFT"
-                    self._nav_state = f"JUNCTION_{action}"
-                    log.info(f"📍 Junction Reached at {nearest}. Routing: {action}")
+                # ── 4. YOLO (traffic) ─────────────────────────────────────────────
+                if self.traffic_engine:
+                    t_res = self.traffic_engine.process(raw_frame)
                 else:
-                    self._nav_state = "JUNCTION_STRAIGHT"  # default fail-safe
+                    from traffic_module import TrafficResult
+                    t_res = TrafficResult(
+                        state="SYS_GO", reason="NO YOLO",
+                        speed_multiplier=1.0, zone_mode="CITY",
+                        parking_state="NONE", steer_bias=0.0,
+                        pedestrian_blocking=False, light_status="NONE",
+                        active_labels=[], yolo_debug_frame=raw_frame.copy()
+                    )
+                self._last_t_res = t_res
 
-            # ── 7. Camera heading for localizer ─────────────────────────────
-            cam_heading = estimate_heading_from_lanes(perc.sl, perc.sr)
+                # ── 5. Lane perception (V3 VisionPipeline) ──────────────────────
+                extra_offset = 0.0
+                if t_res.state == "SYS_LANE_CHANGE_LEFT":
+                    extra_offset = -80.0    # shift target left
 
-            # ── 8. Localizer update ──────────────────────────────────────────
-            self.localizer.update(
-                velocity_ms       = velocity_ms,
-                dt                = dt,
-                camera_heading_rad= cam_heading,
-                camera_confidence = perc.confidence
-            )
+                perc = self.vision.process(
+                    raw_frame,
+                    extra_offset_px=extra_offset,
+                    nav_state=self._nav_state
+                )
 
-            # ── 9. Controller ────────────────────────────────────────────────
-            map_ahead = getattr(self.localizer, "upcoming_curve", "STRAIGHT")
+                # ── 6. Junction detection & Path Routing ──────────────────────────
+                self._nav_state = self.jct_detector.update(
+                    perc.warped_binary,
+                    perc.sl, perc.sr,
+                    perc.lane_width_px,
+                    t_res.active_labels
+                )
+
+                # If the detector prompts us for a choice at a junction, query A* path
+                if self._nav_state == "JUNCTION_PROMPT":
+                    if self._planned_path and self.localizer.planner:
+                        x, y, yaw = self.localizer.get_pose()
+                    
+                        # Find our current nearest node cursor
+                        nearest = self.localizer.planner.get_nearest_node(x, y)
+                        cursor = 0
+                        if nearest in self._planned_path:
+                            cursor = self._planned_path.index(nearest)
+
+                        # Determine turn direction
+                        action = self.localizer.planner.get_next_action(
+                            current_x=x, current_y=y, current_yaw=yaw,
+                            path=self._planned_path, cursor=cursor
+                        )
+                    
+                        # E.g. "LEFT" -> "JUNCTION_LEFT"
+                        self._nav_state = f"JUNCTION_{action}"
+                        log.info(f"📍 Junction Reached at {nearest}. Routing: {action}")
+                    else:
+                        self._nav_state = "JUNCTION_STRAIGHT"  # default fail-safe
+
+                # ── 7. Camera heading for localizer ─────────────────────────────
+                cam_heading = estimate_heading_from_lanes(perc.sl, perc.sr)
+
+                # ── 8. Localizer update ──────────────────────────────────────────
+                self.localizer.update(
+                    velocity_ms       = velocity_ms,
+                    dt                = dt,
+                    camera_heading_rad= cam_heading,
+                    camera_confidence = perc.confidence
+                )
+
+                # ── 9. Controller ────────────────────────────────────────────────
+                map_ahead = getattr(self.localizer, "upcoming_curve", "STRAIGHT")
             
-            ctrl = self.controller.compute(
-                perc_res      = perc,
-                nav_state     = self._nav_state,
-                traffic_state = t_res.state,
-                base_speed    = float(self.base_speed),
-                traffic_mult  = t_res.speed_multiplier,
-                zone_mode     = t_res.zone_mode,
-                parking_state = t_res.parking_state,
-                steer_bias    = t_res.steer_bias,
-                upcoming_curve= map_ahead,
-                visual_yaw_rate_rps = self.localizer.visual_yaw_rate,
-                velocity_ms   = velocity_ms,
-                dt            = dt,
-            )
-            self._last_ctrl = ctrl
+                ctrl = self.controller.compute(
+                    perc_res      = perc,
+                    nav_state     = self._nav_state,
+                    traffic_state = t_res.state,
+                    base_speed    = float(self.base_speed),
+                    traffic_mult  = t_res.speed_multiplier,
+                    zone_mode     = t_res.zone_mode,
+                    parking_state = t_res.parking_state,
+                    steer_bias    = t_res.steer_bias,
+                    upcoming_curve= map_ahead,
+                    visual_yaw_rate_rps = self.localizer.visual_yaw_rate,
+                    velocity_ms   = velocity_ms,
+                    dt            = dt,
+                )
+                self._last_ctrl = ctrl
 
-            # ── LANE-HOLD SAFETY: consecutive blind-frame guard ──────────────
-            if perc.sl is None and perc.sr is None:
-                _lane_lost_frames += 1
-            else:
-                _lane_lost_frames = 0   # reset as soon as ANY line reappears
+                # ── LANE-HOLD SAFETY: consecutive blind-frame guard ──────────────
+                if perc.sl is None and perc.sr is None:
+                    _lane_lost_frames += 1
+                else:
+                    _lane_lost_frames = 0   # reset as soon as ANY line reappears
 
-            if _lane_lost_frames >= _LANE_LOST_STOP:
-                # 3 consecutive seconds with zero lane — stop the car
-                self.hw.set_speed(0)
-                self.hw.set_steering(0)
-                log.error(f"LANE LOST for {_lane_lost_frames} frames — emergency stop")
-                self._estop = True
-                continue
+                if _lane_lost_frames >= _LANE_LOST_STOP:
+                    # 3 consecutive seconds with zero lane — stop the car
+                    self.hw.set_speed(0)
+                    self.hw.set_steering(0)
+                    log.error(f"LANE LOST for {_lane_lost_frames} frames — emergency stop")
+                    self._estop = True
+                    continue
 
-            # ── 10. PWM deadband + blind-frame speed cap ─────────────────────
-            speed = ctrl.speed_pwm
-            # Hard cap: if blind > CRAWL threshold, don't exceed 20 PWM
-            if _lane_lost_frames >= _LANE_LOST_CRAWL:
-                speed = min(speed, 20.0)
-            # PWM deadband
-            if 0.0 < speed < PWM_DEADBAND:
-                speed = PWM_DEADBAND
+                # ── 10. PWM deadband + blind-frame speed cap ─────────────────────
+                speed = ctrl.speed_pwm
+                # Hard cap: if blind > CRAWL threshold, don't exceed 20 PWM
+                if _lane_lost_frames >= _LANE_LOST_CRAWL:
+                    speed = min(speed, 20.0)
+                # PWM deadband
+                if 0.0 < speed < PWM_DEADBAND:
+                    speed = PWM_DEADBAND
 
-            # ── 11. Send commands ────────────────────────────────────────────
-            self.hw.set_speed(speed)
-            self.hw.set_steering(ctrl.steer_angle_deg)
+                # ── 11. Send commands ────────────────────────────────────────────
+                self.hw.set_speed(speed)
+                self.hw.set_steering(ctrl.steer_angle_deg)
 
-            # ── 12. Push frames to GUI queues ────────────────────────────────
-            if not self._q_yolo.full():
-                self._q_yolo.put(t_res.yolo_debug_frame)
-            if not self._q_bev.full():
-                self._q_bev.put(_annotate_bev(perc, ctrl))
+                # ── 12. Push frames to GUI queues ────────────────────────────────
+                if not self._q_yolo.full():
+                    self._q_yolo.put(t_res.yolo_debug_frame)
+                if not self._q_bev.full():
+                    self._q_bev.put(_annotate_bev(perc, ctrl))
 
-            # ── Frame rate throttle ──────────────────────────────────────────
-            elapsed = time.time() - t_start
-            sleep_time = max(0.001, FRAME_PERIOD - elapsed)
-            time.sleep(sleep_time)
+                # ── Frame rate throttle ──────────────────────────────────────────
+                elapsed = time.time() - t_start
+                sleep_time = max(0.001, FRAME_PERIOD - elapsed)
+                time.sleep(sleep_time)
 
         except Exception as e:
             log.error(f"FATAL Pilot loop crash: {e}", exc_info=True)
