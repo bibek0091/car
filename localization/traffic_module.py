@@ -48,8 +48,9 @@ class TrafficResult:
     light_status    : dashboard string for the traffic-light colour.
     active_labels   : all YOLO class names seen this frame.
     yolo_debug_frame: BGR frame with detection overlays.
+    sign_approach_m : estimated approach distance to nearest sign (for dash)
     """
-    state: str              # SYS_GO | SYS_STOP | SYS_SLOW | SYS_LANE_CHANGE_LEFT | SYS_LIMIT
+    state: str              # SYS_GO | SYS_STOP | SYS_SLOW | SYS_APPROACH | SYS_LANE_CHANGE_LEFT | SYS_LIMIT
     reason: str
     speed_multiplier: float
     zone_mode: str = "CITY"
@@ -59,6 +60,7 @@ class TrafficResult:
     light_status: str = "NONE"
     active_labels: List[str] = field(default_factory=list)
     yolo_debug_frame: np.ndarray = None
+    sign_approach_m: float = 99.0   # estimated distance to nearest active sign
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -486,12 +488,23 @@ class TrafficDecisionEngine:
         return "GREEN", green
 
     def _dist_cat(self, box_h):
-        """Classify distance from traffic-light bounding-box height."""
-        if box_h < 40:
+        """Classify distance from bounding-box height.
+        FAR      : box_h < 30  px  — sign detected at long range, pre-decelerate
+        APPROACH : 30–70 px      — sign coming up, sign-specific slow/stop fires
+        HALT     : > 70 px       — right at sign, full action
+        """
+        if box_h < 30:
             return "FAR"
         elif box_h < 70:
             return "APPROACH"
         return "HALT"
+
+    def _approx_dist_m(self, box_h):
+        """Very rough distance estimate from bbox height (calibrate on track).
+        Assumes a sign of real height ~0.30 m and focal length ~400 px.
+        dist = (real_h * focal) / box_h  => 0.30*400 / box_h = 120 / box_h
+        """
+        return 120.0 / max(box_h, 1)
 
     # ── Main process call ─────────────────────────────────────────────────────
 
@@ -545,6 +558,7 @@ class TrafficDecisionEngine:
 
         light_st = "NONE"
         act_lbl  = []
+        _nearest_sign_dist_m = 99.0   # for TrafficResult.sign_approach_m
 
         # ── Per-detection logic ───────────────────────────────────────────────
         for d in dets:
@@ -552,10 +566,14 @@ class TrafficDecisionEngine:
             lbl_lower = lbl.lower()
             x1, y1, x2, y2 = d["bbox"]
             box_h = y2 - y1
+            dist_cat = self._dist_cat(box_h)
+
+            # Estimate approach distance for dashboard
+            approx_m = self._approx_dist_m(box_h)
 
             # Draw detection on debug frame
             cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(dbg, lbl, (x1, y1 - 5),
+            cv2.putText(dbg, f"{lbl} ~{approx_m:.1f}m", (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
             act_lbl.append(lbl)
 
@@ -576,8 +594,24 @@ class TrafficDecisionEngine:
                     light_st = "[GREEN] GO"
                 continue   # done with this detection
 
+            # ── APPROACH PRE-DECELERATION ───────────────────────────────────────
+            # Any sign detected at FAR range triggers gentle deceleration
+            # (0.85×) so the car has time to slow before the sign action zone.
+            # This is separate from sign-specific logic below.
+            is_sign = not ("car" in lbl_lower or "pedestrian" in lbl_lower
+                           or "person" in lbl_lower or "obstacle" in lbl_lower
+                           or "roadblock" in lbl_lower)
+            if is_sign and dist_cat == "FAR":
+                commit(8, "SYS_APPROACH", f"APPROACHING {lbl}")
+                _nearest_sign_dist_m = min(_nearest_sign_dist_m, approx_m)
+                continue   # no further sign logic until APPROACH/HALT range
+
+            # Track distance for dashboard
+            if is_sign:
+                _nearest_sign_dist_m = min(_nearest_sign_dist_m, approx_m)
+
             # Skip tiny detections for all non-light signs
-            if box_h < 40:
+            if box_h < 30:
                 continue
 
             # ── Stop sign ─────────────────────────────────────────────────────
@@ -683,6 +717,8 @@ class TrafficDecisionEngine:
             mult = 0.0
         elif self.state in ("SYS_SLOW", "SYS_LANE_CHANGE_LEFT"):
             mult = 0.55
+        elif self.state == "SYS_APPROACH":
+            mult = 0.85   # gentle pre-decel on sign approach
         elif self.state == "SYS_LIMIT":
             mult = 0.75
 
@@ -701,4 +737,5 @@ class TrafficDecisionEngine:
             light_status     = light_st,
             active_labels    = act_lbl,
             yolo_debug_frame = dbg,
+            sign_approach_m  = _nearest_sign_dist_m,
         )

@@ -123,21 +123,32 @@ class HybridLaneTracker:
 
     # ── Right-lane driving constants ──────────────────────────────────────────
     # In BFMC (drives on the right):
-    #   sl  = LEFT boundary of car’s lane  (usually the centre dashed line)
-    #   sr  = RIGHT boundary of car’s lane (the solid white outer edge)
+    #   sl  = LEFT boundary of car’s lane  (centre dashed divider)
+    #   sr  = RIGHT boundary of car’s lane (solid white outer edge)
     #
-    # WIDE_ROAD_PX: if estimated lane width exceeds this, the camera is seeing
-    #   BOTH lanes (full road). We must explicitly target the RIGHT half.
-    # SINGLE_LANE_PX: below this width the camera sees only its own lane;
-    #   a small rightward comfort bias keeps the car away from the divider.
-    # DIVIDER_FOLLOW_OFFSET_PX: when sr is lost but sl (divider) is still
-    #   visible, the car shadows the divider at this fixed px offset to the
-    #   right. Smaller than hw so the car stays close to the divider and
-    #   doesn’t overshoot into the unknown right side of the lane.
-    WIDE_ROAD_PX            = 420   # full-road threshold (both lanes visible in BEV)
-    SINGLE_LANE_PX          = 200   # minimum plausible single-lane width
-    RIGHT_LANE_BIAS_PX      =  30   # comfort right-ward bias within own lane (px)
-    DIVIDER_FOLLOW_OFFSET_PX =  80  # px right of divider in tier-2 fallback mode
+    # DIVIDER_THICKNESS_PX: physical half-width of the dashed line in BEV.
+    #   polyfit lands on the CENTRE of the line’s pixels. To measure clearance
+    #   from the EDGE of the divider we add this half-thickness to all offsets.
+    #
+    # RIGHT_LANE_BIAS_PX: comfort shift rightward within own lane so the car
+    #   never touches the divider edge (applied when both sl+sr visible).
+    #
+    # DIVIDER_FOLLOW_OFFSET_PX: used in LEFT_LANE_FOLLOW (Tier 2) when sr is
+    #   lost. Car sits this many px right of the divider EDGE.
+    #   = DIVIDER_THICKNESS_PX + desired_gap_px (45 = 20 + 25).
+    #
+    # WIDE_ROAD_PX: if lane_width > this, camera is seeing both lanes.
+    DIVIDER_THICKNESS_PX      = 20   # half-width of dashed line in BEV (px)
+    WIDE_ROAD_PX              = 420  # full-road threshold
+    SINGLE_LANE_PX            = 200  # minimum plausible single-lane width
+    RIGHT_LANE_BIAS_PX        =  45  # rightward bias in own lane (was 30)
+    DIVIDER_FOLLOW_OFFSET_PX  =  85  # = thickness(20) + clearance_gap(65)
+
+    # ── Lane-line thickness gate ─────────────────────────────────────────
+    # A crack or scratch gives 1–5 px spread; a kerb or wall can be >55 px.
+    # Only 6–55 px line thickness is accepted as a valid BFMC lane divider.
+    LINE_MIN_WIDTH_PX = 6
+    LINE_MAX_WIDTH_PX = 55
 
     def __init__(self, img_shape=(480, 640)):
         self.h, self.w = img_shape
@@ -172,6 +183,15 @@ class HybridLaneTracker:
         self.right_conf = len(ri)
         has_l = self.left_conf  >= self.MIN_PIX_OK
         has_r = self.right_conf >= self.MIN_PIX_OK
+
+        # ─ Lane-line thickness gate ───────────────────────────────────────
+        # Reject lines whose pixel spread at the bottom ROW is outside the
+        # valid thickness range for BFMC lane markings. This filters cracks,
+        # tar strips, and kerb edges from being accepted as lane lines.
+        if has_l and not self._is_valid_lane_line(nzx, nzy, li):
+            has_l = False   # thickness gate failed — discard
+        if has_r and not self._is_valid_lane_line(nzx, nzy, ri):
+            has_r = False
 
         if has_l:
             fl = np.polyfit(nzy[li], nzx[li], 2)
@@ -274,13 +294,16 @@ class HybridLaneTracker:
                 base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
                 anchor = "RL_FROM_EDGE"
 
-        # ─ TIER 2: divider follow (only sl visible) ───────────────────
+        # ─ TIER 2: LEFT-LANE FOLLOW (only sl/divider visible) ───────────────
         else:
-            # sr is gone — shadow the divider at a safe fixed offset.
-            # DIVIDER_FOLLOW_OFFSET_PX (80px) < hw (~140px) so the car stays
-            # conservative about how far right it guesses without a right boundary.
+            # sr is gone — right lane lost. Car immediately switches to
+            # following the centre divider (left line) from its right side,
+            # just like driving in the left portion of the right lane.
+            # DIVIDER_FOLLOW_OFFSET_PX already accounts for divider thickness
+            # so the car clears the PHYSICAL EDGE of the dashed line, not
+            # just its polynomial centreline.
             base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
-            anchor = "DIVIDER_FOLLOW"   # signals controller to reduce speed
+            anchor = "LEFT_LANE_FOLLOW"   # signals controller to reduce speed
 
         self.dead_reckoner.last_valid_target       = base_x
         self.dead_reckoner.last_valid_curvature    = self.get_curvature(y_eval)
@@ -360,6 +383,36 @@ class HybridLaneTracker:
         if len(li): dbg[nzy[li], nzx[li]] = [255, 80, 80]
         if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
         return li, ri, dbg
+
+    def _is_valid_lane_line(self, nzx, nzy, indices, check_rows=8):
+        """
+        Thickness gate: check pixel spread at up to `check_rows` evenly spaced
+        rows within the detected indices.  A line is valid if the median
+        horizontal spread across those rows is within [LINE_MIN_WIDTH_PX,
+        LINE_MAX_WIDTH_PX].  Rejects cracks (<6 px) and kerbs/walls (>55 px).
+        """
+        if len(indices) < self.MIN_PIX_OK:
+            return False
+        rows = nzy[indices]
+        y_min, y_max = int(rows.min()), int(rows.max())
+        if y_max == y_min:
+            return False
+
+        spreads = []
+        test_ys = np.linspace(y_min, y_max, check_rows, dtype=int)
+        for y in test_ys:
+            mask = np.abs(nzy[indices] - y) <= 3
+            if not np.any(mask):
+                continue
+            xs = nzx[indices[mask]]
+            if len(xs) < 2:
+                continue
+            spreads.append(int(np.percentile(xs, 90) - np.percentile(xs, 10)))
+
+        if not spreads:
+            return False
+        median_spread = int(np.median(spreads))
+        return self.LINE_MIN_WIDTH_PX <= median_spread <= self.LINE_MAX_WIDTH_PX
 
     def _width_sane(self, lf, rf, y=400):
         # F-06: tightened from 80<w<560 to 180<w<420
