@@ -123,16 +123,21 @@ class HybridLaneTracker:
 
     # ── Right-lane driving constants ──────────────────────────────────────────
     # In BFMC (drives on the right):
-    #   sl  = LEFT boundary of car's lane  (usually the centre dashed line)
-    #   sr  = RIGHT boundary of car's lane (the solid white outer edge)
+    #   sl  = LEFT boundary of car’s lane  (usually the centre dashed line)
+    #   sr  = RIGHT boundary of car’s lane (the solid white outer edge)
     #
     # WIDE_ROAD_PX: if estimated lane width exceeds this, the camera is seeing
     #   BOTH lanes (full road). We must explicitly target the RIGHT half.
     # SINGLE_LANE_PX: below this width the camera sees only its own lane;
     #   a small rightward comfort bias keeps the car away from the divider.
-    WIDE_ROAD_PX       = 420   # full-road threshold (both lanes visible in BEV)
-    SINGLE_LANE_PX     = 200   # minimum plausible single-lane width
-    RIGHT_LANE_BIAS_PX = 30    # comfort right-ward bias within own lane (px)
+    # DIVIDER_FOLLOW_OFFSET_PX: when sr is lost but sl (divider) is still
+    #   visible, the car shadows the divider at this fixed px offset to the
+    #   right. Smaller than hw so the car stays close to the divider and
+    #   doesn’t overshoot into the unknown right side of the lane.
+    WIDE_ROAD_PX            = 420   # full-road threshold (both lanes visible in BEV)
+    SINGLE_LANE_PX          = 200   # minimum plausible single-lane width
+    RIGHT_LANE_BIAS_PX      =  30   # comfort right-ward bias within own lane (px)
+    DIVIDER_FOLLOW_OFFSET_PX =  80  # px right of divider in tier-2 fallback mode
 
     def __init__(self, img_shape=(480, 640)):
         self.h, self.w = img_shape
@@ -230,48 +235,56 @@ class HybridLaneTracker:
                 else: return 320.0 - (lane_width_px * 0.8) + extra_offset_px, "JCT_LEFT_BLIND"
             return 320.0 + extra_offset_px, "JCT_WAITING_CHOICE"
 
-        # ── RIGHT-LANE NORMAL DRIVING ─────────────────────────────────────────
-        # Three cases based on what the camera can see:
+        # ── 3-TIER RIGHT-LANE PRIORITY SYSTEM ────────────────────────────────
         #
-        #  Case A – FULL ROAD VISIBLE (lane_width_px > WIDE_ROAD_PX):
-        #    sl = left outer edge, sr = right outer edge.
-        #    Right lane centre = 3/4 from left edge = (sl + 3*sr) / 4.
+        #  TIER 1 — RIGHT LANE (sr visible): full right-lane targeting.
+        #    Car sees either both boundaries or just the right outer edge.
+        #    Uses RIGHT_LANE_BIAS_PX comfort margin.
         #
-        #  Case B – OWN LANE ONLY (both sl and sr, normal width):
-        #    sl = centre divider, sr = outer edge.
-        #    Right lane centre = midpoint + small rightward comfort bias.
+        #  TIER 2 — DIVIDER FOLLOW (only sl/divider visible, sr lost):
+        #    Right edge has disappeared (shadow, debris, sharp curve exit).
+        #    Car shadows the centre dashed line at DIVIDER_FOLLOW_OFFSET_PX
+        #    to stay safely in the right lane without guessing the full width.
+        #    As soon as sr reappears, Tier 1 takes over automatically.
         #
-        #  Case C – ONE LINE ONLY:
-        #    From right edge: sr - hw         (already right-lane correct)
-        #    From divider:    sl + hw         (already right-lane correct)
-        #    In both cases add the comfort bias toward the outer edge.
-        if sl is None and sr is None:
-            # A-03: predict_target now uses wall-clock time instead of frame count
+        #  TIER 3 — DEAD RECKONING (both lost):
+        #    Uses last-valid right-lane target + wall-clock drift model.
+
+        has_right = (sr is not None)
+        has_left  = (sl is not None)
+
+        # ─ TIER 3: both lost ────────────────────────────────────────
+        if not has_right and not has_left:
             predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
             return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
 
-        if sl is not None and sr is not None:
-            if lane_width_px >= self.WIDE_ROAD_PX:
-                # Case A: full road — drive in the right quarter of the image
-                base_x = (ev(sl) + 3.0 * ev(sr)) / 4.0
-                anchor = "RL_WIDE_ROAD"
+        # ─ TIER 1: sr visible ────────────────────────────────────────
+        if has_right:
+            if has_left:
+                if lane_width_px >= self.WIDE_ROAD_PX:
+                    # Both outer edges visible — target the right quarter
+                    base_x = (ev(sl) + 3.0 * ev(sr)) / 4.0
+                    anchor = "RL_WIDE_ROAD"
+                else:
+                    # Own lane: centre + comfort bias
+                    base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
+                    anchor = "RL_DUAL"
             else:
-                # Case B: own lane visible — centre + rightward comfort margin
-                base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
-                anchor = "RL_DUAL"
-        elif sr is not None:
-            # Case C-right: anchored from outer (right) edge
-            base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
-            anchor = "RL_FROM_EDGE"
-        else:
-            # Case C-left: anchored from centre divider (left line)
-            # No extra bias — divider already defines right lane boundary
-            base_x = ev(sl) + hw
-            anchor = "RL_FROM_DIVIDER"
+                # Only right outer edge visible
+                base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
+                anchor = "RL_FROM_EDGE"
 
-        self.dead_reckoner.last_valid_target = base_x
-        self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
-        self.dead_reckoner.reset_lost_timer()   # A-03: reset timer when lines visible
+        # ─ TIER 2: divider follow (only sl visible) ───────────────────
+        else:
+            # sr is gone — shadow the divider at a safe fixed offset.
+            # DIVIDER_FOLLOW_OFFSET_PX (80px) < hw (~140px) so the car stays
+            # conservative about how far right it guesses without a right boundary.
+            base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
+            anchor = "DIVIDER_FOLLOW"   # signals controller to reduce speed
+
+        self.dead_reckoner.last_valid_target       = base_x
+        self.dead_reckoner.last_valid_curvature    = self.get_curvature(y_eval)
+        self.dead_reckoner.reset_lost_timer()       # reset when at least 1 line visible
         return base_x + extra_offset_px, anchor
 
     def get_curvature(self, y_eval):

@@ -194,6 +194,13 @@ class Controller:
                 dr_conf = 0.5
             speed *= (0.4 + 0.4 * dr_conf)
 
+        # 4d. Divider-follow speed penalty
+        # Right outer edge is lost \u2014 car is shadowing the centre divider.
+        # Reduce speed by 25% to allow more correction time; recovers automatically
+        # the next frame sr becomes visible and anchor reverts to RL_DUAL/RL_FROM_EDGE.
+        if perc_res.anchor == "DIVIDER_FOLLOW":
+            speed *= 0.75
+
         final_speed = speed * traffic_mult * guard_spd_mult
 
         # F-10: minimum speed floor — prevents stacked multipliers stalling mid-track.
