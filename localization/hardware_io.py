@@ -1,8 +1,9 @@
 import sys
-import time
 import math
+import time
 import numpy as np
 import logging
+from STM32_SerialHandler import STM32_SerialHandler
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,11 @@ except ImportError:
 
 
 class HardwareIO:
+    # STM32 UART protocol / ESC limits
+    DEADBAND_PWM = 12.0
+    # From previous calibration: roughly 0.014 m/s per PWM unit above deadband
+    SPEED_CALIB  = 0.014
+
     def __init__(self, sim_mode=False, sim_video=None):
         # Auto-sim ONLY when no hardware drivers at all (e.g. Windows dev machine).
         _no_hw = (not _SERIAL_AVAILABLE and not _CAM_AVAILABLE)
