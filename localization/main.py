@@ -250,6 +250,8 @@ class Orchestrator:
         self.svg_path  = svg_path or SVG_PATH_DEFAULT
         self.running   = False
         self._estop    = False
+        self._pilot_thread = None
+
         # ── Hardware ──────────────────────────────────────────────────────────
         self.hw = HardwareIO(sim_mode=sim_mode)
 
@@ -438,7 +440,8 @@ class Orchestrator:
             pass
         if self._threaded_yolo:
             self._threaded_yolo.stop()
-        self.hw.close()
+        if hasattr(self.hw, 'shutdown'):
+            self.hw.shutdown()
         if hasattr(self, '_root'):
             self._root.destroy()
 
