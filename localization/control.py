@@ -86,7 +86,7 @@ class DividerGuard:
     centre line into oncoming traffic is worse than clipping the outer edge.
     """
 
-    DIVIDER_SAFE_PX = 140   # raised: aligns with new RIGHT_LANE_BIAS_PX=45 + divider thickness
+    DIVIDER_SAFE_PX = 130   # raised from 110: stronger push away from centre divider
     EDGE_SAFE_PX    =  70
     GAIN            = 0.35
     MAX_CORR        = 25.0
@@ -194,14 +194,11 @@ class Controller:
                 dr_conf = 0.5
             speed *= (0.4 + 0.4 * dr_conf)
 
-        # 4d. Road-analysis speed penalty (replaces removed LEFT_LANE_FOLLOW)
-        # ROAD_ANALYSIS: surface probe found road extent — drive cautiously (65%).
-        # ROAD_PREDICT:  probe failed, dead reckoning active             — slow (50%).
-        # Both recover automatically when sr reappears (anchor → RL_*).
-        if perc_res.anchor == "ROAD_ANALYSIS":
-            speed *= 0.65
-        elif perc_res.anchor.startswith("ROAD_PREDICT"):
-            speed *= 0.50
+        # 4d. Divider-follow speed penalty
+        # Right outer edge is lost — car is shadowing the centre divider.
+        # 25% speed reduction; recovers next frame sr reappears (anchor → RL_*).
+        if perc_res.anchor == "DIVIDER_FOLLOW":
+            speed *= 0.75
 
         final_speed = speed * traffic_mult * guard_spd_mult
 

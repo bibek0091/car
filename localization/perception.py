@@ -123,32 +123,16 @@ class HybridLaneTracker:
 
     # ── Right-lane driving constants ──────────────────────────────────────────
     # In BFMC (drives on the right):
-    #   sl  = LEFT boundary of car’s lane  (centre dashed divider)
-    #   sr  = RIGHT boundary of car’s lane (solid white outer edge)
+    #   sl  = LEFT boundary of car's lane  (centre dashed divider)
+    #   sr  = RIGHT boundary of car's lane (solid white outer edge)
     #
-    # DIVIDER_THICKNESS_PX: physical half-width of the dashed line in BEV.
-    #   polyfit lands on the CENTRE of the line’s pixels. To measure clearance
-    #   from the EDGE of the divider we add this half-thickness to all offsets.
-    #
-    # RIGHT_LANE_BIAS_PX: comfort shift rightward within own lane so the car
-    #   never touches the divider edge (applied when both sl+sr visible).
-    #
-    # DIVIDER_FOLLOW_OFFSET_PX: used in LEFT_LANE_FOLLOW (Tier 2) when sr is
-    #   lost. Car sits this many px right of the divider EDGE.
-    #   = DIVIDER_THICKNESS_PX + desired_gap_px (45 = 20 + 25).
-    #
-    # WIDE_ROAD_PX: if lane_width > this, camera is seeing both lanes.
-    DIVIDER_THICKNESS_PX      = 20   # half-width of dashed line in BEV (px)
-    WIDE_ROAD_PX              = 420  # full-road threshold
-    SINGLE_LANE_PX            = 200  # minimum plausible single-lane width
-    RIGHT_LANE_BIAS_PX        =  45  # rightward bias in own lane (was 30)
-    DIVIDER_FOLLOW_OFFSET_PX  =  85  # = thickness(20) + clearance_gap(65)
-
-    # ── Lane-line thickness gate ─────────────────────────────────────────
-    # A crack or scratch gives 1–5 px spread; a kerb or wall can be >55 px.
-    # Only 6–55 px line thickness is accepted as a valid BFMC lane divider.
-    LINE_MIN_WIDTH_PX = 6
-    LINE_MAX_WIDTH_PX = 55
+    # WIDE_ROAD_PX: if lane_width > this, camera is seeing both lanes (full road).
+    # RIGHT_LANE_BIAS_PX: comfort shift rightward so the car stays clear of divider.
+    # DIVIDER_FOLLOW_OFFSET_PX: when sr is lost, track this many px right of sl.
+    WIDE_ROAD_PX             = 420   # full-road threshold (both lanes visible in BEV)
+    SINGLE_LANE_PX           = 200   # minimum plausible single-lane width
+    RIGHT_LANE_BIAS_PX       =  30   # comfort rightward bias within own lane (px)
+    DIVIDER_FOLLOW_OFFSET_PX =  80   # px right of divider when right edge is lost
 
     def __init__(self, img_shape=(480, 640)):
         self.h, self.w = img_shape
@@ -184,14 +168,7 @@ class HybridLaneTracker:
         has_l = self.left_conf  >= self.MIN_PIX_OK
         has_r = self.right_conf >= self.MIN_PIX_OK
 
-        # ─ Lane-line thickness gate ───────────────────────────────────────
-        # Reject lines whose pixel spread at the bottom ROW is outside the
-        # valid thickness range for BFMC lane markings. This filters cracks,
-        # tar strips, and kerb edges from being accepted as lane lines.
-        if has_l and not self._is_valid_lane_line(nzx, nzy, li):
-            has_l = False   # thickness gate failed — discard
-        if has_r and not self._is_valid_lane_line(nzx, nzy, ri):
-            has_r = False
+
 
         if has_l:
             fl = np.polyfit(nzy[li], nzx[li], 2)
@@ -235,8 +212,7 @@ class HybridLaneTracker:
 
     def get_target_x(self, y_eval, lane_width_px, extra_offset_px=0,
                      nav_state="NORMAL", frames_lost=0,
-                     last_speed=0.0, last_steering=0.0,
-                     warped_binary=None):
+                     last_speed=0.0, last_steering=0.0):
         sl, sr = self.sl, self.sr
         hw = lane_width_px / 2.0
 
@@ -258,22 +234,25 @@ class HybridLaneTracker:
                 else: return 320.0 - (lane_width_px * 0.8) + extra_offset_px, "JCT_LEFT_BLIND"
             return 320.0 + extra_offset_px, "JCT_WAITING_CHOICE"
 
-        # ── 2-TIER RIGHT-LANE PRIORITY (sr is the anchor) ───────────────────────────
+        # ── 3-TIER RIGHT-LANE PRIORITY SYSTEM ────────────────────────────────
         #
-        #  TIER 1 — RIGHT LANE (sr visible)
-        #    Full right-lane targeting; sl used for dual-line centering if present.
+        #  TIER 1 — RIGHT LANE (sr visible): full right-lane targeting.
+        #    Both or right-edge-only visible; RIGHT_LANE_BIAS_PX comfort margin.
         #
-        #  TIER 2 — ROAD ANALYSIS (sr lost, any or no sl)
-        #    No left-lane-follow. The car probes the BEV binary image for white
-        #    road-surface pixels to the right of the last known line (or frame
-        #    centre) to find where the road actually extends. Uses that as a
-        #    provisional right edge, then targets right-of-centre within the
-        #    detected road width. Falls back to dead reckoning if no road
-        #    features found. Anchor = ROAD_ANALYSIS or ROAD_PREDICT.
-        #    Tier 1 resumes the instant sr becomes visible again.
+        #  TIER 2 — DIVIDER FOLLOW (sr lost, sl visible):
+        #    Right edge gone — shadow the centre dashed divider at a safe fixed
+        #    offset (DIVIDER_FOLLOW_OFFSET_PX). Speed cut 25% in control.py.
+        #    Tier 1 resumes the instant sr reappears.
+        #
+        #  TIER 3 — DEAD RECKONING (both lost): drift model.
 
         has_right = (sr is not None)
         has_left  = (sl is not None)
+
+        # ─ TIER 3: both lost ────────────────────────────────────────
+        if not has_right and not has_left:
+            predicted_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
+            return predicted_x + extra_offset_px, f"DEAD_RECKONING_{conf:.2f}"
 
         # ─ TIER 1: sr visible ────────────────────────────────────────
         if has_right:
@@ -287,41 +266,16 @@ class HybridLaneTracker:
             else:
                 base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
                 anchor = "RL_FROM_EDGE"
-
-            self.dead_reckoner.last_valid_target    = base_x
-            self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
-            self.dead_reckoner.reset_lost_timer()
-            return base_x + extra_offset_px, anchor
-
-        # ─ TIER 2: ROAD ANALYSIS — sr lost ────────────────────────────────
-        # Determine the x-origin for the road probe.
-        # If sl (divider) is visible, start probing from just right of its edge.
-        # Otherwise probe from frame centre (best neutral assumption).
-        probe_origin = (ev(sl) + self.DIVIDER_THICKNESS_PX
-                        if has_left else float(self.w // 2))
-
-        probed_right = self._probe_right_edge(warped_binary, probe_origin, y_eval)
-
-        if probed_right is not None:
-            road_width = probed_right - probe_origin
-            if self.SINGLE_LANE_PX <= road_width <= self.WIDE_ROAD_PX:
-                # Valid road width found — drive at 55% across detected width
-                # (right-biased within the detected road surface)
-                base_x = probe_origin + road_width * 0.55
-                anchor = "ROAD_ANALYSIS"
-            else:
-                # Width outside sane range — fall to dead reckoning
-                base_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
-                anchor = f"ROAD_PREDICT_{conf:.2f}"
+        # ─ TIER 2: divider follow ────────────────────────────────────
         else:
-            # No road features found at all — pure dead reckoning
-            base_x, conf = self.dead_reckoner.predict_target(last_speed, last_steering)
-            anchor = f"ROAD_PREDICT_{conf:.2f}"
+            # sr gone — shadow the centre divider from the right at a fixed offset
+            base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
+            anchor = "DIVIDER_FOLLOW"
 
-        # Don't update dead_reckoner.last_valid_target here —
-        # we’re in analysis mode; keep the last CONFIRMED right-lane position.
-        self.dead_reckoner.accumulate(0.0)  # keep timer alive but don't double-count
-        return float(base_x) + extra_offset_px, anchor
+        self.dead_reckoner.last_valid_target    = base_x
+        self.dead_reckoner.last_valid_curvature = self.get_curvature(y_eval)
+        self.dead_reckoner.reset_lost_timer()
+        return base_x + extra_offset_px, anchor
 
     def get_curvature(self, y_eval):
         fit = self.sr if self.sr is not None else self.sl
@@ -397,71 +351,6 @@ class HybridLaneTracker:
         if len(ri): dbg[nzy[ri], nzx[ri]] = [80,  80, 255]
         return li, ri, dbg
 
-    def _is_valid_lane_line(self, nzx, nzy, indices, check_rows=8):
-        """
-        Thickness gate: check pixel spread at up to `check_rows` evenly spaced
-        rows within the detected indices.  A line is valid if the median
-        horizontal spread across those rows is within [LINE_MIN_WIDTH_PX,
-        LINE_MAX_WIDTH_PX].  Rejects cracks (<6 px) and kerbs/walls (>55 px).
-        """
-        if len(indices) < self.MIN_PIX_OK:
-            return False
-        rows = nzy[indices]
-        y_min, y_max = int(rows.min()), int(rows.max())
-        if y_max == y_min:
-            return False
-
-        spreads = []
-        test_ys = np.linspace(y_min, y_max, check_rows, dtype=int)
-        for y in test_ys:
-            mask = np.abs(nzy[indices] - y) <= 3
-            if not np.any(mask):
-                continue
-            xs = nzx[indices[mask]]
-            if len(xs) < 2:
-                continue
-            spreads.append(int(np.percentile(xs, 90) - np.percentile(xs, 10)))
-
-        if not spreads:
-            return False
-        median_spread = int(np.median(spreads))
-        return self.LINE_MIN_WIDTH_PX <= median_spread <= self.LINE_MAX_WIDTH_PX
-
-    def _probe_right_edge(self, warped_binary, left_x: float, y_eval: float):
-        """
-        Road surface probe: scans the BEV binary image for white pixels to the
-        right of `left_x` along a band around `y_eval`. Returns the estimated
-        x-coordinate of the right road boundary, or None if nothing is found.
-
-        Algorithm:
-          1. Extract a horizontal band of ±15 rows around y_eval.
-          2. Keep only columns to the right of left_x.
-          3. Project onto the x-axis (column sums).
-          4. Find the rightmost cluster of non-zero pixels (85th percentile).
-          5. Sanity check: the cluster must extend at least 20 columns.
-        """
-        if warped_binary is None:
-            return None
-
-        row     = int(np.clip(y_eval, 0, warped_binary.shape[0] - 1))
-        y1      = max(0, row - 15)
-        y2      = min(warped_binary.shape[0], row + 15)
-        x_start = max(0, int(left_x))
-
-        if x_start >= warped_binary.shape[1] - 10:
-            return None
-
-        # Sum white pixels along each column in the band
-        strip      = warped_binary[y1:y2, x_start:]
-        projection = strip.sum(axis=0).astype(np.float32)
-        nonzero    = np.nonzero(projection > 0)[0]
-
-        if len(nonzero) < 20:   # need a minimum road width to trust this
-            return None
-
-        # Rightmost significant cluster (85th percentile avoids outliers)
-        right_local = int(np.percentile(nonzero, 85))
-        return float(x_start + right_local)
 
     def _width_sane(self, lf, rf, y=400):
         # F-06: tightened from 80<w<560 to 180<w<420
@@ -536,10 +425,10 @@ class VisionPipeline:
         y_eval = 400.0
         lw = self.tracker.estimated_lane_width
         
-        # Determine Target — pass warped_binary for ROAD_ANALYSIS probe in Tier 2
+        # Determine Target
         target_x, anchor = self.tracker.get_target_x(
             y_eval, lw, extra_offset_px, nav_state, self.lost_frames,
-            velocity_ms, last_steering, warped_binary=warped_binary
+            velocity_ms, last_steering
         )
         
         if target_x is None:
