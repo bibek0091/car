@@ -73,6 +73,16 @@ except ImportError:
     BehaviorController = None
 
 try:
+    from sign_map import SignMap, SIGN_TYPES
+    _SIGNMAP_AVAILABLE = True
+except ImportError:
+    _SIGNMAP_AVAILABLE = False
+    SignMap   = None
+    SIGN_TYPES = ["stop","parking","crosswalk","priority",
+                  "highway-entry","highway-exit","no-entry",
+                  "roundabout","speed-limit","traffic-light"]
+
+try:
     from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector, TrafficResult
     _TRAFFIC_AVAILABLE = True
 except ImportError:
@@ -692,6 +702,18 @@ class Orchestrator:
         self._last_t_res = None
         self._sign_history = deque(maxlen=20)
 
+        # Sign map — placed signs persist across restarts
+        _sm_path = os.path.join(_SCRIPT_DIR, "sign_map.json")
+        self.sign_map = SignMap(_sm_path) if _SIGNMAP_AVAILABLE else None
+        self._sign_place_mode    = False    # toggled by [PLACE MODE] button
+        self._selected_sign_type = None     # tk.StringVar set in build_ui
+        self._sign_place_btn     = None     # reference to toggle button
+
+        # Proximity YOLO gating
+        self._YOLO_GATE_M  = 4.0   # run YOLO only within this radius of a sign
+        self._SLOW_SIGN_M  = 3.5   # start slowing at this distance from a sign
+        self._last_snap_id = None  # ID of last sign that triggered a loc snap
+
         self._svg_base     = _load_svg_as_cv2(self.svg_path, self.MAP_W, self.MAP_H)
         self._map_renderer = MapOverlayRenderer(self._svg_base, MAP_W_M, MAP_H_M)
         self._graph_renderer = None
@@ -767,6 +789,65 @@ class Orchestrator:
             self._graph_renderer = GraphMLRenderer(
                 self.localizer.planner, self.CAM_W, self.CAM_H)
 
+        # ── Sign Editor panel ────────────────────────────────────────────
+        se = tk.Frame(root, bg="#0d1a0d", pady=4)
+        se.pack(fill=tk.X, padx=6, pady=(0, 4))
+        tk.Label(se, text=" SIGN EDITOR ", bg="#0d1a0d", fg="#69ff47",
+                 font=("Courier", 9, "bold")).pack(side=tk.LEFT, padx=6)
+
+        # Sign type dropdown
+        self._selected_sign_type = tk.StringVar(value=SIGN_TYPES[0])
+        om = tk.OptionMenu(se, self._selected_sign_type, *SIGN_TYPES)
+        om.config(bg="#1a2b1a", fg="#cce8cc", font=("Courier", 8),
+                  highlightthickness=0, bd=0, relief=tk.FLAT,
+                  activebackground="#2a3b2a")
+        om["menu"].config(bg="#1a2b1a", fg="#cce8cc", font=("Courier", 8))
+        om.pack(side=tk.LEFT, padx=4)
+
+        # PLACE MODE toggle
+        def _toggle_place_mode():
+            self._sign_place_mode = not self._sign_place_mode
+            if self._sign_place_mode:
+                self._sign_place_btn.config(bg="#c0392b", text="PLACE MODE ●")
+                self._sv_hint.set(f"Click map to place: {self._selected_sign_type.get()}")
+            else:
+                self._sign_place_btn.config(bg="#1a3a1a", text="PLACE MODE")
+                self._sv_hint.set("Click map: set START")
+
+        self._sign_place_btn = tk.Button(
+            se, text="PLACE MODE", bg="#1a3a1a", fg="white",
+            font=("Courier", 8, "bold"), command=_toggle_place_mode)
+        self._sign_place_btn.pack(side=tk.LEFT, padx=4)
+
+        def _undo_sign():
+            if self.sign_map and self.sign_map.remove_last():
+                self._sv_hint.set(f"Removed last sign ({len(self.sign_map)} remain)")
+
+        def _clear_signs():
+            if self.sign_map:
+                self.sign_map.clear()
+                self._sv_hint.set("All signs cleared")
+
+        tk.Button(se, text="UNDO LAST", bg="#2c3e50", fg="white",
+                  font=("Courier", 8, "bold"),
+                  command=_undo_sign).pack(side=tk.LEFT, padx=4)
+        tk.Button(se, text="CLEAR ALL", bg="#6d2c2c", fg="white",
+                  font=("Courier", 8, "bold"),
+                  command=_clear_signs).pack(side=tk.LEFT, padx=4)
+
+        # Live count
+        self._sv_sign_count = tk.StringVar(
+            value=f"{len(self.sign_map) if self.sign_map else 0} signs placed")
+        tk.Label(se, textvariable=self._sv_sign_count, bg="#0d1a0d",
+                 fg="#99ccaa", font=("Courier", 8)).pack(side=tk.LEFT, padx=10)
+
+        # Update type hint when dropdown changes
+        def _on_type_change(*_):
+            if self._sign_place_mode:
+                self._sv_hint.set(
+                    f"Click map to place: {self._selected_sign_type.get()}")
+        self._selected_sign_type.trace_add("write", _on_type_change)
+
         self._gui_update()
 
     def _refresh_status_label(self, img):
@@ -774,6 +855,19 @@ class Orchestrator:
         self._sl.config(image=ph); self._sl.photo = ph  # keep reference
 
     def _on_map_click(self, event):
+        # ─ Sign placement mode: left-click places a sign, not start/dest ─────
+        if self._sign_place_mode and self.sign_map is not None:
+            x_m, y_m = pixel_to_map(event.x, event.y, self.MAP_W, self.MAP_H)
+            stype = (self._selected_sign_type.get()
+                     if self._selected_sign_type else "stop")
+            self.sign_map.add_sign(stype, x_m, y_m)
+            count = len(self.sign_map)
+            self._sv_sign_count.set(f"{count} sign{'s' if count != 1 else ''} placed")
+            self._sv_hint.set(
+                f"Placed {stype} @ ({x_m:.2f}, {y_m:.2f})  [{count} total]")
+            return  # don't fall through to start/dest logic
+
+        # ─ Normal route-planning click ─────────────────────────────────────
         if not self.localizer.planner: return
         if len(self.localizer.planner.graph.nodes)==0:
             self._sv_hint.set("Graph empty"); return
@@ -822,7 +916,12 @@ class Orchestrator:
                 x,y,yaw,self._planned_path,self._path_cursor,
                 self.localizer.planner,conf,zone,
                 snap_miss=snap_miss,
-                heading_conf=abs(hconf_raw)*2.0)  # scale to 0-1 approx
+                heading_conf=abs(hconf_raw)*2.0)
+            # Overlay placed signs on the map image
+            if self.sign_map:
+                self.sign_map.draw_on_image(map_img, MAP_W_M, MAP_H_M)
+                self._sv_sign_count.set(
+                    f"{len(self.sign_map)} sign{'s' if len(self.sign_map)!=1 else ''} placed")  # scale to 0-1 approx
             self._map_ph = ImageTk.PhotoImage(
                 Image.fromarray(cv2.cvtColor(map_img,cv2.COLOR_BGR2RGB)))
             self._map_label.config(image=self._map_ph)
@@ -925,18 +1024,65 @@ class Orchestrator:
                 if not self._estop:
                     self._fps = 0.7*self._fps + 0.3*(1.0/dt)
 
-                # --- TRAFFIC ENGINE (runs even in E-STOP for YOLO feed) ---
+                # --- PROXIMITY-GATED YOLO (saves CPU, focuses detection) ---
+                # When signs have been placed on the map, only run full YOLO
+                # inference when the car is within YOLO_GATE_M of a sign.
+                # If no signs placed, run YOLO unconditionally (no map yet).
                 if self.traffic_engine:
-                    x0,y0,_ = self.localizer.get_pose()
+                    x0, y0, _ = self.localizer.get_pose()
                     ei = {}
                     if self._planned_path and self.localizer.planner:
                         ei = self.localizer.planner.get_current_edge_info(
-                            x0,y0,self._planned_path,self._path_cursor)
-                    t_res = self.traffic_engine.process(
-                        raw_frame, "DASHED" if ei.get("dotted") else "CONTINUOUS")
+                            x0, y0, self._planned_path, self._path_cursor)
+
+                    run_yolo = True
+                    nearby_signs = []
+                    if self.sign_map and self.sign_map.signs:
+                        nearby_signs = self.sign_map.get_nearby(
+                            x0, y0, radius_m=self._YOLO_GATE_M)
+                        run_yolo = bool(nearby_signs)
+                        if not run_yolo:
+                            log.debug("YOLO SKIPPED — no signs within %.1fm", self._YOLO_GATE_M)
+
+                    if run_yolo:
+                        t_res = self.traffic_engine.process(
+                            raw_frame, "DASHED" if ei.get("dotted") else "CONTINUOUS")
+                    else:
+                        # Reuse a minimal neutral result to keep dashboard alive
+                        t_res = TrafficResult(
+                            state="SYS_GO", reason="SIGN_GATE_INACTIVE",
+                            speed_multiplier=1.0,
+                            yolo_debug_frame=raw_frame.copy())
                 else:
+                    x0, y0 = 0.0, 0.0
+                    nearby_signs = []
                     t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
+
+                # --- SIGN-TRIGGERED LOCALIZATION SNAP ---
+                # When YOLO detects a label that matches a placed map sign within
+                # 3 m of the car's current estimated position, snap the localizer
+                # to that sign's known map coordinates to correct odometry drift.
+                if self.sign_map and t_res.active_labels:
+                    x_snap, y_snap, _ = self.localizer.get_pose()
+                    for lbl in t_res.active_labels:
+                        matched = self.sign_map.match_detection(
+                            lbl, x_snap, y_snap, radius_m=3.0)
+                        if matched and matched["id"] != self._last_snap_id:
+                            _, _, yaw_now = self.localizer.get_pose()
+                            self.localizer.set_pose(
+                                matched["x_m"], matched["y_m"], yaw_now)
+                            self._last_snap_id = matched["id"]
+                            log.info(
+                                "SIGN SNAP: %s → (%.2f, %.2f) dist=%.2fm",
+                                lbl, matched["x_m"], matched["y_m"],
+                                matched["dist"])
+                            break  # one snap per frame
+                    else:
+                        # Reset snap lock when no sign detected nearby
+                        self._last_snap_id = None
+
                 self._last_t_res = t_res
+
 
                 if self._estop:
                     # Halted — keep motors off, reuse last perception for dashboard
@@ -1047,7 +1193,19 @@ class Orchestrator:
                         upcoming_curve=upcoming_curve,
                         curve_dist_m=curve_dist_m)
 
-                    # --- BEHAVIOR CONTROLLER OVERRIDE ---
+                    # --- AUTO-SLOW NEAR PLACED SIGNS ---
+                    # Smoothly reduce speed when car is approaching any mapped sign.
+                    # Linear ramp: full speed at SLOW_SIGN_M, 50% at 0 m (sign centre).
+                    # This is independent of YOLO — works from map distance alone.
+                    if nearby_signs and ctrl.speed_pwm > 0:
+                        closest_dist = nearby_signs[0]["dist"]   # already sorted
+                        if closest_dist < self._SLOW_SIGN_M:
+                            slow_mult = max(0.50, closest_dist / self._SLOW_SIGN_M)
+                            ctrl.speed_pwm *= slow_mult
+                            log.debug("SIGN SLOW: %.2fm → %.0f%% speed",
+                                      closest_dist, slow_mult * 100)
+
+
                     # BehaviorController evaluates the full priority hierarchy
                     # (Emergency > Mandatory > Legal > Mission > Normal).
                     # If any layer fires above NORMAL priority it overrides
