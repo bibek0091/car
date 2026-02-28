@@ -66,6 +66,13 @@ from control       import Controller, ControlOutput
 from hardware_io   import HardwareIO
 
 try:
+    from behavior_controller import BehaviorController
+    _BEHAVIOR_AVAILABLE = True
+except ImportError:
+    _BEHAVIOR_AVAILABLE = False
+    BehaviorController = None
+
+try:
     from traffic_module import TrafficDecisionEngine, ThreadedYOLODetector, TrafficResult
     _TRAFFIC_AVAILABLE = True
 except ImportError:
@@ -674,6 +681,7 @@ class Orchestrator:
 
         self.jct_detector   = JunctionDetector()
         self.controller     = Controller()
+        self.behavior       = BehaviorController() if _BEHAVIOR_AVAILABLE else None
         self.localizer      = LocalizationEngine()
 
         self._fps        = 0.0
@@ -1038,6 +1046,25 @@ class Orchestrator:
                         map_curvature=map_curvature,
                         upcoming_curve=upcoming_curve,
                         curve_dist_m=curve_dist_m)
+
+                    # --- BEHAVIOR CONTROLLER OVERRIDE ---
+                    # BehaviorController evaluates the full priority hierarchy
+                    # (Emergency > Mandatory > Legal > Mission > Normal).
+                    # If any layer fires above NORMAL priority it overrides
+                    # the Stanley controller's speed and steer output.
+                    if self.behavior:
+                        beh = self.behavior.compute(
+                            perc_res=perc,
+                            t_res=t_res,
+                            dt=dt,
+                            base_steer=ctrl.steer_angle_deg,
+                        )
+                        if beh.priority < self.behavior.PRI_NORMAL:
+                            # Higher-priority command wins
+                            ctrl.speed_pwm       = beh.speed_pwm
+                            ctrl.steer_angle_deg = beh.steer_deg
+                            log.debug("BEH[%d] %s: %s",
+                                      beh.priority, beh.state, beh.reason)
 
                     # --- STARTUP CALIBRATION OVERRIDE ---
                     # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
