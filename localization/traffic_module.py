@@ -515,7 +515,15 @@ class TrafficDecisionEngine:
             cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(dbg, f"{lbl} ~{approx_m:.1f}m", (x1, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-            act_lbl.append(lbl)
+            
+            # Do not register FAR signs as active labels; this prevents main.py 
+            # from attempting to map-snap to them while they are still distant.
+            _is_sign = not ("car" in lbl_lower or "pedestrian" in lbl_lower
+                            or "person" in lbl_lower or "obstacle" in lbl_lower
+                            or "roadblock" in lbl_lower
+                            or "traffic" in lbl_lower)
+            if not (_is_sign and dist_cat == "FAR"):
+                act_lbl.append(lbl)
 
             # ── Traffic light ─────────────────────────────────────────────────
             if "traffic" in lbl_lower and "light" in lbl_lower:
