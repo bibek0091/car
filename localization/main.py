@@ -958,7 +958,7 @@ def _status_bar(w, estop, fps, zone, nav_state, upcoming_curve, curve_dist_m,
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Orchestrator:
-    BASE_SPEED = 22    # ~20 cm/s city speed (was 50 — far too fast)
+    BASE_SPEED = 28    # city base speed — matches CITY_SPEED_PWM in BehaviorController
     MAP_W=600; MAP_H=440
     CAM_W=480; CAM_H=360
     LOC_W=520; LOC_H=400

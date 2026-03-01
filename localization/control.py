@@ -144,7 +144,7 @@ class Controller:
                 nav_state:      str   = "NORMAL",
                 velocity_ms:    float = 0.0,
                 dt:             float = 0.033,
-                base_speed:     float = 50.0,
+                base_speed:     float = 28.0,   # matches CITY_SPEED_PWM
                 traffic_mult:   float = 1.0,
                 map_curvature:  float = 0.0,
                 upcoming_curve: str   = "STRAIGHT",
@@ -184,7 +184,8 @@ class Controller:
             braked_speed = min_curve_speed + (base_speed - min_curve_speed) * decel_factor
             speed = min(speed, braked_speed)
         elif abs(steer_angle) < 5:
-            speed = min(speed * 1.15, base_speed * 1.20)   # straight-line boost, capped
+            # Gentle straight-line boost — capped at 10% above base (was 20%)
+            speed = min(speed * 1.08, base_speed * 1.10)
 
         # 4c. Dead-reckoning speed penalty
         if "DEAD_RECKONING" in perc_res.anchor:
