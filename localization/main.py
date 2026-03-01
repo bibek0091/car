@@ -1932,7 +1932,7 @@ class Orchestrator:
                             f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
                             (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                     elif elapsed_run < 6.0:
-                        ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
+                        ctrl.speed_pwm = min(ctrl.speed_pwm, 17.0)
                         cv2.putText(perc.lane_dbg,
                             f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
                             (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
@@ -1940,7 +1940,8 @@ class Orchestrator:
                     self._last_ctrl = ctrl
 
                     _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
-                    if _ll>=_LLS:
+
+                    if _ll >= _LLS and elapsed_run > 6.0:
                         self.hw.set_speed(0); self.hw.set_steering(0)
                         self._estop=True
                     else:
