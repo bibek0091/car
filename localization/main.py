@@ -1709,13 +1709,25 @@ class Orchestrator:
                             lbl, x_snap, y_snap, radius_m=3.0)
                         if matched and matched["id"] != self._last_snap_id:
                             _, _, yaw_now = self.localizer.get_pose()
-                            self.localizer.set_pose(
-                                matched["x_m"], matched["y_m"], yaw_now)
+                            
+                            # Real-world distance estimated by YOLO bounding box height
+                            d_obs = min(t_res.sign_approach_m, 4.0)
+                            
+                            # Current theoretical distance on the map
+                            d_est = math.hypot(matched["x_m"] - x_snap, matched["y_m"] - y_snap)
+                            
+                            # Shift car along its heading vector to correct longitudinal odometry drift
+                            # (prevents teleporting the car laterally off the road onto the signpost)
+                            shift_m = d_est - d_obs
+                            true_x = x_snap + shift_m * math.cos(yaw_now)
+                            true_y = y_snap + shift_m * math.sin(yaw_now)
+                            
+                            self.localizer.set_pose(true_x, true_y, yaw_now)
                             self._last_snap_id = matched["id"]
                             log.info(
-                                "SIGN SNAP: %s → (%.2f, %.2f) dist=%.2fm",
-                                lbl, matched["x_m"], matched["y_m"],
-                                matched["dist"])
+                                "SIGN SNAP: %s \u2192 shifted %+.2fm (est=%.2f, obs=%.2f)",
+                                lbl, shift_m, d_est, d_obs)
+                            self._announce_msg = f"SNAP: {lbl} \u2192 shifted {shift_m:+.1f}m"
                             break  # one snap per frame
                     else:
                         # Reset snap lock when no sign detected nearby
