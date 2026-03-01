@@ -24,30 +24,30 @@ log = logging.getLogger(__name__)
 
 # ── Sign type catalogue ────────────────────────────────────────────────────────
 SIGN_TYPES = [
+    "traffic-light",
     "stop",
     "parking",
     "crosswalk",
     "priority",
     "highway-entry",
     "highway-exit",
-    "no-entry",
+    "one-way",
     "roundabout",
-    "speed-limit",
-    "traffic-light",
+    "no-entry",
 ]
 
 # BGR colours and single-char glyphs for map overlay rendering
 _SIGN_STYLE: dict = {
-    "stop":          ((0,   0, 220), "S"),
-    "parking":       ((200, 90,   0), "P"),
-    "crosswalk":     ((0, 200, 200), "X"),
-    "priority":      ((50, 200,  50), "!"),
-    "highway-entry": ((20, 180,  20), "H"),
-    "highway-exit":  ((40, 100, 200), "h"),
-    "no-entry":      ((0,   0, 200), "N"),
-    "roundabout":    ((200, 50, 200), "O"),
-    "speed-limit":   ((180,180,   0), "L"),
-    "traffic-light": ((0, 200, 100), "T"),
+    "traffic-light": ((50,  50, 220), "TL"),
+    "stop":          ((30,  30, 210), "S"),
+    "parking":       ((20, 130, 210), "P"),
+    "crosswalk":     ((200, 200,  30), "X"),
+    "priority":      ((30,  200,  30), "!"),
+    "highway-entry": ((20, 180,  20), "H+"),
+    "highway-exit":  ((180, 100,  30), "H-"),
+    "one-way":       ((200,  40, 160), "O"),
+    "roundabout":    ((200,  50, 200), "R"),
+    "no-entry":      ((30,  30, 220), "N"),
 }
 _DEFAULT_STYLE = ((160, 160, 160), "?")
 
@@ -220,5 +220,49 @@ class SignMap:
     def _with_dist(self, x_m: float, y_m: float) -> list:
         return [(s, self._dist(s, x_m, y_m)) for s in self.signs]
 
+    def get_signs_on_path(self, path_nodes: list, node_positions: dict,
+                          threshold_m: float = 2.0) -> list:
+        """
+        Returns signs that lie within threshold_m of any node on the path.
+        Result is [{'sign': dict, 'node_idx': int, 'path_dist_m': float}]
+        sorted by node_idx so callers get an ordered landmark sequence.
+        """
+        if not path_nodes or not node_positions or not self.signs:
+            return []
+
+        # Build cumulative path distances.
+        cum_dist = [0.0]
+        for i in range(1, len(path_nodes)):
+            p1 = node_positions.get(path_nodes[i - 1])
+            p2 = node_positions.get(path_nodes[i])
+            if p1 and p2:
+                cum_dist.append(cum_dist[-1] + math.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+            else:
+                cum_dist.append(cum_dist[-1])
+
+        matched = {}  # sign_id -> best (node_idx, dist, path_dist)
+        for i, nid in enumerate(path_nodes):
+            pos = node_positions.get(nid)
+            if pos is None:
+                continue
+            nx_, ny_ = pos
+            for s in self.signs:
+                d = math.hypot(s['x_m'] - nx_, s['y_m'] - ny_)
+                if d <= threshold_m:
+                    sid = s['id']
+                    if sid not in matched or d < matched[sid][1]:
+                        matched[sid] = (i, d, cum_dist[i] if i < len(cum_dist) else 0.0)
+
+        result = []
+        for s in self.signs:
+            if s['id'] in matched:
+                node_idx, dist, path_dist = matched[s['id']]
+                result.append({'sign': s, 'node_idx': node_idx,
+                                'dist_m': round(dist, 3),
+                                'path_dist_m': round(path_dist, 3)})
+        result.sort(key=lambda e: e['node_idx'])
+        return result
+
     def __len__(self) -> int:
         return len(self.signs)
+

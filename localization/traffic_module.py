@@ -99,6 +99,10 @@ class ThreadedYOLODetector:
             else:
                 print(f"[YOLO] '{model_path}' not found — detection disabled.")
 
+        self._latch_dets  : list = []     # latched detections
+        self._latch_frames : int  = 0      # frames since last real detection
+        self.LATCH_FRAMES  : int  = 5      # hold detections for this many frames
+
         self.worker = threading.Thread(target=self._run, daemon=True)
         self.worker.start()
 
@@ -122,7 +126,24 @@ class ThreadedYOLODetector:
                 frame = self.frame_queue.get(timeout=0.1)
                 if self.model is None:
                     continue
-                results = self.model.predict(source=frame, conf=0.25, verbose=False)
+
+                # ─ CLAHE contrast enhancement for sign detection ────────────
+                # BFMC signs can be small and low-contrast in bright outdoor
+                # light. Apply CLAHE on the L channel + mild unsharp mask
+                # so edges of signs are crisper for YOLO.
+                try:
+                    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+                    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+                    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+                    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+                    # Mild unsharp mask to sharpen sign edges
+                    blur = cv2.GaussianBlur(enhanced, (0, 0), 2)
+                    infer_frame = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
+                except Exception:
+                    infer_frame = frame   # fall back to raw if anything fails
+
+                results = self.model.predict(
+                    source=infer_frame, conf=0.30, verbose=False)
                 detections = []
                 for box in results[0].boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -130,6 +151,18 @@ class ThreadedYOLODetector:
                     conf  = box.conf[0].item()
                     detections.append({"label": label, "confidence": conf,
                                        "bbox": (x1, y1, x2, y2)})
+
+                # ─ Detection latch: hold non-empty results for LATCH_FRAMES ──
+                if detections:
+                    self._latch_dets   = detections
+                    self._latch_frames = 0
+                else:
+                    self._latch_frames += 1
+                    if self._latch_frames <= self.LATCH_FRAMES:
+                        detections = self._latch_dets  # reuse last good frame
+                    else:
+                        self._latch_dets = []          # latch expired
+
                 if not self.result_queue.full():
                     self.result_queue.put(detections)
             except queue.Empty:
@@ -303,104 +336,6 @@ class PedestrianCrosswalkMonitor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Parking state machine
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ParkingStateMachine:
-    """
-    Full parking maneuver FSM:
-      NONE -> TRIGGERED -> SEEK -> ENTER -> WAIT -> EXIT -> DONE -> NONE
-
-    Returns (state_str, speed_mult, steer_bias_deg) each frame.
-    speed_mult < 0 is not used (no reverse); EXIT re-uses slow forward.
-    steer_bias_deg is added to the controller's steering output.
-    """
-    # Time limits for each phase (seconds)
-    SEEK_TIMEOUT   = 6.0    # if no clear spot found, park anyway after 6 s
-    ENTER_DURATION = 2.0    # drive forward into spot
-    WAIT_DURATION  = 3.0    # mandatory stop in spot (competition requirement)
-    EXIT_DURATION  = 2.5    # drive forward out of spot
-
-    # Steer bias angles (degrees)
-    ENTER_STEER =  22.0     # right steer to angle into spot
-    EXIT_STEER  = -18.0     # left steer to pull out of spot
-
-    def __init__(self):
-        self.state  = "NONE"
-        self._ts    = 0.0
-
-    def trigger(self, now):
-        """Call when a parking sign is detected."""
-        if self.state == "NONE":
-            self.state = "TRIGGERED"
-            self._ts   = now
-
-    def reset(self):
-        self.state = "NONE"
-        self._ts   = 0.0
-
-    def update(self, dets, frame, now):
-        """
-        Returns (parking_state: str, speed_mult: float, steer_bias_deg: float).
-        """
-        if self.state == "NONE" or self.state == "DONE":
-            return "NONE", 1.0, 0.0
-
-        if self.state == "TRIGGERED":
-            # Brief delay to slow down before seeking
-            if now - self._ts > 0.3:
-                self.state = "SEEK"
-                self._ts   = now
-            return "SEEK", 0.35, 0.0
-
-        if self.state == "SEEK":
-            right_clear = self._right_lane_clear(dets, frame)
-            if right_clear or (now - self._ts > self.SEEK_TIMEOUT):
-                self.state = "ENTER"
-                self._ts   = now
-            return "SEEK", 0.30, 0.0
-
-        if self.state == "ENTER":
-            if now - self._ts > self.ENTER_DURATION:
-                self.state = "WAIT"
-                self._ts   = now
-            return "ENTER", 0.20, self.ENTER_STEER
-
-        if self.state == "WAIT":
-            if now - self._ts > self.WAIT_DURATION:
-                self.state = "EXIT"
-                self._ts   = now
-            return "WAIT", 0.0, 0.0
-
-        if self.state == "EXIT":
-            if now - self._ts > self.EXIT_DURATION:
-                self.state = "DONE"
-                self._ts   = now
-            return "EXIT", 0.28, self.EXIT_STEER
-
-        # DONE: hand back control
-        return "NONE", 1.0, 0.0
-
-    @staticmethod
-    def _right_lane_clear(dets, frame):
-        """
-        Returns True when the right side of the frame is clear of obstacles
-        (indicating an available parking spot).
-        """
-        if frame is None:
-            return True
-        h, w = frame.shape[:2]
-        right_x = int(w * 0.55)
-        for d in dets:
-            lbl = d["label"].lower()
-            if lbl in ("car", "obstacle", "roadblock", "closed-road-stand"):
-                x1, y1, x2, y2 = d["bbox"]
-                if x1 > right_x and y2 > h * 0.35:
-                    return False
-        return True
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Main decision engine
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -444,7 +379,8 @@ class TrafficDecisionEngine:
         self.tl_fsm     = TrafficLightStateMachine()
         self.col_pred   = CollisionPredictor()
         self.ped_xwalk  = PedestrianCrosswalkMonitor()
-        self.parking_fsm = ParkingStateMachine()
+        # NOTE: ParkingStateMachine removed — ParkingSequenceFSM in
+        # behavior_controller.py is the single source of truth.
 
         # Zone tracking
         self._zone_mode = "CITY"   # "CITY" | "HIGHWAY"
@@ -499,12 +435,14 @@ class TrafficDecisionEngine:
             return "APPROACH"
         return "HALT"
 
-    def _approx_dist_m(self, box_h):
-        """Very rough distance estimate from bbox height (calibrate on track).
-        Assumes a sign of real height ~0.30 m and focal length ~400 px.
-        dist = (real_h * focal) / box_h  => 0.30*400 / box_h = 120 / box_h
+    def _approx_dist_m(self, box_h, focal_px: float = 400.0):
+        """Distance estimate from bbox height.
+        sign_h_m = 0.06 m — BFMC 1:10 scale sign real height.
+        Formula: dist = (sign_h_m * focal_px) / box_h
+        Example: 24 px box  → 0.06 * 400 / 24 = 1.0 m  (was 5× too large at 5.0 m)
         """
-        return 120.0 / max(box_h, 1)
+        sign_h_m = 0.06
+        return (sign_h_m * focal_px) / max(box_h, 1)
 
     # ── Main process call ─────────────────────────────────────────────────────
 
@@ -539,6 +477,19 @@ class TrafficDecisionEngine:
             nonlocal pri, p_state, p_res
             if pr < pri:
                 pri, p_state, p_res = pr, st, rs
+
+        # ── Fix-7: Stationary pedestrian in road path (growth=0, TTC=∞) ─────────
+        # CollisionPredictor only fires on box growth > 5 px/s. A pedestrian
+        # standing still produces zero growth and infinite TTC — this check
+        # catches that case before TTC logic runs.
+        for _det7 in dets:
+            if _det7["label"].lower() in ("pedestrian", "person"):
+                _x1, _y1, _x2, _y2 = _det7["bbox"]
+                _in_centre = (_x1 < fw * 0.75 and _x2 > fw * 0.25
+                              and _y2 > fh * 0.50)
+                if _in_centre:
+                    commit(0, "SYS_STOP", "PEDESTRIAN IN ROAD PATH")
+                    break
 
         # ── Collision predictor (TTC) ─────────────────────────────────────────
         crit = self.col_pred.update_and_predict(dets, dt)
@@ -698,15 +649,8 @@ class TrafficDecisionEngine:
         if "RED" in light_st:
             commit(1, "SYS_STOP", "RED LIGHT")
 
-        # ── Parking FSM ───────────────────────────────────────────────────────
-        park_state, park_speed_mult, park_steer = self.parking_fsm.update(
-            dets, frame, now
-        )
-        if park_state not in ("NONE", "DONE"):
-            if park_state == "WAIT":
-                commit(1, "SYS_STOP", "PARKING — IN SPOT")
-            else:
-                commit(2, "SYS_SLOW", f"PARKING — {park_state}")
+        # NOTE: Parking FSM removed — behavior_controller.ParkingSequenceFSM
+        # is the single source of truth for parking state.
 
         self.state  = p_state
         self.reason = p_res
@@ -722,17 +666,11 @@ class TrafficDecisionEngine:
         elif self.state == "SYS_LIMIT":
             mult = 0.75
 
-        # Parking FSM overrides multiplier
-        if park_state not in ("NONE", "DONE"):
-            mult = park_speed_mult
-
         return TrafficResult(
             state            = self.state,
             reason           = self.reason,
             speed_multiplier = mult,
             zone_mode        = self._zone_mode,
-            parking_state    = park_state,
-            steer_bias       = park_steer,
             pedestrian_blocking = ped_blocking,
             light_status     = light_st,
             active_labels    = act_lbl,

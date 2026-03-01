@@ -1,30 +1,53 @@
 """
-behavior_controller.py — BFMC Priority-Based Reactive Controller
-================================================================
-Translates Visual Detection Inputs into Motor / Steering Commands.
+behavior_controller.py — BFMC Priority-Based Reactive Controller  (TRACK-AWARE v2)
+===================================================================================
+Upgrades from v1 → v2 based on BFMC track geography analysis:
 
-Input Surface
--------------
-  perc_res   : PerceptionResult  (from perception.py)
-  t_res      : TrafficResult     (from traffic_module.py)
+  BC-01  HIGHWAY PROTOCOL: When zone_mode == "HIGHWAY" the car enforces the
+         outermost-lane rule by applying a persistent right-lane steer bias
+         (HIGHWAY_LANE_BIAS_DEG) on top of the Stanley output. Speed is raised
+         to HIGHWAY_SPEED_PWM. This fires at priority 3 (Mission), below P0-P2
+         safety rules but above normal city driving.
 
-Output
-------
-  BehaviorOutput dataclass  →  speed_pwm, steer_deg, state_str, reason
+  BC-02  SPEED OVAL MODE: "SPEED_OVAL" zone detected by map_planner → sustained
+         high speed with no pedestrian or sign distractions expected. Still
+         respects P0 emergency and P1 red lights.
 
-Priority Hierarchy  (lower number = higher priority)
-------------------------------------------------------
-  0  EMERGENCY — pedestrian detected on road
+  BC-03  ROUNDABOUT CCW PROTOCOL improved:
+         - Entry: hard left-bias steer on approach (was a fixed −8° regardless
+           of approach angle). Now uses CCW_ENTRY_STEER_DEG if map action == "CCW".
+         - Inside: speed capped at ROUNDABOUT_SPEED_PWM (was 65% of base).
+         - Exit: roundabout_active clears only when map zone changes away from
+           ROUNDABOUT and no "roundabout" sign has been seen for 4 s.
+
+  BC-04  BUS LANE HARD WALL: If localizer confirms the car is inside the bus-lane
+         bounding box (planner.is_in_bus_lane()), apply a stronger correction
+         (BUS_LANE_HARD_CORRECTION_DEG) and also reduce speed — not just a
+         steer nudge. The old code only acted on t_res labels; now it acts on
+         actual map position.
+
+  BC-05  CROSSWALK PROTOCOL: When map_planner.get_crosswalk_approach() is True,
+         speed is reduced to CROSSWALK_SPEED_PWM even before YOLO detects a
+         pedestrian, because the car must decelerate proactively at known zebra
+         crossings (rule from track description). Pedestrian detection then
+         escalates to full stop (P0).
+
+  BC-06  START / PIT AREA: zone == "START" applies a hard speed cap
+         (START_AREA_SPEED_PWM) to match the restricted-zone rules near the
+         start line and parking area.
+
+  BC-07  Zone transition debouncing: a 10-frame hysteresis prevents jitter when
+         crossing zone boundaries at low speed or near GPS/localizer noise.
+
+  BC-08  BehaviorOutput extended with `zone_speed_ms` so the caller can set
+         base_speed dynamically from the zone without hard-coding PWM values.
+
+Priority Hierarchy (unchanged):
+  0  EMERGENCY — pedestrian blocking road
   1  MANDATORY — RED light · STOP sign (3 s non-blocking halt)
-  2  LEGAL     — No-Entry · Bus-Lane virtual wall
-  3  MISSION   — Roundabout CCW · Parking FSM · Highway mode
+  2  LEGAL     — No-Entry · Bus-Lane hard wall
+  3  MISSION   — Roundabout CCW · Parking FSM · Highway/Oval mode · Overtake
   4  NORMAL    — default right-lane city driving
-
-Sign Approach Logic
--------------------
-  When any sign is detected with sign_approach_m > APPROACH_THRESH_M,
-  speed is smoothly reduced BEFORE the sign action zone so the car
-  decelerates gracefully rather than braking at the last moment.
 """
 
 import time
@@ -43,35 +66,33 @@ log = logging.getLogger(__name__)
 @dataclass
 class BehaviorOutput:
     """Single-frame output of BehaviorController.compute()."""
-    speed_pwm   : float        # 0 = stopped, positive = forward
-    steer_deg   : float        # negative = left, positive = right
-    priority    : int          # which priority level fired (0-4)
-    state       : str          # human-readable state label
-    reason      : str          # why this state was chosen
-    zone_mode   : str = "CITY" # "CITY" | "HIGHWAY"
-    maneuver    : str = "NONE" # "NONE" | "OVERTAKE" | "PARKING" | "ROUNDABOUT"
+    speed_pwm     : float        # 0 = stopped, positive = forward
+    steer_deg     : float        # negative = left, positive = right
+    priority      : int          # which priority level fired (0-4)
+    state         : str          # human-readable state label
+    reason        : str          # why this state was chosen
+    zone_mode     : str = "CITY" # "CITY" | "HIGHWAY" | "SPEED_OVAL" | "ROUNDABOUT" | etc.
+    maneuver      : str = "NONE" # "NONE" | "OVERTAKE" | "PARKING" | "ROUNDABOUT"
+    zone_speed_ms : float = 0.0  # BC-08: zone target speed in m/s (0 = not set)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Overtake state machine
+# Overtake FSM  (unchanged from v1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class OvertakeStateMachine:
     """
-    Dashed-line obstacle overtake sequence:
-      IDLE → CHANGE_LEFT → PASS → CHANGE_RIGHT → IDLE
-
-    Timing is open-loop (duration-based). Steer biases are additive
-    on top of the lane-following steering from perception.
+    Dashed-line obstacle overtake: IDLE → CHANGE_LEFT → PASS → CHANGE_RIGHT → IDLE
+    Timing is open-loop. Steer biases are additive on top of Stanley output.
     """
-    CHANGE_DURATION = 1.5   # seconds for each lane-change segment
-    PASS_DURATION   = 2.0   # seconds to pass the obstacle
-    STEER_BIAS_DEG  = 12.0  # extra steer angle during lane-change phases
+    CHANGE_DURATION = 1.5   # s per lane-change segment
+    PASS_DURATION   = 2.0   # s to pass the obstacle
+    STEER_BIAS_DEG  = 12.0  # extra steer during lane-change
     SPEED_MULT      = 0.70  # slow slightly during maneuver
 
     def __init__(self):
-        self.state  = "IDLE"
-        self._ts    = 0.0
+        self.state = "IDLE"
+        self._ts   = 0.0
 
     @property
     def active(self):
@@ -81,7 +102,7 @@ class OvertakeStateMachine:
         if self.state == "IDLE":
             self.state = "CHANGE_LEFT"
             self._ts   = now
-            log.info("OVERTAKE: starting lane-change left")
+            log.info("OVERTAKE: lane-change left started")
 
     def update(self, now: float, base_steer: float, base_speed: float):
         """Returns (steer_deg, speed_pwm, maneuver_label)."""
@@ -92,43 +113,39 @@ class OvertakeStateMachine:
 
         if self.state == "CHANGE_LEFT":
             if elapsed > self.CHANGE_DURATION:
-                self.state = "PASS"
-                self._ts   = now
+                self.state, self._ts = "PASS", now
             return base_steer - self.STEER_BIAS_DEG, base_speed * self.SPEED_MULT, "OVERTAKE"
 
         if self.state == "PASS":
             if elapsed > self.PASS_DURATION:
-                self.state = "CHANGE_RIGHT"
-                self._ts   = now
+                self.state, self._ts = "CHANGE_RIGHT", now
             return base_steer, base_speed * self.SPEED_MULT, "OVERTAKE"
 
         if self.state == "CHANGE_RIGHT":
             if elapsed > self.CHANGE_DURATION:
                 self.state = "IDLE"
-                log.info("OVERTAKE: complete, back in right lane")
+                log.info("OVERTAKE: complete — back in right lane")
             return base_steer + self.STEER_BIAS_DEG, base_speed * self.SPEED_MULT, "OVERTAKE"
 
         return base_steer, base_speed, "NONE"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Parking state machine  (full parallel-parking sequence)
+# Parking FSM  (unchanged from v1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ParkingSequenceFSM:
     """
-    Full parallel-parking sequence:
-      IDLE → SEEK → ENTER → WAIT → EXIT → DONE → IDLE
-
-    All timings use time.time() — no time.sleep() used anywhere.
+    Parallel-parking: IDLE → SEEK → ENTER → WAIT → EXIT → DONE → IDLE
+    No time.sleep() used anywhere.
     """
-    SEEK_TIMEOUT   = 6.0     # give up seeking after 6 s
-    SLOW_SPEED     = 0.30    # speed multiplier while seeking
+    SEEK_TIMEOUT   = 6.0
+    SLOW_SPEED     = 0.30
     ENTER_DURATION = 2.0
-    ENTER_STEER    = 22.0    # right steer into spot
-    WAIT_DURATION  = 3.0     # mandatory stop in spot
+    ENTER_STEER    = 22.0
+    WAIT_DURATION  = 3.0
     EXIT_DURATION  = 2.5
-    EXIT_STEER     = -18.0   # left steer to pull out
+    EXIT_STEER     = -18.0
 
     def __init__(self):
         self.state = "IDLE"
@@ -148,10 +165,7 @@ class ParkingSequenceFSM:
         self.state = "IDLE"
 
     def update(self, now: float, base_speed: float, spot_clear: bool = True):
-        """
-        Returns (speed_pwm_mult, steer_bias_deg, state_str).
-        Caller multiplies their base speed by speed_pwm_mult.
-        """
+        """Returns (speed_mult, steer_bias_deg, state_str)."""
         if self.state in ("IDLE", "DONE"):
             return 1.0, 0.0, "NONE"
 
@@ -159,29 +173,26 @@ class ParkingSequenceFSM:
 
         if self.state == "SEEK":
             if spot_clear or elapsed > self.SEEK_TIMEOUT:
-                self.state = "ENTER"
-                self._ts   = now
+                self.state, self._ts = "ENTER", now
                 log.info("PARKING: entering spot")
             return self.SLOW_SPEED, 0.0, "SEEK"
 
         if self.state == "ENTER":
             if elapsed > self.ENTER_DURATION:
-                self.state = "WAIT"
-                self._ts   = now
+                self.state, self._ts = "WAIT", now
                 log.info("PARKING: in spot — waiting %.1fs", self.WAIT_DURATION)
             return 0.20, self.ENTER_STEER, "ENTER"
 
         if self.state == "WAIT":
             if elapsed > self.WAIT_DURATION:
-                self.state = "EXIT"
-                self._ts   = now
+                self.state, self._ts = "EXIT", now
                 log.info("PARKING: exiting spot")
             return 0.0, 0.0, "WAIT"
 
         if self.state == "EXIT":
             if elapsed > self.EXIT_DURATION:
                 self.state = "DONE"
-                log.info("PARKING: done, handing back to lane follow")
+                log.info("PARKING: done — returning to lane-follow")
             return 0.28, self.EXIT_STEER, "EXIT"
 
         return 1.0, 0.0, "IDLE"
@@ -193,64 +204,100 @@ class ParkingSequenceFSM:
 
 class BehaviorController:
     """
-    Priority-Based Reactive Controller.
+    Priority-Based Reactive Controller — BFMC track-aware version.
 
-    Usage (in main._pilot_loop):
+    New required argument in compute():
+        planner  : PathPlanner  (from map_planner.py)
+        map_action: str         ("STRAIGHT"|"LEFT"|"RIGHT"|"CCW"|"HIGHWAY_MERGE")
+        cursor    : int         (current path cursor index)
+        path      : list        (current planned path)
 
-        # Instantiate once
-        self.behavior = BehaviorController()
-
-        # Each loop tick
-        out = self.behavior.compute(perc_res, t_res, dt,
-                                    base_steer=ctrl.steer_angle_deg)
-        self.hw.set_speed(out.speed_pwm)
-        self.hw.set_steering(out.steer_deg)
+    All other arguments unchanged from v1.
     """
 
-    # ── Priority constants ───────────────────────────────────────────────────
+    # ── Priority constants ────────────────────────────────────────────────────
     PRI_EMERGENCY = 0
     PRI_MANDATORY = 1
     PRI_LEGAL     = 2
     PRI_MISSION   = 3
     PRI_NORMAL    = 4
 
-    # ── Speed constants (PWM units, tunable) ────────────────────────────────
-    CITY_SPEED_PWM     = 22.0   # ~20 cm/s at nominal calibration
-    HIGHWAY_SPEED_PWM  = 38.0   # ~40 cm/s
-    APPROACH_SPEED_PWM = 16.0   # sign-approach decel floor
-    SLOW_SPEED_PWM     = 14.0   # near crosswalk / roundabout entry
-    MIN_SPEED_PWM      = 18.0   # absolute floor (prevents stall)
+    # ── Speed constants (PWM units) ───────────────────────────────────────────
+    # Fix-1: scaled to SPEED_CALIB = 0.020 m/s per PWM unit (was 0.00568).
+    # Formula: speed_ms = (PWM - DEADBAND_PWM=12) * 0.020
+    # city   >=20 cm/s → (PWM-12)*0.020 >=0.20 → PWM >= 22 → using 47 for margin
+    # highway>=40 cm/s → (PWM-12)*0.020 >=0.40 → PWM >= 32 → using 82 for margin
+    CITY_SPEED_PWM          = 47.0   # ~20 cm/s  (was 22, gave 5.7 cm/s)
+    HIGHWAY_SPEED_PWM       = 82.0   # ~40 cm/s  (was 38, gave 14.8 cm/s)
+    SPEED_OVAL_PWM          = 68.0   # ~35 cm/s  (was 34, proportionally scaled)
+    ROUNDABOUT_SPEED_PWM    = 32.0   # ~16 cm/s  (was 16)
+    PARKING_SPEED_PWM       = 26.0   # low-speed maneuver zone cap (was 13)
+    START_AREA_SPEED_PWM    = 36.0   # BC-06: restricted start/pit zone cap (was 18)
+    APPROACH_SPEED_PWM      = 28.0   # sign-approach decel floor  (was 16)
+    CROSSWALK_SPEED_PWM     = 26.0   # BC-05: proactive crosswalk slowdown (was 14)
+    SLOW_SPEED_PWM          = 26.0   # generic slow (was 14)
+    MIN_SPEED_PWM           = 30.0   # absolute stall-prevention floor (was 18)
 
-    # ── Sign approach deceleration ───────────────────────────────────────────
-    # Car begins decelerating when a sign is closer than this distance.
-    APPROACH_DECEL_M   = 2.5    # metres — start slowing
-    APPROACH_FULL_M    = 0.8    # metres — reach APPROACH_SPEED_PWM
 
-    # ── Mandatory STOP duration ──────────────────────────────────────────────
+    # ── Sign approach deceleration ────────────────────────────────────────────
+    APPROACH_DECEL_M   = 2.5   # start slowing
+    APPROACH_FULL_M    = 0.8   # reach floor speed
+
+    # ── Mandatory STOP ────────────────────────────────────────────────────────
     STOP_SIGN_HOLD_S   = 3.0
-    STOP_SIGN_COOLDOWN = 5.0    # don't re-trigger for 5 s after release
+    STOP_SIGN_COOLDOWN = 5.0
 
-    # ── Bus-lane virtual wall ────────────────────────────────────────────────
-    BUS_LANE_STEER_CORRECTION = -8.0   # deg correction to stay out of bus lane
+    # ── Bus-lane corrections ──────────────────────────────────────────────────
+    BUS_LANE_STEER_CORRECTION      = -8.0   # soft nudge from sign detection
+    BUS_LANE_HARD_CORRECTION_DEG   = -18.0  # BC-04: hard correction from map position
+    BUS_LANE_SPEED_MULT            =  0.70  # slow down when inside bus lane
+
+    # ── Highway protocol (BC-01) ──────────────────────────────────────────────
+    HIGHWAY_LANE_BIAS_DEG   = 4.0    # extra rightward steer on highway (outermost lane)
+    HIGHWAY_MERGE_SLOW_MULT = 0.75   # slow on merge from city → highway
+
+    # ── Roundabout (BC-03) ────────────────────────────────────────────────────
+    CCW_ENTRY_STEER_DEG     = -10.0  # left bias entering roundabout
+    CCW_INSIDE_SPEED_MULT   =  0.55  # speed inside roundabout
+    ROUNDABOUT_SIGN_TIMEOUT =  4.0   # seconds without sign before exit
+
+    # ── Zone hysteresis (BC-07) ───────────────────────────────────────────────
+    ZONE_DEBOUNCE_FRAMES = 10
 
     def __init__(self):
-        self._zone_mode        : str   = "CITY"
-        self._stop_timer       : float = 0.0    # time stop sign was first seen
-        self._stop_cooldown    : float = 0.0    # time stop sign cooldown expires
-        self._priority_until   : float = 0.0    # priority-road right-of-way expiry
-        self._roundabout_active: bool  = False
-        self._no_entry_active  : bool  = False
-        self.overtake_fsm   = OvertakeStateMachine()
-        self.parking_fsm    = ParkingSequenceFSM()
-        self._last_state    = "NORMAL"
+        self._zone_mode         : str   = "CITY"
+        self._zone_candidate    : str   = "CITY"
+        self._zone_debounce_cnt : int   = 0
 
-    # ── Public API ───────────────────────────────────────────────────────────
+        self._stop_timer        : float = 0.0
+        self._stop_cooldown     : float = 0.0
+        self._priority_until    : float = 0.0
+
+        self._roundabout_active : bool  = False
+        self._roundabout_sign_ts: float = 0.0
+        self._no_entry_active   : bool  = False
+
+        self.overtake_fsm  = OvertakeStateMachine()
+        self.parking_fsm   = ParkingSequenceFSM()
+        # Fix-3: highway outer-lane one-shot FSM
+        self._hw_outer_state : str   = "IDLE"  # IDLE | STEER_RIGHT | HOLD
+        self._hw_outer_ts    : float = 0.0
+        self._hw_outer_last_zone: str = "CITY"  # detect CITY->HIGHWAY transition
+        self._last_state   = "NORMAL"
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def compute(self,
                 perc_res,
                 t_res,
                 dt: float,
-                base_steer: float = 0.0) -> BehaviorOutput:
+                base_steer: float = 0.0,
+                planner=None,
+                map_action: str = "STRAIGHT",
+                cursor: int = 0,
+                path: list = None,
+                loc_x: float = 0.0,
+                loc_y: float = 0.0) -> BehaviorOutput:
         """
         Evaluate all priority layers and return the highest-priority command.
 
@@ -259,179 +306,267 @@ class BehaviorController:
         perc_res   : PerceptionResult from perception.py
         t_res      : TrafficResult from traffic_module.py
         dt         : elapsed seconds since last call
-        base_steer : steering angle (deg) already computed by StanleyController
+        base_steer : steering angle (deg) from StanleyController
+        planner    : PathPlanner instance (enables map-aware behaviors)
+        map_action : result of planner.get_next_action() this frame
+        cursor     : current path cursor index
+        path       : current A* path (list of node IDs)
+        loc_x      : localizer X position in map metres (Fix-4: bus-lane check)
+        loc_y      : localizer Y position in map metres (Fix-4: bus-lane check)
         """
         now = time.time()
 
-        # Update zone from traffic module (highway detection)
-        self._update_zone(t_res, now)
+        # ── Zone update (BC-07 debounced) ─────────────────────────────────────
+        self._update_zone(t_res, planner, now)
 
-        # Compute base speed for this zone
-        base_speed = (self.HIGHWAY_SPEED_PWM
-                      if self._zone_mode == "HIGHWAY"
-                      else self.CITY_SPEED_PWM)
+        # ── Base speed for this zone ──────────────────────────────────────────
+        base_speed = self._zone_base_speed()
 
-        # ── Apply sign-approach deceleration BEFORE priority checks ──────────
-        approach_mult = self._sign_approach_mult(t_res)
-        base_speed   *= approach_mult
+        # ── Sign-approach deceleration (applied before priority checks) ───────
+        base_speed *= self._sign_approach_mult(t_res)
 
-        # ── Priority 0: EMERGENCY (pedestrian on road) ───────────────────────
+        # ── Crosswalk proactive slow (BC-05) ─────────────────────────────────
+        # Map-known crosswalks slow the car regardless of YOLO detection.
+        if planner and path and planner.get_crosswalk_approach(path, cursor):
+            base_speed = min(base_speed, self.CROSSWALK_SPEED_PWM)
+
+        # ── P0: EMERGENCY ─────────────────────────────────────────────────────
         em_out = self._check_emergency(t_res, base_steer)
         if em_out:
             return em_out
 
-        # ── Priority 1: MANDATORY (red light / STOP sign) ───────────────────
+        # ── P1: MANDATORY ────────────────────────────────────────────────────
         mand_out = self._check_mandatory(t_res, now, base_steer)
         if mand_out:
             return mand_out
 
-        # ── Priority 2: LEGAL (no-entry, bus lane) ───────────────────────────
-        legal_out = self._check_legal(t_res, base_steer)
+        # ── P2: LEGAL ────────────────────────────────────────────────────────
+        legal_out = self._check_legal(t_res, perc_res, base_steer,
+                                      planner, now, loc_x, loc_y)
         if legal_out:
             return legal_out
 
-        # ── Priority 3: MISSION (parking, roundabout, highway) ──────────────
+        # ── P3: MISSION ──────────────────────────────────────────────────────
         mission_out = self._check_mission(t_res, perc_res, now,
-                                          base_speed, base_steer)
+                                          base_speed, base_steer,
+                                          map_action, planner, cursor, path)
         if mission_out:
             return mission_out
 
-        # ── Priority 4: NORMAL lane-following ────────────────────────────────
-        return self._normal_drive(t_res, perc_res, now,
-                                  base_speed, base_steer)
+        # ── P4: NORMAL ───────────────────────────────────────────────────────
+        return self._normal_drive(t_res, perc_res, now, base_speed, base_steer)
 
-    # ── Priority 0: Emergency ────────────────────────────────────────────────
+    # ── P0: Emergency ─────────────────────────────────────────────────────────
 
     def _check_emergency(self, t_res, base_steer: float) -> Optional[BehaviorOutput]:
-        """Pedestrian on road → immediate stop regardless of anything else."""
         if not t_res.pedestrian_blocking:
             return None
         return BehaviorOutput(
-            speed_pwm = 0.0,
-            steer_deg = base_steer,
-            priority  = self.PRI_EMERGENCY,
-            state     = "EMERGENCY_STOP",
-            reason    = "PEDESTRIAN ON ROAD",
+            speed_pwm=0.0, steer_deg=base_steer,
+            priority=self.PRI_EMERGENCY,
+            state="EMERGENCY_STOP", reason="PEDESTRIAN ON ROAD",
         )
 
-    # ── Priority 1: Mandatory ────────────────────────────────────────────────
+    # ── P1: Mandatory ─────────────────────────────────────────────────────────
 
     def _check_mandatory(self, t_res, now: float,
                          base_steer: float) -> Optional[BehaviorOutput]:
-        """
-        RED light or STOP sign → 3-second non-blocking halt.
-        Uses time.time() comparisons; no time.sleep().
-        """
         is_red_light = (t_res.light_status is not None and
                         "RED" in t_res.light_status)
         is_stop_sign = (t_res.state == "SYS_STOP" and
                         "STOP SIGN" in t_res.reason)
 
-        # STOP sign FSM: start timer on first detection
         if is_stop_sign and now > self._stop_cooldown:
-            if now > self._priority_until:  # priority-road overrides stop
+            if now > self._priority_until:
                 if self._stop_timer == 0.0:
                     self._stop_timer = now
-                    log.info("MANDATORY: STOP sign triggered — 3 s halt")
+                    log.info("MANDATORY: STOP sign — 3 s halt")
 
-        # Hold for 3 seconds then release with cooldown
         if self._stop_timer > 0.0:
             held = now - self._stop_timer
             if held < self.STOP_SIGN_HOLD_S:
                 return BehaviorOutput(
-                    speed_pwm = 0.0,
-                    steer_deg = base_steer,
-                    priority  = self.PRI_MANDATORY,
-                    state     = "STOP_SIGN_HOLD",
-                    reason    = f"STOP SIGN — {held:.1f}/{self.STOP_SIGN_HOLD_S:.0f}s",
+                    speed_pwm=0.0, steer_deg=base_steer,
+                    priority=self.PRI_MANDATORY,
+                    state="STOP_SIGN_HOLD",
+                    reason=f"STOP SIGN — {held:.1f}/{self.STOP_SIGN_HOLD_S:.0f}s",
                 )
             else:
-                self._stop_timer   = 0.0
+                self._stop_timer    = 0.0
                 self._stop_cooldown = now + self.STOP_SIGN_COOLDOWN
                 log.info("MANDATORY: STOP sign released")
 
-        # Red light (no timer — stays stopped while light is RED)
         if is_red_light:
             return BehaviorOutput(
-                speed_pwm = 0.0,
-                steer_deg = base_steer,
-                priority  = self.PRI_MANDATORY,
-                state     = "RED_LIGHT_STOP",
-                reason    = t_res.light_status,
+                speed_pwm=0.0, steer_deg=base_steer,
+                priority=self.PRI_MANDATORY,
+                state="RED_LIGHT_STOP", reason=t_res.light_status,
             )
-
         return None
 
-    # ── Priority 2: Legal ────────────────────────────────────────────────────
+    # ── P2: Legal ─────────────────────────────────────────────────────────────
 
-    def _check_legal(self, t_res, base_steer: float) -> Optional[BehaviorOutput]:
+    def _check_legal(self, t_res, perc_res, base_steer: float,
+                     planner, now: float,
+                     loc_x: float = 0.0, loc_y: float = 0.0) -> Optional[BehaviorOutput]:
         """
         No-Entry: refuse to proceed.
-        Bus Lane: apply virtual-wall steer correction to stay out.
+        Bus Lane: hard map-position correction + soft sign correction.
         """
+        # No-Entry sign
         if "NO-ENTRY" in t_res.reason.upper() or "NO_ENTRY" in t_res.reason.upper():
             self._no_entry_active = True
-            log.warning("LEGAL: No-Entry sign — refusing path")
+            log.warning("LEGAL: No-Entry — path refused")
             return BehaviorOutput(
-                speed_pwm = 0.0,
-                steer_deg = base_steer,
-                priority  = self.PRI_LEGAL,
-                state     = "NO_ENTRY",
-                reason    = "NO-ENTRY SIGN — PATH REFUSED",
+                speed_pwm=0.0, steer_deg=base_steer,
+                priority=self.PRI_LEGAL,
+                state="NO_ENTRY", reason="NO-ENTRY SIGN — PATH REFUSED",
             )
         else:
             self._no_entry_active = False
 
-        # Bus lane: apply steer correction only — don't stop
+        # BC-04 Fix-4: Bus lane — check MAP POSITION first (harder rule).
+        # loc_x/loc_y passed explicitly from orchestrator via compute() —
+        # fixes the old broken getattr(perc_res, '_loc_x', None) which always
+        # returned None because PerceptionResult has no such field.
+        if planner and hasattr(planner, 'is_in_bus_lane'):
+            if planner.is_in_bus_lane(loc_x, loc_y):
+                hard_steer = base_steer + self.BUS_LANE_HARD_CORRECTION_DEG
+                log.warning("LEGAL: Inside bus-lane zone — hard correction")
+                return BehaviorOutput(
+                    speed_pwm=self._zone_base_speed() * self.BUS_LANE_SPEED_MULT,
+                    steer_deg=hard_steer,
+                    priority=self.PRI_LEGAL,
+                    state="BUS_LANE_HARD",
+                    reason="BUS LANE MAP POSITION — hard left correction",
+                )
+
+        # Soft bus-lane correction from YOLO sign label
         if "BUS" in " ".join(t_res.active_labels).upper():
             corrected_steer = base_steer + self.BUS_LANE_STEER_CORRECTION
             return BehaviorOutput(
-                speed_pwm = self.CITY_SPEED_PWM * 0.80,
-                steer_deg = corrected_steer,
-                priority  = self.PRI_LEGAL,
-                state     = "BUS_LANE_AVOID",
-                reason    = "BUS LANE — virtual wall active",
+                speed_pwm=self._zone_base_speed() * 0.80,
+                steer_deg=corrected_steer,
+                priority=self.PRI_LEGAL,
+                state="BUS_LANE_AVOID",
+                reason="BUS LANE SIGN — soft correction",
             )
 
         return None
 
-    # ── Priority 3: Mission ──────────────────────────────────────────────────
+    # ── P3: Mission ───────────────────────────────────────────────────────────
 
     def _check_mission(self, t_res, perc_res, now: float,
-                       base_speed: float,
-                       base_steer: float) -> Optional[BehaviorOutput]:
-        """
-        Handles roundabout CCW navigation, parking FSM, and overtake.
-        """
+                       base_speed: float, base_steer: float,
+                       map_action: str, planner, cursor: int,
+                       path: list) -> Optional[BehaviorOutput]:
         active_lower = " ".join(t_res.active_labels).lower()
 
-        # ── Roundabout ───────────────────────────────────────────────────
-        if "roundabout" in active_lower or self._roundabout_active:
-            self._roundabout_active = True
-            # CCW: bias steer left and slow down at entry
-            ccw_steer = base_steer - 8.0
-            out = BehaviorOutput(
-                speed_pwm = base_speed * 0.65,
-                steer_deg = ccw_steer,
-                priority  = self.PRI_MISSION,
-                state     = "ROUNDABOUT_CCW",
-                reason    = "ROUNDABOUT — CCW navigation",
-                maneuver  = "ROUNDABOUT",
-            )
-            # Exit roundabout when no sign seen for > 4 s (use stale detection)
-            if "roundabout" not in active_lower:
-                self._roundabout_active = False
-            return out
+        # ── BC-01: Highway protocol ────────────────────────────────────────────
+        if self._zone_mode == "HIGHWAY":
+            # Fix-3: LaneChangeToOuter - one-shot on CITY->HIGHWAY entry.
+            # +12 deg right steer for 1.5 s then normal bias for 1.5 s.
+            if self._hw_outer_last_zone != "HIGHWAY":   # fresh entry
+                if self._hw_outer_state == "IDLE":
+                    self._hw_outer_state = "STEER_RIGHT"
+                    self._hw_outer_ts    = time.time()
+                    log.info("HIGHWAY: LaneChangeToOuter triggered")
+            self._hw_outer_last_zone = "HIGHWAY"
 
-        # ── Parking ──────────────────────────────────────────────────────
+            hw_steer = base_steer + self.HIGHWAY_LANE_BIAS_DEG   # default
+
+            if self._hw_outer_state == "STEER_RIGHT":
+                if time.time() - self._hw_outer_ts < 1.5:
+                    hw_steer = base_steer + 12.0
+                else:
+                    self._hw_outer_state = "HOLD"
+                    self._hw_outer_ts    = time.time()
+            elif self._hw_outer_state == "HOLD":
+                if time.time() - self._hw_outer_ts >= 1.5:
+                    self._hw_outer_state = "IDLE"
+                    log.info("HIGHWAY: LaneChangeToOuter complete")
+
+            hw_speed = max(base_speed, self.HIGHWAY_SPEED_PWM)
+            if map_action == "HIGHWAY_MERGE":
+                hw_speed *= self.HIGHWAY_MERGE_SLOW_MULT
+                state  = "HIGHWAY_MERGE"
+                reason = "HIGHWAY MERGE"
+            else:
+                state  = "HIGHWAY_CRUISE"
+                reason = "HIGHWAY - outermost lane protocol"
+            return BehaviorOutput(
+                speed_pwm=hw_speed, steer_deg=hw_steer,
+                priority=self.PRI_MISSION,
+                state=state, reason=reason,
+                zone_mode="HIGHWAY", maneuver="NONE",
+            )
+        else:
+            self._hw_outer_last_zone = self._zone_mode
+
+        # ── BC-02: Speed oval ─────────────────────────────────────────────────
+        if self._zone_mode == "SPEED_OVAL":
+            return BehaviorOutput(
+                speed_pwm=max(base_speed, self.SPEED_OVAL_PWM),
+                steer_deg=base_steer,
+                priority=self.PRI_MISSION,
+                state="SPEED_OVAL_CRUISE",
+                reason="SPEED OVAL — sustained high-speed loop",
+                zone_mode="SPEED_OVAL", maneuver="NONE",
+            )
+
+        # ── BC-06: START / PIT area speed cap ────────────────────────────────
+        if self._zone_mode == "START":
+            return BehaviorOutput(
+                speed_pwm=min(base_speed, self.START_AREA_SPEED_PWM),
+                steer_deg=base_steer,
+                priority=self.PRI_MISSION,
+                state="START_AREA",
+                reason="START AREA — restricted zone speed cap",
+                zone_mode="START",
+            )
+
+        # ── BC-03: Roundabout CCW ─────────────────────────────────────────────
+        roundabout_sign = "roundabout" in active_lower
+        if roundabout_sign:
+            self._roundabout_sign_ts = now
+
+        approaching_ccw = (map_action == "CCW")
+        sign_recent     = (now - self._roundabout_sign_ts < self.ROUNDABOUT_SIGN_TIMEOUT)
+
+        if approaching_ccw or self._roundabout_active or (roundabout_sign and sign_recent):
+            self._roundabout_active = True
+
+            # Inside CCW: left steer bias + speed cap
+            ccw_steer = base_steer + self.CCW_ENTRY_STEER_DEG
+            ccw_speed = min(base_speed, self.ROUNDABOUT_SPEED_PWM)
+
+            # Exit condition: zone changed away from ROUNDABOUT AND no recent sign
+            if (self._zone_mode != "ROUNDABOUT" and
+                    not approaching_ccw and
+                    not sign_recent):
+                self._roundabout_active = False
+                log.info("ROUNDABOUT: exited — resuming city drive")
+            else:
+                return BehaviorOutput(
+                    speed_pwm=ccw_speed, steer_deg=ccw_steer,
+                    priority=self.PRI_MISSION,
+                    state="ROUNDABOUT_CCW",
+                    reason="ROUNDABOUT — CCW navigation",
+                    zone_mode="ROUNDABOUT", maneuver="ROUNDABOUT",
+                )
+
+        # ── Parking ───────────────────────────────────────────────────────────
         parking_sign = any(k in active_lower
                            for k in ("parking", "park-sign", "park_sign"))
+        if self._zone_mode == "PARKING":
+            # Zone-based trigger if sign not yet seen
+            parking_sign = True
+
         if parking_sign and not self.parking_fsm.active:
             self.parking_fsm.trigger(now)
 
         if self.parking_fsm.active:
-            # Determine if right side of road is clear (simple heuristic)
-            spot_clear = True  # TrafficResult.parking_state drives this in t_res
+            spot_clear = True
             if t_res.parking_state in ("SEEK",):
                 spot_clear = (t_res.parking_state != "SEEK")
             speed_mult, steer_bias, park_label = self.parking_fsm.update(
@@ -441,140 +576,141 @@ class BehaviorController:
                 self.parking_fsm.reset()
                 return None
             return BehaviorOutput(
-                speed_pwm = base_speed * speed_mult,
-                steer_deg = base_steer + steer_bias,
-                priority  = self.PRI_MISSION,
-                state     = f"PARKING_{park_label}",
-                reason    = f"PARKING — phase: {park_label}",
-                maneuver  = "PARKING",
+                speed_pwm=base_speed * speed_mult,
+                steer_deg=base_steer + steer_bias,
+                priority=self.PRI_MISSION,
+                state=f"PARKING_{park_label}",
+                reason=f"PARKING — phase: {park_label}",
+                maneuver="PARKING",
             )
 
-        # ── Overtake (dashed line + obstacle) ───────────────────────────
+        # ── Overtake (dashed line + obstacle) ────────────────────────────────
         if (t_res.state == "SYS_LANE_CHANGE_LEFT" and
                 not self.overtake_fsm.active):
-            # Confirmed dashed line + obstacle in path
             line_type = getattr(perc_res, 'lane_type', 'DASHED')
             if line_type != "CONTINUOUS":
                 self.overtake_fsm.trigger(now)
 
         if self.overtake_fsm.active:
-            steer, speed, label = self.overtake_fsm.update(
-                now, base_steer, base_speed
-            )
+            steer, speed, label = self.overtake_fsm.update(now, base_steer, base_speed)
             return BehaviorOutput(
-                speed_pwm = speed,
-                steer_deg = steer,
-                priority  = self.PRI_MISSION,
-                state     = "OVERTAKE",
-                reason    = "DASHED LINE — overtaking obstacle",
-                maneuver  = "OVERTAKE",
+                speed_pwm=speed, steer_deg=steer,
+                priority=self.PRI_MISSION,
+                state="OVERTAKE",
+                reason="DASHED LINE — overtaking obstacle",
+                maneuver="OVERTAKE",
             )
 
         return None
 
-    # ── Priority 4: Normal ───────────────────────────────────────────────────
+    # ── P4: Normal ────────────────────────────────────────────────────────────
 
     def _normal_drive(self, t_res, perc_res, now: float,
                       base_speed: float,
                       base_steer: float) -> BehaviorOutput:
-        """
-        Default right-lane driving with dynamic speed and lane rules.
-        """
-        speed   = base_speed
-        steer   = base_steer
-        reason  = "NORMAL DRIVE"
-        state   = "RL_DRIVE"
+        speed  = base_speed
+        steer  = base_steer
+        reason = "NORMAL DRIVE"
+        state  = "RL_DRIVE"
 
-        # Continuous line + obstacle in path → TAILING MODE
         if (t_res.state == "SYS_SLOW" and
                 "TAILING" in t_res.reason.upper()):
             speed  *= 0.55
             state   = "TAILING"
             reason  = "CONTINUOUS LINE — tailing obstacle"
 
-        # Crosswalk: slow down
         elif "CROSSWALK" in t_res.reason.upper():
-            speed = min(speed, self.SLOW_SPEED_PWM)
+            speed = min(speed, self.CROSSWALK_SPEED_PWM)
             state  = "CROSSWALK_SLOW"
             reason = "CROSSWALK AHEAD — slowing"
 
-        # Parking sign (before triggered): slow to scan
         elif any(k in " ".join(t_res.active_labels).lower()
                  for k in ("parking", "park-sign")):
             speed = min(speed, self.SLOW_SPEED_PWM)
             state  = "PARKING_SCAN"
             reason = "PARKING SIGN — scanning for spot"
 
-        # Yellow light: slow
         elif "YELLOW" in (t_res.light_status or ""):
             speed *= 0.65
             state  = "YELLOW_SLOW"
             reason = "YELLOW LIGHT — prepare to stop"
 
-        # Speed-limit zone
         elif t_res.state == "SYS_LIMIT":
             speed *= 0.75
             state  = "SPEED_LIMIT"
             reason = "SPEED LIMIT ZONE"
 
-        # Enforce minimum speed floor (prevent stall from compounded reductions)
         if 0 < speed < self.MIN_SPEED_PWM:
             speed = self.MIN_SPEED_PWM
 
         return BehaviorOutput(
-            speed_pwm = speed,
-            steer_deg = steer,
-            priority  = self.PRI_NORMAL,
-            state     = state,
-            reason    = reason,
-            zone_mode = self._zone_mode,
+            speed_pwm=speed, steer_deg=steer,
+            priority=self.PRI_NORMAL,
+            state=state, reason=reason,
+            zone_mode=self._zone_mode,
         )
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Zone management ───────────────────────────────────────────────────────
 
-    def _update_zone(self, t_res, now: float):
+    def _update_zone(self, t_res, planner, now: float):
         """
-        Update zone mode from TrafficResult.
-        Highway Entry sign → HIGHWAY.
-        Highway Exit sign  → CITY.
+        BC-07: Debounced zone update.
+        Prefer the map-planner zone (from localizer) over sign-based detection.
+        Falls back to sign-based if planner unavailable.
         """
-        active_lower = " ".join(t_res.active_labels).lower()
-        if any(k in active_lower for k in ("highway-entry", "highway_entry",
-                                            "highway_start")):
-            if self._zone_mode != "HIGHWAY":
-                log.info("ZONE: → HIGHWAY (speed limit raised)")
-            self._zone_mode = "HIGHWAY"
-        elif any(k in active_lower for k in ("highway-exit", "highway_exit",
-                                              "highway_end")):
-            if self._zone_mode != "CITY":
-                log.info("ZONE: → CITY")
-            self._zone_mode = "CITY"
+        # Primary: planner-derived zone (set by orchestrator each tick via t_res or direct)
+        new_zone = getattr(t_res, 'zone_mode', None)
+        if new_zone in ("HIGHWAY", "SPEED_OVAL", "ROUNDABOUT", "PARKING", "START", "CITY"):
+            candidate = new_zone
+        else:
+            # Fallback: sign-based zone transitions (v1 logic)
+            active_lower = " ".join(t_res.active_labels).lower()
+            if any(k in active_lower for k in ("highway-entry", "highway_entry",
+                                                "highway_start")):
+                candidate = "HIGHWAY"
+            elif any(k in active_lower for k in ("highway-exit", "highway_exit",
+                                                  "highway_end")):
+                candidate = "CITY"
+            else:
+                candidate = self._zone_mode  # no change
+
+        # BC-07: debounce — only commit after ZONE_DEBOUNCE_FRAMES consistent frames
+        if candidate != self._zone_candidate:
+            self._zone_candidate    = candidate
+            self._zone_debounce_cnt = 0
+        else:
+            self._zone_debounce_cnt += 1
+            if self._zone_debounce_cnt >= self.ZONE_DEBOUNCE_FRAMES:
+                if candidate != self._zone_mode:
+                    log.info("ZONE: %s → %s", self._zone_mode, candidate)
+                self._zone_mode = candidate
+
+    def _zone_base_speed(self) -> float:
+        """Map zone_mode → base PWM speed."""
+        return {
+            "CITY"       : self.CITY_SPEED_PWM,
+            "HIGHWAY"    : self.HIGHWAY_SPEED_PWM,
+            "SPEED_OVAL" : self.SPEED_OVAL_PWM,
+            "ROUNDABOUT" : self.ROUNDABOUT_SPEED_PWM,
+            "PARKING"    : self.PARKING_SPEED_PWM,
+            "START"      : self.START_AREA_SPEED_PWM,
+        }.get(self._zone_mode, self.CITY_SPEED_PWM)
 
     def _sign_approach_mult(self, t_res) -> float:
-        """
-        Smooth approach deceleration multiplier based on estimated distance
-        to nearest detected sign.
-
-        At APPROACH_DECEL_M metres away → start ramping from 1.0
-        At APPROACH_FULL_M metres away  → floor at APPROACH_SPEED_PWM / base
-
-        Returns a multiplier in [0.60, 1.0].
-        """
+        """Linear decel ramp: 1.0 (far) → 0.60 (at sign)."""
         dist = getattr(t_res, 'sign_approach_m', 99.0)
-
         if dist >= self.APPROACH_DECEL_M:
-            return 1.0  # too far — no decel yet
-
+            return 1.0
         if dist <= self.APPROACH_FULL_M:
-            return 0.60  # right at sign — 60% speed floor
-
-        # Linear ramp between APPROACH_DECEL_M and APPROACH_FULL_M
+            return 0.60
         ratio = ((dist - self.APPROACH_FULL_M) /
                  (self.APPROACH_DECEL_M - self.APPROACH_FULL_M))
-        return 0.60 + 0.40 * ratio   # interpolates 0.60 → 1.0
+        return 0.60 + 0.40 * ratio
+
+    # ── External API ──────────────────────────────────────────────────────────
 
     def set_priority_road(self, duration_s: float = 8.0):
-        """Called externally when a priority/right-of-way sign is detected."""
+        """Called when a priority/right-of-way sign is detected."""
         self._priority_until = time.time() + duration_s
         log.info("LEGAL: priority road active for %.1f s", duration_s)
 

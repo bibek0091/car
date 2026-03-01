@@ -1,0 +1,52 @@
+{
+  "signs": [
+    {
+      "id": "f2cddadf",
+      "type": "stop",
+      "x_m": 14.796,
+      "y_m": 0.816,
+      "radius_m": 1.5,
+      "label": "STOP"
+    },
+    {
+      "id": "ca178523",
+      "type": "stop",
+      "x_m": 15.184,
+      "y_m": 5.891,
+      "radius_m": 1.5,
+      "label": "STOP"
+    },
+    {
+      "id": "f3fca5eb",
+      "type": "roundabout",
+      "x_m": 16.435,
+      "y_m": 9.607,
+      "radius_m": 1.5,
+      "label": "ROUNDABOUT"
+    },
+    {
+      "id": "0ba25bad",
+      "type": "priority",
+      "x_m": 20.533,
+      "y_m": 11.964,
+      "radius_m": 1.5,
+      "label": "PRIORITY"
+    },
+    {
+      "id": "c1d9761b",
+      "type": "priority",
+      "x_m": 16.478,
+      "y_m": 13.323,
+      "radius_m": 1.5,
+      "label": "PRIORITY"
+    },
+    {
+      "id": "0a72aa07",
+      "type": "priority",
+      "x_m": 13.157,
+      "y_m": 0.77,
+      "radius_m": 1.5,
+      "label": "PRIORITY"
+    }
+  ]
+}

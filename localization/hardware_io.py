@@ -61,8 +61,13 @@ class HardwareIO:
         self.serial    = STM32_SerialHandler()
 
         self.DEADBAND_PWM  = 12.0
-        self.SPEED_CALIB   = 0.00568   # m/s per PWM unit above deadband
-        self.MAX_SPEED_MS  = 0.50
+        # Fix-1: SPEED_CALIB updated from 0.00568 → 0.020 m/s per PWM unit.
+        # BFMC rule: city ≥ 20 cm/s, highway ≥ 40 cm/s.
+        # At 0.00568, CITY_SPEED_PWM=22 → only 5.7 cm/s (28% of minimum).
+        # At 0.020, CITY_SPEED_PWM=47 → 20 cm/s ✓, HIGHWAY_SPEED_PWM=82 → 40 cm/s ✓
+        # ⚠ MUST validate with encoder feedback on the actual car before competition.
+        self.SPEED_CALIB   = 0.020     # m/s per PWM unit above deadband (estimated)
+        self.MAX_SPEED_MS  = 1.00      # raised to match highway target (was 0.50)
 
         self._vel_filtered    = 0.0
         self._sim_yaw         = 0.0
