@@ -948,125 +948,9 @@ def _status_bar(w, estop, fps, zone, nav_state, upcoming_curve, curve_dist_m,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PathAwareLaneSelector
-# Determines steer correction so the car stays centred on the road.
-# Uses the A* map_action (STRAIGHT|LEFT|RIGHT) for junction biases and the
-# lane anchor from VisionPipeline (DUAL|LEFT|RIGHT|DEAD) for centering logic.
+# Junction detection removed — map_planner.get_next_action() handles turns
+# directly from the A* path cursor. No visual fallback needed.
 # ══════════════════════════════════════════════════════════════════════════════
-
-class PathAwareLaneSelector:
-    """
-    Road-centering + junction steer bias.
-
-    Centering logic
-    ───────────────
-    anchor == "DUAL"  → both lane lines visible → Stanley already centers
-                         between them; apply tiny right-keep bias only.
-    anchor == "RIGHT" → only right line visible → car is at right edge;
-                         shift left (negative offset) to find road centre.
-    anchor == "LEFT"  → only left line visible → car is at left edge;
-                         shift right (positive offset) to find road centre.
-    anchor == "DEAD"  → no lanes; use last good bias, fade to 0 over time.
-
-    Junction steer injection
-    ────────────────────────
-    When map_action changes to LEFT/RIGHT/STRAIGHT the bias is applied for
-    JUNCTION_HOLD_S seconds so the car physically steers into the turn before
-    Stanley's own path-error term catches up.
-    """
-
-    # ── Centering offsets (degrees, additive to Stanley steer) ────────────────
-    DUAL_RIGHT_KEEP     =  2.0   # gentle right-keep when both lanes visible
-    SINGLE_RIGHT_CENTRE = -10.0  # only right edge visible → steer left to centre
-    SINGLE_LEFT_CENTRE  =  10.0  # only left edge visible → steer right to centre
-
-    # ── Junction biases (degrees) ─────────────────────────────────────────────
-    JUNCTION_LEFT_DEG   = -16.0  # extra steer left for LEFT turn
-    JUNCTION_RIGHT_DEG  =  16.0  # extra steer right for RIGHT turn
-    JUNCTION_STRAIGHT_DEG =  3.0 # keep right at a straight junction
-
-    # ── Timing ────────────────────────────────────────────────────────────────
-    JUNCTION_HOLD_S     =  2.0   # hold junction bias for this long
-    DEAD_FADE_S         =  1.5   # fade dead-reckoning bias to 0 over this time
-
-    def __init__(self):
-        self._last_bias        : float = 0.0
-        self._last_anchor      : str   = "DEAD"
-        self._dead_ts          : float = 0.0   # when DEAD started
-        self._junction_action  : str   = "STRAIGHT"
-        self._junction_ts      : float = 0.0
-        self._junction_active  : bool  = False
-        self.drive_side        : str   = "CENTER"
-        self.lane_reason       : str   = "INIT"
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def compute(self, map_action: str, anchor: str) -> float:
-        """
-        Returns a steer bias in degrees to be added to Stanley steer output.
-
-        map_action : from planner.get_next_action()  "STRAIGHT"|"LEFT"|"RIGHT"|"CCW"
-        anchor     : from PerceptionResult.anchor     "DUAL"|"LEFT"|"RIGHT"|"DEAD"
-        """
-        now = time.time()
-
-        # ── 1. Centering offset based on visible lanes ─────────────────────
-        if anchor == "DUAL":
-            centre_bias      = self.DUAL_RIGHT_KEEP
-            self.drive_side  = "CENTER"
-            self.lane_reason = "DUAL_CENTRE"
-            self._dead_ts    = 0.0
-        elif anchor == "RIGHT":
-            centre_bias      = self.SINGLE_RIGHT_CENTRE
-            self.drive_side  = "LEFT_OF_RIGHT_LANE"
-            self.lane_reason = "SINGLE_RIGHT→CENTRE"
-            self._dead_ts    = 0.0
-        elif anchor == "LEFT":
-            centre_bias      = self.SINGLE_LEFT_CENTRE
-            self.drive_side  = "RIGHT_OF_LEFT_LANE"
-            self.lane_reason = "SINGLE_LEFT→CENTRE"
-            self._dead_ts    = 0.0
-        else:  # DEAD — no lanes
-            if self._dead_ts == 0.0:
-                self._dead_ts = now
-            fade = 1.0 - min(1.0, (now - self._dead_ts) / self.DEAD_FADE_S)
-            centre_bias      = self._last_bias * fade
-            self.drive_side  = "DEAD"
-            self.lane_reason = f"DEAD_RECKONING(fade={fade:.2f})"
-
-        self._last_anchor = anchor
-
-        # ── 2. Junction bias when A* requests a turn ───────────────────────
-        # Latch a new junction when map_action changes to something non-trivial
-        if map_action != self._junction_action and map_action in ("LEFT", "RIGHT", "STRAIGHT", "CCW"):
-            self._junction_action = map_action
-            self._junction_ts     = now
-            self._junction_active = True
-            log.debug("PathAwareLaneSelector: junction → %s", map_action)
-
-        junction_bias = 0.0
-        if self._junction_active:
-            elapsed = now - self._junction_ts
-            if elapsed < self.JUNCTION_HOLD_S:
-                if self._junction_action == "LEFT":
-                    junction_bias     = self.JUNCTION_LEFT_DEG
-                    self.lane_reason += " +JCT_LEFT"
-                elif self._junction_action in ("RIGHT", "HIGHWAY_MERGE"):
-                    junction_bias     = self.JUNCTION_RIGHT_DEG
-                    self.lane_reason += " +JCT_RIGHT"
-                elif self._junction_action == "CCW":
-                    junction_bias     = self.JUNCTION_LEFT_DEG * 0.7   # soft left for roundabout
-                    self.lane_reason += " +JCT_CCW"
-                else:  # STRAIGHT
-                    junction_bias     = self.JUNCTION_STRAIGHT_DEG
-                    self.lane_reason += " +JCT_STR"
-            else:
-                self._junction_active = False
-                self._junction_action = "STRAIGHT"
-
-        total_bias = centre_bias + junction_bias
-        self._last_bias = total_bias
-        return total_bias
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1145,51 +1029,40 @@ class Orchestrator:
         self.MAP_W = 640; self.MAP_H = 480
         self.SEQ_W = 280; self.SEQ_H = 480
 
-        # Road-centring + junction steer injection
-        self._lane_selector = PathAwareLaneSelector()
-
         self._q_yolo  = queue.Queue(maxsize=1)
         self._q_bev   = queue.Queue(maxsize=1)
         self._q_loc   = queue.Queue(maxsize=1)
 
     def build_ui(self, root):
-        """BFMC v5 dashboard — screen-adaptive, zero-waste compact layout."""
+        """BFMC v5 dashboard — scrollable, works on any screen size."""
         self._root = root
         root.title("BFMC v5  \u2014  Autonomous Navigation Pilot")
         root.configure(bg="#080810")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # ── Detect usable screen area ─────────────────────────────────────────
-        # Reserve headroom for OS taskbars / titlebars (~60 px).
-        SW = root.winfo_screenwidth()
-        SH = root.winfo_screenheight() - 60
+        # ── Screen geometry ───────────────────────────────────────────────────
+        SW  = root.winfo_screenwidth()
+        SH  = root.winfo_screenheight()
 
-        # Fixed chrome heights (status bar + sign editor + control bar)
-        # Status bar: 28px, Sign editor: ~86px, Control bar: 28px → ~142px total
-        CHROME_H = 142
-        AVAIL_H  = SH - CHROME_H   # pixels available for the 3-column panel grid
+        # Content always uses full screen width; minimum 1200 for usability.
+        COL_GAP   = 2
+        COL_W     = (SW - COL_GAP * 2) // 3
 
-        # ── Compute panel sizes that fill the screen exactly ──────────────────
-        # Layout:  Col-0 (map+bev)  |  Col-1 (cam+loc)  |  Col-2 (seq+telem)
-        # Col widths: map=col1=col0_w, seq panel narrower.
-        # 3 columns + 2 gaps of 2px each → col_w = (SW - 4) / 3
-        COL_GAP  = 2
-        COL_W    = (SW - COL_GAP * 2) // 3
+        # Panel height: each column stacks 2 panels.
+        # Chrome (status+editor+control) ~= 140px → each panel gets half the rest.
+        # Cap at 500, floor at 280 so it's always usable.
+        CHROME_H  = 140
+        PANEL_H   = max(280, min(500, (SH - CHROME_H) // 2))
 
-        # Each column has 2 panels stacked; they share AVAIL_H equally.
-        PANEL_H  = AVAIL_H // 2
-
-        # Individual panel dimensions (images rendered at these sizes)
         self.MAP_W = COL_W;  self.MAP_H = PANEL_H
         self.CAM_W = COL_W;  self.CAM_H = PANEL_H
         self.LOC_W = COL_W;  self.LOC_H = PANEL_H
         self.TEL_W = COL_W;  self.TEL_H = PANEL_H
         self.SEQ_W = COL_W;  self.SEQ_H = PANEL_H
 
-        # Rebuild loc_panel at the correct size now that we know dimensions
         self._loc_panel = LocalizationPanel(self.LOC_W, self.LOC_H)
 
-        # ── Colour tokens ─────────────────────────────────────────────────────
+        # ── Colours ───────────────────────────────────────────────────────────
         BG      = "#080810"
         PANEL   = "#08080f"
         SIGN_BG = "#06060e"
@@ -1206,22 +1079,23 @@ class Orchestrator:
             value=f"{len(self.sign_map) if self.sign_map else 0} signs")
         self._sv_announce    = tk.StringVar(value="")
 
-        # ═════════════════════════════════════════════════════════════════════
-        # BLOCK 1 — STATUS BAR (28 px, full width)
-        # ═════════════════════════════════════════════════════════════════════
-        self._sf = tk.Frame(root, bg=BG, height=28)
-        self._sf.pack(fill=tk.X, side=tk.TOP)
+        # ═══════════════════════════════════════════════════════════════════
+        # FIXED TOP CHROME — status bar + sign editor (never scrolls)
+        # ═══════════════════════════════════════════════════════════════════
+        top_chrome = tk.Frame(root, bg=BG)
+        top_chrome.pack(fill=tk.X, side=tk.TOP)
+
+        # Status bar
+        self._sf = tk.Frame(top_chrome, bg=BG, height=26)
+        self._sf.pack(fill=tk.X)
         self._sf.pack_propagate(False)
         self._sl = tk.Label(self._sf, bg=BG, anchor=tk.W)
         self._sl.pack(fill=tk.BOTH, expand=True)
-        self._refresh_status_label(np.full((28, SW, 3), 12, np.uint8))
+        self._refresh_status_label(np.full((26, max(SW, 1200), 3), 12, np.uint8))
 
-        # ═════════════════════════════════════════════════════════════════════
-        # BLOCK 2 — SIGN PLACEMENT EDITOR  (compact, no wasted padding)
-        # ═════════════════════════════════════════════════════════════════════
-        se_outer = tk.Frame(root, bg=SIGN_BG)
-        se_outer.pack(fill=tk.X, side=tk.TOP)
-        # Thin accent top-border
+        # Sign editor
+        se_outer = tk.Frame(top_chrome, bg=SIGN_BG)
+        se_outer.pack(fill=tk.X)
         tk.Frame(se_outer, bg=_ACCENT, height=1).pack(fill=tk.X)
 
         ctrl_row = tk.Frame(se_outer, bg=SIGN_BG)
@@ -1292,13 +1166,11 @@ class Orchestrator:
         tk.Label(ctrl_row, textvariable=self._sv_sign_count,
                  bg=SIGN_BG, fg=_ACCENT,
                  font=("Consolas", 8)).pack(side=tk.LEFT, padx=8)
-
         tk.Label(ctrl_row,
                  text="\u2460 type  \u2461 place  \u2462 L-click  \u2463 R-removes",
                  bg=SIGN_BG, fg=_FG_DIM,
                  font=("Consolas", 7)).pack(side=tk.RIGHT, padx=4)
 
-        # ── Sign-type button rows (2 × 5, ultra-compact) ──────────────────────
         SIGN_COLORS = {
             "traffic-light": ("#e63232","#fff"), "stop":    ("#c0392b","#fff"),
             "parking":       ("#e67e22","#fff"), "crosswalk":("#00ced1","#000"),
@@ -1308,10 +1180,10 @@ class Orchestrator:
         }
         SIGN_LABELS = {
             "traffic-light": "\U0001f6a6 TRF LIGHT", "stop":    "\U0001f6d1 STOP",
-            "parking":       "\U0001f17f PARKING",  "crosswalk":"\u2b1c XWALK",
-            "priority":      "\u25b2 PRIORITY",     "highway-entry":"H\u207a HWY IN",
-            "highway-exit":  "H\u207b HWY OUT",     "one-way": "\u2192 ONE-WAY",
-            "roundabout":    "\u21ba ROUNDABOUT",   "no-entry":"\u2296 NO ENTRY",
+            "parking":       "\U0001f17f PARKING",   "crosswalk":"\u2b1c XWALK",
+            "priority":      "\u25b2 PRIORITY",      "highway-entry":"H\u207a HWY IN",
+            "highway-exit":  "H\u207b HWY OUT",      "one-way": "\u2192 ONE-WAY",
+            "roundabout":    "\u21ba ROUNDABOUT",    "no-entry":"\u2296 NO ENTRY",
         }
         SIGN_DESCR = {
             "traffic-light":"Stop at RED, go on GREEN","stop":"Halt 3 s at intersection",
@@ -1320,7 +1192,6 @@ class Orchestrator:
             "highway-exit":"Switch back to city rules","one-way":"Follow one-way direction",
             "roundabout":"Follow CCW roundabout rules","no-entry":"Block node, reroute",
         }
-
         self._selected_sign_type = tk.StringVar(value=SIGN_TYPES[0])
         self._sign_btns = {}
 
@@ -1333,7 +1204,8 @@ class Orchestrator:
                     is_sel = (t2 == stype)
                     b2.config(bg="#e8e8e8" if is_sel else nc2,
                               fg="#000000" if is_sel else fc2,
-                              relief=tk.SUNKEN if is_sel else tk.FLAT, bd=1 if is_sel else 0)
+                              relief=tk.SUNKEN if is_sel else tk.FLAT,
+                              bd=1 if is_sel else 0)
                 hint = SIGN_DESCR.get(stype, "")
                 if self._sign_place_mode:
                     self._sv_hint.set(f"PLACE [{stype}] \u2014 {hint}")
@@ -1345,7 +1217,6 @@ class Orchestrator:
         btn_area.pack(fill=tk.X, padx=4, pady=(0, 2))
         sr0 = tk.Frame(btn_area, bg=SIGN_BG); sr0.pack(fill=tk.X)
         sr1 = tk.Frame(btn_area, bg=SIGN_BG); sr1.pack(fill=tk.X)
-
         for i, st in enumerate(SIGN_TYPES):
             nc, fc = SIGN_COLORS.get(st, ("#333","#fff"))
             lb     = SIGN_LABELS.get(st, st.upper())
@@ -1358,86 +1229,16 @@ class Orchestrator:
             b.pack(side=tk.LEFT, padx=1, pady=0)
             self._sign_btns[st] = b
         _make_select(SIGN_TYPES[0])()
-
-        # Thin separator under editor
         tk.Frame(se_outer, bg="#1a1a2a", height=1).pack(fill=tk.X)
 
-        # ═════════════════════════════════════════════════════════════════════
-        # BLOCK 3 — ANNOUNCEMENT BANNER (hidden until triggered)
-        # ═════════════════════════════════════════════════════════════════════
-        self._announce_lbl = tk.Label(root, textvariable=self._sv_announce,
+        # Announcement banner (hidden until triggered, sits in top chrome)
+        self._announce_lbl = tk.Label(top_chrome, textvariable=self._sv_announce,
             bg="#030f06", fg="#00ff88", font=("Consolas", 10, "bold"),
             anchor=tk.CENTER, pady=2, relief=tk.FLAT)
 
-        # ═════════════════════════════════════════════════════════════════════
-        # BLOCK 4 — MAIN PANEL GRID (fills remaining space, zero gaps)
-        # ═════════════════════════════════════════════════════════════════════
-        main_grid = tk.Frame(root, bg=BG)
-        main_grid.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
-
-        def _panel_label(parent, title, color):
-            """Thin labelled header bar + image label — no LabelFrame border waste."""
-            hdr = tk.Frame(parent, bg="#0e0e1c", height=16)
-            hdr.pack(fill=tk.X)
-            hdr.pack_propagate(False)
-            tk.Label(hdr, text=f"  {title}", bg="#0e0e1c", fg=color,
-                     font=("Consolas", 7, "bold"), anchor=tk.W).pack(
-                         side=tk.LEFT, fill=tk.Y)
-            lbl = tk.Label(parent, bg=PANEL, cursor="arrow")
-            lbl.pack(fill=tk.BOTH)
-            return lbl
-
-        # Col 0 — MAP + BEV
-        col0 = tk.Frame(main_grid, bg=BG)
-        col0.grid(row=0, column=0, padx=(0, COL_GAP), sticky="nsew")
-        self._map_label = _panel_label(col0, "MAP \u2014 GraphML Arena  [L-click place \u2022 R-click remove]", "#00e5ff")
-        self._map_label.bind("<Button-1>", self._on_map_click)
-        self._map_label.bind("<Button-3>", self._on_map_right_click)
-        blank_map = np.full((self.MAP_H, self.MAP_W, 3), 8, np.uint8)
-        self._map_ph = ImageTk.PhotoImage(Image.fromarray(blank_map))
-        self._map_label.config(image=self._map_ph)
-
-        self._bev_label = _panel_label(col0, "LANE VIEW \u2014 Bird's Eye", "#69ff47")
-        blank_bev = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
-        self._bev_ph = ImageTk.PhotoImage(Image.fromarray(blank_bev))
-        self._bev_label.config(image=self._bev_ph)
-
-        # Col 1 — CAMERA + LOCALIZATION
-        col1 = tk.Frame(main_grid, bg=BG)
-        col1.grid(row=0, column=1, padx=(0, COL_GAP), sticky="nsew")
-        self._yolo_label = _panel_label(col1, "CAMERA \u2014 YOLO Detection", "#ff9100")
-        blank_cam = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
-        self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(blank_cam))
-        self._yolo_label.config(image=self._yolo_ph)
-
-        self._loc_label = _panel_label(col1, "LOCALIZATION ENGINE", "#cc44ff")
-        blank_loc = np.full((self.LOC_H, self.LOC_W, 3), 10, np.uint8)
-        self._loc_ph = ImageTk.PhotoImage(Image.fromarray(blank_loc))
-        self._loc_label.config(image=self._loc_ph)
-
-        # Col 2 — SIGN SEQUENCE + TELEMETRY
-        col2 = tk.Frame(main_grid, bg=BG)
-        col2.grid(row=0, column=2, sticky="nsew")
-        self._seq_panel = SignSequencePanel(self.SEQ_W, self.SEQ_H)
-        self._seq_label = _panel_label(col2, "SIGN ROUTE SEQUENCE", "#00e5a0")
-        blank_seq = np.full((self.SEQ_H, self.SEQ_W, 3), 10, np.uint8)
-        self._seq_ph = ImageTk.PhotoImage(Image.fromarray(blank_seq))
-        self._seq_label.config(image=self._seq_ph)
-
-        self._telem_label = _panel_label(col2, "TELEMETRY", "#ff9100")
-        blank_tel = np.full((self.TEL_H, self.TEL_W, 3), 10, np.uint8)
-        self._telem_ph = ImageTk.PhotoImage(Image.fromarray(blank_tel))
-        self._telem_label.config(image=self._telem_ph)
-
-        # Uniform column weights so grid fills width perfectly
-        main_grid.columnconfigure(0, weight=1)
-        main_grid.columnconfigure(1, weight=1)
-        main_grid.columnconfigure(2, weight=1)
-        main_grid.rowconfigure(0, weight=1)
-
-        # ═════════════════════════════════════════════════════════════════════
-        # BLOCK 5 — CONTROL BAR (28 px, bottom)
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
+        # FIXED BOTTOM CHROME — control bar (never scrolls)
+        # ═══════════════════════════════════════════════════════════════════
         tk.Frame(root, bg="#00aa66", height=1).pack(fill=tk.X, side=tk.BOTTOM)
         cb = tk.Frame(root, bg="#060610", height=28)
         cb.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1447,7 +1248,6 @@ class Orchestrator:
                  font=("Consolas", 7)).pack(side=tk.LEFT, padx=6)
         tk.Label(cb, textvariable=self._sv_hint, bg="#060610", fg="#d0b040",
                  font=("Consolas", 8, "bold")).pack(side=tk.LEFT, padx=4)
-
         for lbl, bg, abg, fn in [
             ("\u26d4 E-STOP", "#500000", "#800000", self._estop_cb),
             ("\u25b6 RESUME", "#0b220b", "#183018", self._resume_cb),
@@ -1460,9 +1260,154 @@ class Orchestrator:
                       activebackground=abg, activeforeground="#fff",
                       command=fn).pack(side=tk.RIGHT, padx=2)
 
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
+        # SCROLLABLE CONTENT AREA
+        # Canvas + scrollbars.  Mouse-wheel scrolls vertically.
+        # Shift+wheel or horizontal drag scrolls horizontally.
+        # ═══════════════════════════════════════════════════════════════════
+        scroll_outer = tk.Frame(root, bg=BG)
+        scroll_outer.pack(fill=tk.BOTH, expand=True)
+
+        v_scroll = tk.Scrollbar(scroll_outer, orient=tk.VERTICAL,
+                                bg="#141420", troughcolor="#0a0a14",
+                                activebackground=_ACCENT, width=10)
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        h_scroll = tk.Scrollbar(scroll_outer, orient=tk.HORIZONTAL,
+                                bg="#141420", troughcolor="#0a0a14",
+                                activebackground=_ACCENT, width=10)
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._scroll_canvas = tk.Canvas(
+            scroll_outer, bg=BG, highlightthickness=0,
+            yscrollcommand=v_scroll.set,
+            xscrollcommand=h_scroll.set)
+        self._scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        v_scroll.config(command=self._scroll_canvas.yview)
+        h_scroll.config(command=self._scroll_canvas.xview)
+
+        # ── Inner frame — all panels live here ──────────────────────────────
+        inner = tk.Frame(self._scroll_canvas, bg=BG)
+        _inner_id = self._scroll_canvas.create_window(
+            (0, 0), window=inner, anchor=tk.NW)
+
+        # ── Scroll helpers ────────────────────────────────────────────────────
+        def _vscroll(event):
+            if event.num == 4:
+                self._scroll_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self._scroll_canvas.yview_scroll(1, "units")
+            else:
+                self._scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+        def _hscroll(event):
+            if event.num == 4:
+                self._scroll_canvas.xview_scroll(-1, "units")
+            elif event.num == 5:
+                self._scroll_canvas.xview_scroll(1, "units")
+            else:
+                self._scroll_canvas.xview_scroll(int(-event.delta / 120), "units")
+
+        def _bind_scroll(widget):
+            """Recursively bind mousewheel on widget and all descendants."""
+            widget.bind("<MouseWheel>",       _vscroll, add="+")
+            widget.bind("<Button-4>",         _vscroll, add="+")
+            widget.bind("<Button-5>",         _vscroll, add="+")
+            widget.bind("<Shift-MouseWheel>", _hscroll, add="+")
+            widget.bind("<Shift-Button-4>",   _hscroll, add="+")
+            widget.bind("<Shift-Button-5>",   _hscroll, add="+")
+            for child in widget.winfo_children():
+                _bind_scroll(child)
+
+        # Bind now on root & canvas; re-bind on inner after all children exist
+        for w in (root, self._scroll_canvas):
+            _bind_scroll(w)
+
+        def _update_scrollregion(*_):
+            self._scroll_canvas.configure(
+                scrollregion=self._scroll_canvas.bbox("all"))
+
+        def _on_canvas_resize(event):
+            # Keep inner frame at least as wide as the canvas viewport
+            req = inner.winfo_reqwidth()
+            new_w = max(req, event.width)
+            self._scroll_canvas.itemconfig(_inner_id, width=new_w)
+            _update_scrollregion()
+
+        inner.bind("<Configure>", _update_scrollregion)
+        self._scroll_canvas.bind("<Configure>", _on_canvas_resize)
+
+        # ── Panel grid inside the scrollable inner frame ─────────────────────
+        def _panel_label(parent, title, color):
+            """16-px accent header bar + image label — zero border waste."""
+            hdr = tk.Frame(parent, bg="#0d0d1c", height=16)
+            hdr.pack(fill=tk.X)
+            hdr.pack_propagate(False)
+            tk.Label(hdr, text=f"  {title}", bg="#0d0d1c", fg=color,
+                     font=("Consolas", 7, "bold"), anchor=tk.W).pack(
+                         side=tk.LEFT, fill=tk.Y)
+            lbl = tk.Label(parent, bg=PANEL, cursor="arrow")
+            lbl.pack()
+            return lbl
+
+        main_grid = tk.Frame(inner, bg=BG)
+        main_grid.pack(anchor=tk.NW)
+
+        # Column 0 — MAP + BEV
+        col0 = tk.Frame(main_grid, bg=BG)
+        col0.grid(row=0, column=0, padx=(0, COL_GAP), sticky="nw")
+        self._map_label = _panel_label(
+            col0, "MAP \u2014 GraphML Arena  [L-click place \u2022 R-click remove]", "#00e5ff")
+        self._map_label.bind("<Button-1>", self._on_map_click)
+        self._map_label.bind("<Button-3>", self._on_map_right_click)
+        blank_map = np.full((self.MAP_H, self.MAP_W, 3), 8, np.uint8)
+        self._map_ph = ImageTk.PhotoImage(Image.fromarray(blank_map))
+        self._map_label.config(image=self._map_ph)
+
+        self._bev_label = _panel_label(col0, "LANE VIEW \u2014 Bird's Eye", "#69ff47")
+        blank_bev = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+        self._bev_ph = ImageTk.PhotoImage(Image.fromarray(blank_bev))
+        self._bev_label.config(image=self._bev_ph)
+
+        # Column 1 — CAMERA + LOCALIZATION
+        col1 = tk.Frame(main_grid, bg=BG)
+        col1.grid(row=0, column=1, padx=(0, COL_GAP), sticky="nw")
+        self._yolo_label = _panel_label(col1, "CAMERA \u2014 YOLO Detection", "#ff9100")
+        blank_cam = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+        self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(blank_cam))
+        self._yolo_label.config(image=self._yolo_ph)
+
+        self._loc_label = _panel_label(col1, "LOCALIZATION ENGINE", "#cc44ff")
+        blank_loc = np.full((self.LOC_H, self.LOC_W, 3), 10, np.uint8)
+        self._loc_ph = ImageTk.PhotoImage(Image.fromarray(blank_loc))
+        self._loc_label.config(image=self._loc_ph)
+
+        # Column 2 — SIGN SEQUENCE + TELEMETRY
+        col2 = tk.Frame(main_grid, bg=BG)
+        col2.grid(row=0, column=2, sticky="nw")
+        self._seq_panel = SignSequencePanel(self.SEQ_W, self.SEQ_H)
+        self._seq_label = _panel_label(col2, "SIGN ROUTE SEQUENCE", "#00e5a0")
+        blank_seq = np.full((self.SEQ_H, self.SEQ_W, 3), 10, np.uint8)
+        self._seq_ph = ImageTk.PhotoImage(Image.fromarray(blank_seq))
+        self._seq_label.config(image=self._seq_ph)
+
+        self._telem_label = _panel_label(col2, "TELEMETRY", "#ff9100")
+        blank_tel = np.full((self.TEL_H, self.TEL_W, 3), 10, np.uint8)
+        self._telem_ph = ImageTk.PhotoImage(Image.fromarray(blank_tel))
+        self._telem_label.config(image=self._telem_ph)
+
+        # Bind scroll on all inner widgets now that they exist
+        _bind_scroll(inner)
+
+        # Force scrollregion after layout settles (next event-loop tick)
+        root.after(100, _update_scrollregion)
+
+        # Window: fill screen, let OS handle taskbar offset
+        root.geometry(f"{SW}x{SH - 40}+0+0")
+
+        # ═══════════════════════════════════════════════════════════════════
         # Init map canvas renderer
-        # ═════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════
         if self.localizer.planner:
             self._map_canvas = GraphMLMapCanvas(
                 self.localizer.planner, self.MAP_W, self.MAP_H)
@@ -1938,25 +1883,7 @@ class Orchestrator:
                         upcoming_curve=upcoming_curve,
                         curve_dist_m=curve_dist_m)
 
-                    # ── PATH-AWARE LANE CENTERING + JUNCTION STEER BIAS ────────
-                    # PathAwareLaneSelector keeps the car centred on the road:
-                    #  • Both lanes visible (DUAL anchor) → +2° right-keep bias
-                    #  • Only right line visible → −10° to move away from edge
-                    #  • Only left line visible  → +10° to move away from edge
-                    #  • No lanes (DEAD)         → bias fades to 0 over 1.5 s
-                    # On top of that, junction bias from A* (LEFT/RIGHT/STRAIGHT):
-                    #  • LEFT  junction → −16° for 2 s
-                    #  • RIGHT junction → +16° for 2 s
-                    #  • STRAIGHT jct   →  +3° to resist wrong-turn drift
-                    _anchor = getattr(perc, 'anchor', 'DEAD')
-                    _lane_bias = self._lane_selector.compute(map_action, _anchor)
-                    # Clamp to ±20° so it can never overpower the Stanley term
-                    _lane_bias = max(-20.0, min(20.0, _lane_bias))
-                    ctrl.steer_angle_deg += _lane_bias
-                    log.debug("LaneSel anchor=%s action=%s bias=%+.1f° → steer=%+.1f°",
-                              _anchor, map_action, _lane_bias, ctrl.steer_angle_deg)
-
-
+                    # --- AUTO-SLOW NEAR PLACED SIGNS ---
                     # Smoothly reduce speed when car is approaching any mapped sign.
                     # Linear ramp: full speed at SLOW_SIGN_M, 50% at 0 m (sign centre).
                     # This is independent of YOLO — works from map distance alone.
