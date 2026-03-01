@@ -146,6 +146,7 @@ class HardwareIO:
                     else:
                         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     self._push_frame(cv2.resize(frame, (640, 480)))
+                    time.sleep(0.010)   # Throttle to ~60-90 FPS max to save CPU
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")
                 time.sleep(0.033)   # brief pause only on error, then retry

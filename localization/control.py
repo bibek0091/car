@@ -115,7 +115,8 @@ class DividerGuard:
                 triggered   = True
 
         if div_corr > 0 and edge_corr > 0:
-            correction = max(div_corr - edge_corr, self.DEADBAND_PX * self.GAIN)
+            # Squeezed between both lines: prioritize center divider (stay right)
+            correction = div_corr
         else:
             correction = div_corr - edge_corr
 
@@ -206,7 +207,7 @@ class Controller:
         # F-10: minimum speed floor — prevents stacked multipliers stalling mid-track.
         # 16 PWM = just above the 12 PWM deadband. Only applies in normal driving.
         MINIMUM_DRIVE_PWM = 16.0
-        if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0:
+        if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0 and traffic_mult >= 1.0:
             final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
 
         return ControlOutput(

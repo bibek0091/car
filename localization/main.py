@@ -74,16 +74,13 @@ except ImportError:
 
     @dataclass
     class TrafficResult:
-        state:               str   = "SYS_GO"
-        reason:              str   = "NO TRAFFIC MODULE"
-        speed_multiplier:    float = 1.0
-        zone_mode:           str   = "CITY"
-        parking_state:       str   = "NONE"
-        steer_bias:          float = 0.0
-        pedestrian_blocking: bool  = False
-        light_status:        str   = "NONE"
-        active_labels:       List  = field(default_factory=list)
-        yolo_debug_frame:    object = None
+        state: str = "SYS_GO"
+        reason: str = "OK"
+        speed_multiplier: float = 1.0
+        active_labels: list = field(default_factory=list)
+        yolo_debug_frame: object = None
+        sign_approach_m: float = 99.0
+        zone_mode: str = "CITY"
 
     class ThreadedYOLODetector:
         def __init__(self, *a, **kw): pass
@@ -273,6 +270,10 @@ class GraphMLMapCanvas:
 
     def add_trail_point(self, x, y):
         self._trail.append((x, y))
+
+    def draw_map(self):
+        """Re-draws the static base map (e.g., after clearing signs)."""
+        self._base = self._build_base()
 
     def render(self, car_x, car_y, car_yaw, path, cursor, conf,
                zone, snap_miss, heading_conf, sign_map=None,
@@ -1158,7 +1159,7 @@ class Orchestrator:
             ("\u25a4 Save",  "#0c1e0c", "#143014", _save_signs),
         ]:
             tk.Button(ctrl_row, text=lbl, bg=bg, fg=_FG_BRIGHT,
-                      font=("Consolas", 8, "bold"),
+                      font=("Consolas", 9, "bold"),
                       relief=tk.FLAT, bd=0, padx=7, pady=2,
                       activebackground=abg, activeforeground="#fff",
                       command=fn).pack(side=tk.LEFT, padx=2)
@@ -1614,7 +1615,7 @@ class Orchestrator:
             # ── Status bar ────────────────────────────────────────────────
             cd  = getattr(self.localizer, 'curve_dist_m', 99.0)
             uc  = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
-            si  = _status_bar(1280, self._estop, self._fps, zone,
+            si = _status_bar(1280, self._estop, self._fps, zone,
                               self._nav_state, uc, cd, conf, snap_miss)
             self._refresh_status_label(si)
 
@@ -1707,30 +1708,19 @@ class Orchestrator:
                     for lbl in t_res.active_labels:
                         matched = self.sign_map.match_detection(
                             lbl, x_snap, y_snap, radius_m=3.0)
-                        if matched and matched["id"] != self._last_snap_id:
-                            _, _, yaw_now = self.localizer.get_pose()
-                            
-                            # Real-world distance estimated by YOLO bounding box height
-                            d_obs = min(t_res.sign_approach_m, 4.0)
-                            
-                            # Current theoretical distance on the map
-                            d_est = math.hypot(matched["x_m"] - x_snap, matched["y_m"] - y_snap)
-                            
-                            # Shift car along its heading vector to correct longitudinal odometry drift
-                            # (prevents teleporting the car laterally off the road onto the signpost)
-                            shift_m = d_est - d_obs
-                            true_x = x_snap + shift_m * math.cos(yaw_now)
-                            true_y = y_snap + shift_m * math.sin(yaw_now)
-                            
-                            self.localizer.set_pose(true_x, true_y, yaw_now)
-                            self._last_snap_id = matched["id"]
-                            log.info(
-                                "SIGN SNAP: %s \u2192 shifted %+.2fm (est=%.2f, obs=%.2f)",
-                                lbl, shift_m, d_est, d_obs)
-                            self._announce_msg = f"SNAP: {lbl} \u2192 shifted {shift_m:+.1f}m"
-                            break  # one snap per frame
+                        if matched:
+                            if matched["id"] != self._last_snap_id:
+                                _, _, yaw_now = self.localizer.get_pose()
+                                d_obs = min(t_res.sign_approach_m, 4.0)
+                                d_est = math.hypot(matched["x_m"] - x_snap, matched["y_m"] - y_snap)
+                                shift_m = d_est - d_obs
+                                true_x = x_snap + shift_m * math.cos(yaw_now)
+                                true_y = y_snap + shift_m * math.sin(yaw_now)
+                                self.localizer.set_pose(true_x, true_y, yaw_now)
+                                self._last_snap_id = matched["id"]
+                                log.info("SIGN SNAP: %s \u2192 shifted %+.2fm", lbl, shift_m)
+                            break  # Found a match, stop searching and don't reset lock
                     else:
-                        # Reset snap lock when no sign detected nearby
                         self._last_snap_id = None
 
                 self._last_t_res = t_res
@@ -1760,7 +1750,7 @@ class Orchestrator:
                     # If lanes are visible again, clear E-STOP and resume driving.
                     try:
                         recovery_perc = self.vision.process(raw_frame, dt=dt)
-                        if recovery_perc.confidence > 0.4:
+                        if recovery_perc.confidence > 0.4 and not self._dest_reached:
                             self._estop = False
                             _ll = 0
                             log.info("F-15: E-STOP cleared — lanes re-detected (conf=%.2f)", recovery_perc.confidence)
@@ -1845,6 +1835,7 @@ class Orchestrator:
                         if self._nav_state == 'TUNNEL_ENTRY':
                             self._nav_state = 'NORMAL'
                             log.info("Fix-6: TUNNEL_EXIT — lanes resuming")
+                        
                         perc = self.vision.process(
                             raw_frame,
                             dt=dt,
@@ -1854,7 +1845,15 @@ class Orchestrator:
                             last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0),
                             upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
                             pitch_rad=_pitch_rad)
-                    self._last_conf = perc.confidence; self._last_perc = perc
+                    
+                    self._last_conf = perc.confidence
+                    self._last_perc = perc
+
+                    # --- PATH-ACTION & NEARBY SIGNS ---
+                    nearby_signs = []
+                    if self.sign_map:
+                        sx, sy, _ = self.localizer.get_pose()
+                        nearby_signs = self.sign_map.get_nearby_signs(sx, sy, radius_m=2.0)
 
                     # Fix-2: direct map-cursor action — JunctionDetector removed.
                     map_action = "STRAIGHT"
@@ -2014,11 +2013,17 @@ class Orchestrator:
         if not self.running: self._start_pilot()
         else: self._estop=False; self._sv_hint.set("Resumed")
 
-    def _reset_route(self):
-        self._start_node=None; self._target_node=None
-        self._planned_path=[]; self._path_cursor=0
-        self.localizer.reset_cursor(); self._map_renderer._trail.clear()
-        self._sv_hint.set("Route cleared. Click map: set START")
+    def _reset_route(self, event=None):
+        self._start_node  = None
+        self._target_node = None
+        self._planned_path= []
+        self._path_cursor = 0
+        if self._map_canvas:
+            self._map_canvas._trail.clear()
+            self._map_canvas.draw_map()
+        self.localizer.reset_cursor()
+        self._sv_hint.set("Route cleared. Click two nodes to plan.")
+        log.info("Route reset by user.")
 
     def _on_close(self):
         self.running=False; self._estop=True

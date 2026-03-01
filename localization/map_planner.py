@@ -47,6 +47,7 @@ import networkx as nx
 import numpy as np
 import logging
 import math
+import time
 from scipy.spatial import KDTree
 
 log = logging.getLogger(__name__)
@@ -203,14 +204,15 @@ class PathPlanner:
                     self._roundabout_nodes.add(nid)
                     break
 
-            # Highway
-            if nx_ > _HW_X_MIN and ny_ > _HW_Y_MIN:
-                self._highway_nodes.add(nid)
-
-            # Speed oval (subset of highway-x range, tighter bounds)
-            if (_OVAL_X_MIN <= nx_ <= _OVAL_X_MAX and
-                    _OVAL_Y_MIN <= ny_ <= _OVAL_Y_MAX):
+            # ── Speed oval ──
+            in_oval = (_OVAL_X_MIN <= nx_ <= _OVAL_X_MAX and
+                       _OVAL_Y_MIN <= ny_ <= _OVAL_Y_MAX)
+            if in_oval:
                 self._oval_nodes.add(nid)
+
+            # ── Highway (excluding oval) ──
+            if not in_oval and nx_ > _HW_X_MIN and ny_ > _HW_Y_MIN:
+                self._highway_nodes.add(nid)
 
             # Bus lane
             if _in_bus_zone(nx_, ny_):

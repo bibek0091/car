@@ -558,9 +558,8 @@ class BehaviorController:
         # ── Parking ───────────────────────────────────────────────────────────
         parking_sign = any(k in active_lower
                            for k in ("parking", "park-sign", "park_sign"))
-        if self._zone_mode == "PARKING":
-            # Zone-based trigger if sign not yet seen
-            parking_sign = True
+        # F-01: zone-based trigger removed to prevent accidental drift-triggered parking.
+        # Car now strictly requires seeing a parking sign to trigger the FSM.
 
         if parking_sign and not self.parking_fsm.active:
             self.parking_fsm.trigger(now)

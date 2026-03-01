@@ -256,7 +256,7 @@ class V2XManager:
         self.v2x.tl_sub.get_state(node_id) — current TL state
     """
     def __init__(self, state_fn=None):
-        self.correction_q  = queue.Queue(maxsize=1)
+        self.correction_q  = queue.Queue(maxsize=8)
         self._tl_states    = {}
         self._state_fn     = state_fn or (lambda: {})
 
@@ -269,6 +269,8 @@ class V2XManager:
                          self.obstacle_rpt, self.tl_sub]
 
     def start(self):
+        if SERVER_IP == "192.168.1.1":
+            log.warning("V2XManager: SERVER_IP is still placeholder '192.168.1.1' — verify on-site!")
         for t in self._threads:
             if not t.is_alive():
                 t.start()

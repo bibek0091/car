@@ -382,9 +382,12 @@ class TrafficDecisionEngine:
         Returns ("RED"|"YELLOW"|"GREEN"|"NONE", pixel_mass).
         """
         fh, fw = frame.shape[:2]
+        # Clamp to image boundaries
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(fw, x2), min(fh, y2)
-        if y2 - y1 < 15 or x2 - x1 < 10:
+        
+        # Zero-size check to prevent cv2.cvtColor crash
+        if x1 >= x2 or y1 >= y2 or (y2 - y1) < 15 or (x2 - x1) < 10:
             return "NONE", 0
         crop = frame[y1:y2, x1:x2]
         hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)

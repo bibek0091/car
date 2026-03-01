@@ -427,10 +427,10 @@ class VisionPipeline:
             velocity_ms, last_steering
         )
         
-        if target_x is None:
+        if target_x is None or "DEAD_RECKONING" in anchor:
             self.lost_frames += 1
-            self.tracker.dead_reckoner.accumulate(dt)   # A-03: accumulate real time
-            target_x = self.last_target_x
+            self.tracker.dead_reckoner.accumulate(dt)
+            if target_x is None: target_x = self.last_target_x
         else:
             self.lost_frames = 0
             self.last_target_x = target_x
@@ -440,30 +440,37 @@ class VisionPipeline:
         conf = 1.0 if (sl is not None and sr is not None) else 0.5 if (sl is not None or sr is not None) else 0.0
         
         # F-02: heading averaged from BOTH lane lines when available
-        # Left-only heading is unreliable when sl has a noisy 2nd-order coefficient.
         heading_rad = 0.0
+        h_conf      = 0.0
         def _lane_heading(fit, y):
             return math.atan2(np.polyval(fit, y - 50) - np.polyval(fit, y), 50)
+        
         if sl is not None and sr is not None:
-            heading_rad = (_lane_heading(sl, y_eval) + _lane_heading(sr, y_eval)) / 2.0
+            hl = _lane_heading(sl, y_eval)
+            hr = _lane_heading(sr, y_eval)
+            heading_rad = (hl + hr) / 2.0
+            # heading_conf is agreement between lane lines: lower if they diverge
+            h_conf = max(0.0, 1.0 - abs(hl - hr) * 2.0)
         elif sl is not None:
             heading_rad = _lane_heading(sl, y_eval)
+            h_conf = 0.4
         elif sr is not None:
             heading_rad = _lane_heading(sr, y_eval)
-
+            h_conf = 0.4
+        
         return PerceptionResult(
             warped_binary=warped_binary,
             lane_dbg=line_dbg,
             sl=sl, sr=sr,
             target_x=target_x,
-            lateral_error_px=target_x - 320.0,
+            lateral_error_px=(320.0 - target_x),
             anchor=anchor,
             confidence=conf,
+            heading_rad=heading_rad,
+            heading_conf=h_conf,
             lane_width_px=lw,
             curvature=curv,
-            heading_rad=heading_rad,
-            heading_conf=conf,
             y_eval=y_eval,
             optical_yaw_rate=opt_yaw_rate,
-            optical_vel=opt_vel,
+            optical_vel=opt_vel
         )

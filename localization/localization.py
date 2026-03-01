@@ -404,9 +404,10 @@ class LocalizationEngine:
             # LOC-C: absolute heading soft-fusion
             if (heading_conf >= self._MIN_HEADING_CONF
                     and abs(camera_heading_rad) < 0.6):
-                # camera_heading_rad is in BEV frame; negate for map yaw correction
-                heading_err = -camera_heading_rad - 0.0  # how far yaw deviates
-                # Only apply if the signal agrees with current yaw sign
+                # camera_heading_rad is BEV frame; negate for map yaw comparison.
+                # heading_err is (visual_obs_yaw - current_localizer_yaw).
+                obs_yaw     = -camera_heading_rad
+                heading_err = (obs_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
                 if abs(heading_err) < 0.5:
                     corr = self._ABS_HEADING_GAIN * heading_err * heading_conf
                     corr = max(-self._ABS_HEADING_MAX_CORR,
@@ -452,8 +453,8 @@ class LocalizationEngine:
             n = path[i]
             if n not in self.planner.node_positions:
                 continue
-            nx_, ny_ = self.planner.node_positions[n]
-            d = math.hypot(nx_ - self.x, ny_ - self.y)
+            node_x, node_y = self.planner.node_positions[n]
+            d = math.hypot(node_x - self.x, node_y - self.y)
             if d < best_d:
                 best_d  = d
                 best_idx = i
@@ -486,78 +487,14 @@ class LocalizationEngine:
             n = path[i]
             if n not in self.planner.node_positions:
                 continue
-            nx_, ny_ = self.planner.node_positions[n]
-            d = math.hypot(nx_ - x, ny_ - y)
+            node_x, node_y = self.planner.node_positions[n]
+            d = math.hypot(node_x - x, node_y - y)
             if d < best_d:
                 best_d  = d
                 best_idx = i
 
-        self._path_cursor = best_idx
+        self._path_cursor = max(self._path_cursor, best_idx)
         return self._path_cursor
-
-    def _apply_map_snap(self, velocity, dt, cam_conf, path, cursor):
-        """
-        FIX VL-FIX-B: Two-tier snap radius:
-          Normal: 1.0 m  (was 0.5 m — too tight, failed after any drift)
-          Recovery: 2.0 m after _SNAP_LOST_LIMIT consecutive misses
-
-        Also: curvature gate still disables snap during corners > 0.005.
-        """
-        if velocity < 0.05 or cam_conf < 0.3:
-            return
-        if not path or cursor >= len(path) - 1:
-            return
-
-        curvature = self.planner.get_path_curvature(
-            self.x, self.y, path, cursor=cursor, window_m=0.8)
-        if curvature > 0.005:
-            return
-
-        # Decide which radius to use
-        snap_radius = (self._MAP_SNAP_RECOVERY_M
-                       if self._snap_miss_frames >= self._SNAP_LOST_LIMIT
-                       else self._MAP_SNAP_RADIUS_M)
-
-        best_dist = float('inf')
-        best_foot = None
-
-        search_start = max(0,             cursor - 2)
-        search_end   = min(len(path) - 1, cursor + 6)
-
-        for i in range(search_start, search_end):
-            n1 = path[i]
-            n2 = path[i + 1]
-            p1 = self.planner.node_positions.get(n1)
-            p2 = self.planner.node_positions.get(n2)
-            if p1 is None or p2 is None:
-                continue
-
-            ex, ey = p2[0] - p1[0], p2[1] - p1[1]
-            seg_len_sq = ex * ex + ey * ey
-            if seg_len_sq < 1e-8:
-                continue
-            t = ((self.x - p1[0]) * ex + (self.y - p1[1]) * ey) / seg_len_sq
-            t = max(0.0, min(1.0, t))
-            foot_x = p1[0] + t * ex
-            foot_y = p1[1] + t * ey
-            d = math.hypot(self.x - foot_x, self.y - foot_y)
-            if d < best_dist:
-                best_dist = d
-                best_foot = (foot_x, foot_y)
-
-        if best_foot and best_dist < snap_radius:
-            # FIX LOC-02: clamp dt to 100 ms max so a stall spike can't jump the car
-            dt_clamped = min(dt, 0.10)
-            pull = self._MAP_SNAP_PULL * dt_clamped
-            self.x = self.x + pull * (best_foot[0] - self.x)
-            self.y = self.y + pull * (best_foot[1] - self.y)
-            self._snap_miss_frames = 0   # reset recovery counter
-        else:
-            self._snap_miss_frames += 1
-            if self._snap_miss_frames >= self._SNAP_LOST_LIMIT:
-                log.warning(
-                    f"Map snap lost for {self._snap_miss_frames} frames "
-                    f"(dist={best_dist:.2f}m). Recovery radius active.")
 
     def _apply_map_snap_gated(self, velocity, dt, cam_conf, path, cursor):
         """
