@@ -613,7 +613,7 @@ class TrafficDecisionEngine:
             # ── Parking sign ──────────────────────────────────────────────────
             elif any(k in lbl_lower for k in ("parking", "park-sign", "park_sign",
                                                "car-park")):
-                self.parking_fsm.trigger(now)
+                pass # self.parking_fsm.trigger(now) - Disabled per user request
 
             # ── Static obstacles / other cars ────────────────────────────────
             elif lbl_lower in ("car", "closed-road-stand", "roadblock", "obstacle"):
