@@ -102,16 +102,15 @@ class HardwareIO:
                 cfg = self.camera.create_video_configuration(
                     main={"size": (1280, 720), "format": "XRGB8888"},
                     controls={
-                        "AwbEnable":   False,
-                        "ColourGains": (3.5, 1.2),
+                        "AwbEnable":   True,   # let camera balance colors naturally
                         "AeEnable":    True,
-                        "Saturation":  1.4,
+                        "Saturation":  1.2,
                         "Sharpness":   1.2,
                     }
                 )
                 self.camera.configure(cfg)
                 self.camera.start()
-                log.info("PiCamera2 initialized with manual ColourGains.")
+                log.info("PiCamera2 initialized with Auto White Balance enabled.")
                 threading.Thread(target=self._camera_worker, daemon=True,
                                  name="camera_worker").start()
             except Exception as e:

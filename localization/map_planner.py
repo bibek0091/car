@@ -121,12 +121,12 @@ ZONE_SPEED_MS = {
 # Extra pixel offset applied to target_x to keep car on the right side of
 # two-way roads.  Positive = shift right (toward outer road edge).
 ZONE_LANE_OFFSET_PX = {
-    "CITY"       : 20,   # city two-way streets — stay right of dashed centre
-    "HIGHWAY"    : 35,   # multi-lane highway — favour outermost (rightmost) lane
-    "SPEED_OVAL" : 25,   # oval — right-hand bias
-    "ROUNDABOUT" :  0,   # CCW flow dictates lateral position; don't add bias
-    "PARKING"    :  0,   # parking FSM controls position
-    "START"      : 10,
+    "CITY"       : 0,    # user requested exact center of road
+    "HIGHWAY"    : 0,
+    "SPEED_OVAL" : 0,
+    "ROUNDABOUT" : 0,
+    "PARKING"    : 0,
+    "START"      : 0,
 }
 
 

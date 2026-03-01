@@ -1680,19 +1680,9 @@ class Orchestrator:
                         # If localization is uninitialized or low-confidence,
                         # the position could be wrong → always run YOLO to
                         # avoid missing signs.
-                        loc_trusted = (self.localizer.is_initialized() and
-                                       self._last_conf > 0.40)
-                        if loc_trusted:
-                            nearby_signs = self.sign_map.get_nearby(
-                                x0, y0, radius_m=self._YOLO_GATE_M)
-                            run_yolo = bool(nearby_signs)
-                            if not run_yolo:
-                                log.debug("YOLO SKIPPED — loc trusted, no signs "
-                                          "within %.1fm", self._YOLO_GATE_M)
-                        else:
-                            # Localization uncertain — run YOLO unconditionally
-                            run_yolo = True
-                            log.debug("YOLO FORCED — localization not yet trusted")
+                        # Run YOLO unconditionally to ensure signs are never missed,
+                        # regardless of whether they have been placed on the map.
+                        run_yolo = True
 
                     if run_yolo:
                         t_res = self.traffic_engine.process(

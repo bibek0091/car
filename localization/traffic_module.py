@@ -127,23 +127,12 @@ class ThreadedYOLODetector:
                 if self.model is None:
                     continue
 
-                # ─ CLAHE contrast enhancement for sign detection ────────────
-                # BFMC signs can be small and low-contrast in bright outdoor
-                # light. Apply CLAHE on the L channel + mild unsharp mask
-                # so edges of signs are crisper for YOLO.
-                try:
-                    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-                    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-                    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-                    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-                    # Mild unsharp mask to sharpen sign edges
-                    blur = cv2.GaussianBlur(enhanced, (0, 0), 2)
-                    infer_frame = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
-                except Exception:
-                    infer_frame = frame   # fall back to raw if anything fails
-
+                # ─ YOLO inference ─────────────────────────────────────────────
+                # Note: CLAHE image enhancement was removed. A standard YOLO 
+                # model expects raw RGB/BGR input matching its training data.
+                # Aggressive contrast filters often break the feature matching.
                 results = self.model.predict(
-                    source=infer_frame, conf=0.30, verbose=False)
+                    source=frame, conf=0.25, verbose=False)
                 detections = []
                 for box in results[0].boxes:
                     x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())

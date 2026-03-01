@@ -131,7 +131,7 @@ class HybridLaneTracker:
     # DIVIDER_FOLLOW_OFFSET_PX: when sr is lost, track this many px right of sl.
     WIDE_ROAD_PX             = 420   # full-road threshold (both lanes visible in BEV)
     SINGLE_LANE_PX           = 200   # minimum plausible single-lane width
-    RIGHT_LANE_BIAS_PX       = -15   # target shifted LEFT of lane centre — buffer from right edge
+    RIGHT_LANE_BIAS_PX       =   0   # target exact lane centre (buffer removed per user request)
     DIVIDER_FOLLOW_OFFSET_PX =  80   # px right of divider when right edge is lost
 
     def __init__(self, img_shape=(480, 640)):
@@ -257,19 +257,15 @@ class HybridLaneTracker:
         # ─ TIER 1: sr visible ────────────────────────────────────────
         if has_right:
             if has_left:
-                if lane_width_px >= self.WIDE_ROAD_PX:
-                    base_x = (ev(sl) + 3.0 * ev(sr)) / 4.0
-                    anchor = "RL_WIDE_ROAD"
-                else:
-                    base_x = (ev(sl) + ev(sr)) / 2.0 + self.RIGHT_LANE_BIAS_PX
-                    anchor = "RL_DUAL"
+                base_x = (ev(sl) + ev(sr)) / 2.0
+                anchor = "RL_DUAL"
             else:
-                base_x = ev(sr) - hw + self.RIGHT_LANE_BIAS_PX
+                base_x = ev(sr) - hw
                 anchor = "RL_FROM_EDGE"
         # ─ TIER 2: divider follow ────────────────────────────────────
         else:
-            # sr gone — shadow the centre divider from the right at a fixed offset
-            base_x = ev(sl) + self.DIVIDER_FOLLOW_OFFSET_PX
+            # sr gone — track exactly half a lane width right of the centre divider
+            base_x = ev(sl) + hw
             anchor = "DIVIDER_FOLLOW"
 
         self.dead_reckoner.last_valid_target    = base_x
