@@ -223,20 +223,19 @@ class BehaviorController:
     PRI_NORMAL    = 4
 
     # ── Speed constants (PWM units) ───────────────────────────────────────────
-    # Fix-1: scaled to SPEED_CALIB = 0.020 m/s per PWM unit (was 0.00568).
-    # Formula: speed_ms = (PWM - DEADBAND_PWM=12) * 0.020
-    # city   >=20 cm/s → (PWM-12)*0.020 >=0.20 → PWM >= 22 → using 47 for margin
-    # highway>=40 cm/s → (PWM-12)*0.020 >=0.40 → PWM >= 32 → using 82 for margin
-    CITY_SPEED_PWM          = 47.0   # ~20 cm/s  (was 22, gave 5.7 cm/s)
-    HIGHWAY_SPEED_PWM       = 82.0   # ~40 cm/s  (was 38, gave 14.8 cm/s)
-    SPEED_OVAL_PWM          = 68.0   # ~35 cm/s  (was 34, proportionally scaled)
-    ROUNDABOUT_SPEED_PWM    = 32.0   # ~16 cm/s  (was 16)
-    PARKING_SPEED_PWM       = 26.0   # low-speed maneuver zone cap (was 13)
-    START_AREA_SPEED_PWM    = 36.0   # BC-06: restricted start/pit zone cap (was 18)
-    APPROACH_SPEED_PWM      = 28.0   # sign-approach decel floor  (was 16)
-    CROSSWALK_SPEED_PWM     = 26.0   # BC-05: proactive crosswalk slowdown (was 14)
-    SLOW_SPEED_PWM          = 26.0   # generic slow (was 14)
-    MIN_SPEED_PWM           = 30.0   # absolute stall-prevention floor (was 18)
+    # User request: slow the car down. City base cut to 28 PWM (~40% reduction).
+    # Highway = city × 1.20  (user: +20% on highway only).
+    CITY_SPEED_PWM          = 28.0   # city base speed         (was 47)
+    HIGHWAY_SPEED_PWM       = 34.0   # highway = city × 1.20   (was 82)
+    SPEED_OVAL_PWM          = 34.0   # speed oval (same as highway) (was 68)
+    ROUNDABOUT_SPEED_PWM    = 20.0   # inside roundabout        (was 32)
+    PARKING_SPEED_PWM       = 16.0   # parking maneuver zone    (was 26)
+    START_AREA_SPEED_PWM    = 20.0   # restricted start/pit cap (was 36)
+    APPROACH_SPEED_PWM      = 16.0   # sign-approach decel floor(was 28)
+    CROSSWALK_SPEED_PWM     = 16.0   # proactive crosswalk slow (was 26)
+    SLOW_SPEED_PWM          = 16.0   # generic slow             (was 26)
+    MIN_SPEED_PWM           = 18.0   # stall-prevention floor   (was 30)
+
 
 
     # ── Sign approach deceleration ────────────────────────────────────────────
