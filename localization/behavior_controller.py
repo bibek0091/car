@@ -223,18 +223,19 @@ class BehaviorController:
     PRI_NORMAL    = 4
 
     # ── Speed constants (PWM units) ───────────────────────────────────────────
-    # User request: slow the car down. City base cut to 28 PWM (~40% reduction).
-    # Highway = city × 1.20  (user: +20% on highway only).
-    CITY_SPEED_PWM          = 28.0   # city base speed         (was 47)
-    HIGHWAY_SPEED_PWM       = 34.0   # highway = city × 1.20   (was 82)
-    SPEED_OVAL_PWM          = 34.0   # speed oval (same as highway) (was 68)
-    ROUNDABOUT_SPEED_PWM    = 20.0   # inside roundabout        (was 32)
-    PARKING_SPEED_PWM       = 16.0   # parking maneuver zone    (was 26)
-    START_AREA_SPEED_PWM    = 20.0   # restricted start/pit cap (was 36)
-    APPROACH_SPEED_PWM      = 16.0   # sign-approach decel floor(was 28)
-    CROSSWALK_SPEED_PWM     = 16.0   # proactive crosswalk slow (was 26)
-    SLOW_SPEED_PWM          = 16.0   # generic slow             (was 26)
-    MIN_SPEED_PWM           = 18.0   # stall-prevention floor   (was 30)
+    # User request: car is still overspeeding. Doing an EXTREME SLOWdown.
+    # Note: DEADBAND is 12.0. So PWM=22 means 10 effective drive units.
+    # Highway = city × 1.20 (user: +20% on highway only).
+    CITY_SPEED_PWM          = 22.0   # city base speed         (was 28)
+    HIGHWAY_SPEED_PWM       = 26.0   # highway = city × 1.20   (was 34)
+    SPEED_OVAL_PWM          = 26.0   # speed oval (same as highway) (was 34)
+    ROUNDABOUT_SPEED_PWM    = 16.0   # inside roundabout        (was 20)
+    PARKING_SPEED_PWM       = 14.0   # parking maneuver zone    (was 16)
+    START_AREA_SPEED_PWM    = 16.0   # restricted start/pit cap (was 20)
+    APPROACH_SPEED_PWM      = 14.0   # sign-approach decel floor(was 16)
+    CROSSWALK_SPEED_PWM     = 14.0   # proactive crosswalk slow (was 16)
+    SLOW_SPEED_PWM          = 14.0   # generic slow             (was 16)
+    MIN_SPEED_PWM           = 14.0   # stall-prevention floor   (was 18)
 
 
 

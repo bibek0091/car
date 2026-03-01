@@ -62,16 +62,15 @@ class HardwareIO:
 
         self.DEADBAND_PWM  = 12.0
         # SPEED_CALIB: m/s per PWM unit above deadband.
-        # Lowered from 0.020 to 0.012 — car was overspeeding on actual hardware.
-        # Tune this value if the car is still too fast/slow after testing.
-        self.SPEED_CALIB   = 0.012     # m/s per PWM unit above deadband
-        self.MAX_SPEED_MS  = 0.25      # absolute fallback cap (m/s)
+        # User requested even slower behavior.
+        self.SPEED_CALIB   = 0.008     # m/s per PWM unit above deadband
+        self.MAX_SPEED_MS  = 0.15      # absolute fallback cap (m/s)
 
         # Hard mm/s limit sent to STM32 regardless of PWM or SPEED_CALIB.
-        # City: 180 mm/s = 18 cm/s. Highway: 216 mm/s (+20%).
+        # EXTREME SLOW: City: 100 mm/s = 10 cm/s. Highway: 120 mm/s.
         # Change ONLY this value to tune actual physical cap.
-        self.MAX_SPEED_MM_S_CITY    = 180
-        self.MAX_SPEED_MM_S_HIGHWAY = 216
+        self.MAX_SPEED_MM_S_CITY    = 100
+        self.MAX_SPEED_MM_S_HIGHWAY = 120
 
         self._vel_filtered    = 0.0
         self._sim_yaw         = 0.0

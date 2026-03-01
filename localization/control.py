@@ -144,7 +144,7 @@ class Controller:
                 nav_state:      str   = "NORMAL",
                 velocity_ms:    float = 0.0,
                 dt:             float = 0.033,
-                base_speed:     float = 28.0,   # matches CITY_SPEED_PWM
+                base_speed:     float = 22.0,   # matches CITY_SPEED_PWM
                 traffic_mult:   float = 1.0,
                 map_curvature:  float = 0.0,
                 upcoming_curve: str   = "STRAIGHT",
@@ -204,8 +204,8 @@ class Controller:
         final_speed = speed * traffic_mult * guard_spd_mult
 
         # F-10: minimum speed floor — prevents stacked multipliers stalling mid-track.
-        # 18 PWM = just above the 12 PWM deadband. Only applies in normal driving.
-        MINIMUM_DRIVE_PWM = 18.0
+        # 16 PWM = just above the 12 PWM deadband. Only applies in normal driving.
+        MINIMUM_DRIVE_PWM = 16.0
         if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0:
             final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
 
