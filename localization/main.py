@@ -1237,28 +1237,33 @@ class Orchestrator:
             anchor=tk.CENTER, pady=2, relief=tk.FLAT)
 
         # ═══════════════════════════════════════════════════════════════════
-        # FIXED BOTTOM CHROME — control bar (never scrolls)
+        # CONTROL BAR — inside top_chrome so it is ALWAYS visible
         # ═══════════════════════════════════════════════════════════════════
-        tk.Frame(root, bg="#00aa66", height=1).pack(fill=tk.X, side=tk.BOTTOM)
-        cb = tk.Frame(root, bg="#060610", height=28)
-        cb.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Frame(top_chrome, bg="#1a2a1a", height=1).pack(fill=tk.X)
+        cb = tk.Frame(top_chrome, bg="#060610", height=28)
+        cb.pack(fill=tk.X)
         cb.pack_propagate(False)
 
         tk.Label(cb, textvariable=self._sv_pose, bg="#060610", fg="#606080",
                  font=("Consolas", 7)).pack(side=tk.LEFT, padx=6)
         tk.Label(cb, textvariable=self._sv_hint, bg="#060610", fg="#d0b040",
                  font=("Consolas", 8, "bold")).pack(side=tk.LEFT, padx=4)
-        for lbl, bg, abg, fn in [
-            ("\u26d4 E-STOP", "#500000", "#800000", self._estop_cb),
-            ("\u25b6 RESUME", "#0b220b", "#183018", self._resume_cb),
-            ("\u21ba RESET",  "#091830", "#102848", self._reset_route),
-            ("\u25b6\u25b6 START", "#1e0038", "#300060", self._start_pilot),
+
+        for _lbl, _bg, _abg, _fn in [
+            ("\u26d4 E-STOP",        "#500000", "#800000", self._estop_cb),
+            ("\u25b6 RESUME",        "#0b220b", "#183018", self._resume_cb),
+            ("\u21ba RESET",         "#091830", "#102848", self._reset_route),
+            ("\u25b6\u25b6 START",   "#1e0038", "#300060", self._start_pilot),
         ]:
-            tk.Button(cb, text=lbl, bg=bg, fg="#d8d8f0",
-                      font=("Consolas", 8, "bold"), relief=tk.FLAT, bd=0,
-                      padx=9, pady=2,
-                      activebackground=abg, activeforeground="#fff",
-                      command=fn).pack(side=tk.RIGHT, padx=2)
+            tk.Button(cb, text=_lbl, bg=_bg, fg="#d8d8f0",
+                      font=("Consolas", 9, "bold"), relief=tk.RIDGE, bd=1,
+                      padx=10, pady=2,
+                      activebackground=_abg, activeforeground="#fff",
+                      command=_fn).pack(side=tk.RIGHT, padx=3)
+
+        tk.Frame(top_chrome, bg="#001a0a", height=1).pack(fill=tk.X)
+
+
 
         # ═══════════════════════════════════════════════════════════════════
         # SCROLLABLE CONTENT AREA
