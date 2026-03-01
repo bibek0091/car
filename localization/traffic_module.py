@@ -534,17 +534,16 @@ class TrafficDecisionEngine:
                     light_st = "[GREEN] GO"
                 continue   # done with this detection
 
-            # ── APPROACH PRE-DECELERATION ───────────────────────────────────────
-            # Any sign detected at FAR range triggers gentle deceleration
-            # (0.85×) so the car has time to slow before the sign action zone.
-            # This is separate from sign-specific logic below.
+            # ── APPROACH PRE-DECELERATION (DISABLED) ────────────────────────────
+            # The user requested no reaction to far away signs. The car will
+            # ignore signs until they enter the NEAR/APPROACH threshold.
             is_sign = not ("car" in lbl_lower or "pedestrian" in lbl_lower
                            or "person" in lbl_lower or "obstacle" in lbl_lower
                            or "roadblock" in lbl_lower)
             if is_sign and dist_cat == "FAR":
-                commit(8, "SYS_APPROACH", f"APPROACHING {lbl}")
+                # Only track distance for the dashboard, do NOT slow down or react
                 _nearest_sign_dist_m = min(_nearest_sign_dist_m, approx_m)
-                continue   # no further sign logic until APPROACH/HALT range
+                continue   # ignore until APPROACH range
 
             # Track distance for dashboard
             if is_sign:
