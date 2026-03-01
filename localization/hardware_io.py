@@ -61,13 +61,17 @@ class HardwareIO:
         self.serial    = STM32_SerialHandler()
 
         self.DEADBAND_PWM  = 12.0
-        # Fix-1: SPEED_CALIB updated from 0.00568 → 0.020 m/s per PWM unit.
-        # BFMC rule: city ≥ 20 cm/s, highway ≥ 40 cm/s.
-        # At 0.00568, CITY_SPEED_PWM=22 → only 5.7 cm/s (28% of minimum).
-        # At 0.020, CITY_SPEED_PWM=47 → 20 cm/s ✓, HIGHWAY_SPEED_PWM=82 → 40 cm/s ✓
-        # ⚠ MUST validate with encoder feedback on the actual car before competition.
-        self.SPEED_CALIB   = 0.020     # m/s per PWM unit above deadband (estimated)
-        self.MAX_SPEED_MS  = 1.00      # raised to match highway target (was 0.50)
+        # SPEED_CALIB: m/s per PWM unit above deadband.
+        # Lowered from 0.020 to 0.012 — car was overspeeding on actual hardware.
+        # Tune this value if the car is still too fast/slow after testing.
+        self.SPEED_CALIB   = 0.012     # m/s per PWM unit above deadband
+        self.MAX_SPEED_MS  = 0.25      # absolute fallback cap (m/s)
+
+        # Hard mm/s limit sent to STM32 regardless of PWM or SPEED_CALIB.
+        # City: 180 mm/s = 18 cm/s. Highway: 216 mm/s (+20%).
+        # Change ONLY this value to tune actual physical cap.
+        self.MAX_SPEED_MM_S_CITY    = 180
+        self.MAX_SPEED_MM_S_HIGHWAY = 216
 
         self._vel_filtered    = 0.0
         self._sim_yaw         = 0.0
@@ -198,7 +202,7 @@ class HardwareIO:
             return
         self.serial.set_steering(self._last_cmd_steer)
 
-    def set_speed(self, speed_pwm):
+    def set_speed(self, speed_pwm: float, highway_mode: bool = False):
         speed_pwm = max(0.0, min(100.0, speed_pwm))
         self._last_cmd_speed = speed_pwm
         if self.sim_mode:
@@ -206,13 +210,17 @@ class HardwareIO:
         if speed_pwm == 0.0:
             speed_mm_s = 0.0
         else:
-            speed_ms   = max(0.0, (speed_pwm - self.DEADBAND_PWM) * self.SPEED_CALIB)
-            raw_mm_s   = speed_ms * 1000.0
-            speed_mm_s = min(500.0, raw_mm_s)
-            if raw_mm_s > 500.0:
-                log.warning(
-                    f"set_speed: command {raw_mm_s:.0f} mm/s clipped to 500 mm/s "
-                    f"(pwm={speed_pwm:.1f}). Check SPEED_CALIB or DEADBAND_PWM.")
+            speed_ms = max(0.0, (speed_pwm - self.DEADBAND_PWM) * self.SPEED_CALIB)
+            raw_mm_s = speed_ms * 1000.0
+            # Hard physical cap — prevents any code path from over-speeding the car.
+            # Highway gets a 20% higher ceiling (set at init, user-tunable).
+            hard_cap = (self.MAX_SPEED_MM_S_HIGHWAY if highway_mode
+                        else self.MAX_SPEED_MM_S_CITY)
+            speed_mm_s = min(hard_cap, raw_mm_s)
+            if raw_mm_s > hard_cap:
+                log.debug(
+                    "set_speed: clipped %.0f → %.0f mm/s (cap=%d, pwm=%.1f)",
+                    raw_mm_s, speed_mm_s, hard_cap, speed_pwm)
         self.serial.set_speed(speed_mm_s)
 
     # ── Encoder velocity ──────────────────────────────────────────────────────

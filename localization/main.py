@@ -1957,7 +1957,9 @@ class Orchestrator:
                         speed = ctrl.speed_pwm
                         if _ll>=_LLC: speed = min(speed,20.0)
                         if 0.0<speed<PWM_DEADBAND: speed=PWM_DEADBAND
-                        self.hw.set_speed(speed); self.hw.set_steering(ctrl.steer_angle_deg)
+                        _is_hwy = (self._nav_state == "HIGHWAY")
+                        self.hw.set_speed(speed, highway_mode=_is_hwy)
+                        self.hw.set_steering(ctrl.steer_angle_deg)
 
                 # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
                 push_latest(self._q_yolo,
