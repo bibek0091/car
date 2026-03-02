@@ -375,8 +375,15 @@ class LocalizationEngine:
             if camera_confidence > 0.3:
                 self._prev_cam_heading = camera_heading_rad
 
-            self.yaw += self.visual_yaw_rate * dt
-            self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+            # FIX 3: Yaw Freeze When Straight
+            if self.upcoming_curve == "STRAIGHT" and abs(self.visual_yaw_rate) < 0.05:
+                self.visual_yaw_rate *= 0.3
+
+            # FIX 1: Velocity-Gated Yaw Integration
+            MIN_SPEED_FOR_YAW = 0.05  # m/s
+            if velocity_ms > MIN_SPEED_FOR_YAW and heading_conf > self._MIN_HEADING_CONF:
+                self.yaw += self.visual_yaw_rate * dt
+                self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
             # ── Layer 2: A* Path Heading Nudge ───────────────────────────────
             # F-14: gate raised from 0.5 → 0.7 to prevent this fighting optical fallback
@@ -390,6 +397,14 @@ class LocalizationEngine:
                 if p1 and p2:
                     ph   = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
                     diff = (ph - self.yaw + math.pi) % (2 * math.pi) - math.pi
+                    
+                    # FIX 4: Drift Growth Monitor (Early Warning)
+                    # Forces speed reduction BEFORE the 40 deg hard clamp is needed.
+                    if abs(diff) > math.radians(20):
+                        self.pos_var += 0.2
+                        self.confidence *= 0.8
+                        log.warning("DRIFT GROWTH MONITOR: Yaw error > 20 deg! Spiking pos_var to force slow down.")
+
                     self.yaw += 0.05 * diff
                     self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
                     
@@ -443,7 +458,14 @@ class LocalizationEngine:
                 obs_yaw     = -camera_heading_rad
                 heading_err = (obs_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
                 if abs(heading_err) < 0.5:
-                    corr = self._ABS_HEADING_GAIN * heading_err * heading_conf
+                    # FIX 2: Adaptive Absolute Heading Gain
+                    # Stronger correction if off by > 5 degrees
+                    if abs(heading_err) > math.radians(5):
+                        gain = 0.08
+                    else:
+                        gain = self._ABS_HEADING_GAIN
+
+                    corr = gain * heading_err * heading_conf
                     corr = max(-self._ABS_HEADING_MAX_CORR,
                                min(self._ABS_HEADING_MAX_CORR, corr))
                     self.yaw += corr
