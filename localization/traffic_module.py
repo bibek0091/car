@@ -626,19 +626,12 @@ class TrafficDecisionEngine:
                                                "car-park")):
                 pass # self.parking_fsm.trigger(now) - Disabled per user request
 
-            # ── Static obstacles / other cars ────────────────────────────────
             elif lbl_lower in ("car", "closed-road-stand", "roadblock", "obstacle"):
                 in_path = (x1 < fw * 0.80 and x2 > fw * 0.20 and y2 > fh * 0.60)
                 if in_path:
-                    if line_type == "DASHED":
-                        # Dashed line → overtake allowed
-                        commit(3, "SYS_LANE_CHANGE_LEFT", "OVERTAKING OBSTACLE")
-                    elif line_type == "CONTINUOUS":
-                        # Continuous line → must follow, not overtake
-                        commit(3, "SYS_SLOW", "TAILING OBSTACLE (CONT LINE)")
-                    else:
-                        # Unknown: default to lane-change (conservative)
-                        commit(3, "SYS_LANE_CHANGE_LEFT", "EVADING OBSTACLE")
+                    # STRICT RIGHT LANE COMPLIANCE: Do not swerve into oncoming traffic.
+                    # Always brake if an obstacle is in the path.
+                    commit(1, "SYS_STOP", f"OBSTACLE IN PATH ({lbl})")
 
         # ── Apply active stop-sign hold ───────────────────────────────────────
         if self.stop_timer > 0.0 and now - self.stop_timer < 3.0:

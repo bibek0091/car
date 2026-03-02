@@ -256,13 +256,11 @@ class HybridLaneTracker:
 
         # ─ TIER 1: sr visible ────────────────────────────────────────
         if has_right:
-            if has_left:
-                base_x = (ev(sl) + ev(sr)) / 2.0
-                anchor = "RL_DUAL"
-            else:
-                base_x = ev(sr) - hw
-                anchor = "RL_FROM_EDGE"
-        # ─ TIER 2: divider follow ────────────────────────────────────
+            # Strictly track from the right edge, adding a safety margin to avoid riding the line
+            RIGHT_LANE_BIAS_PX = 30.0  # Push car slightly left of the right boundary
+            base_x = ev(sr) - hw - RIGHT_LANE_BIAS_PX
+            anchor = "RL_STRICT"
+        # ─ TIER 2: divider follow (sr lost, sl visible) ──────────────
         else:
             # sr gone — track exactly half a lane width right of the centre divider
             base_x = ev(sl) + hw

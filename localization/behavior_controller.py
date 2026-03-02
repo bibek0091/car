@@ -584,22 +584,9 @@ class BehaviorController:
             )
 
         # ── Overtake (dashed line + obstacle) ────────────────────────────────
-        if (t_res.state == "SYS_LANE_CHANGE_LEFT" and
-                not self.overtake_fsm.active):
-            line_type = getattr(perc_res, 'lane_type', 'DASHED')
-            if line_type != "CONTINUOUS":
-                self.overtake_fsm.trigger(now)
-
-        if self.overtake_fsm.active:
-            steer, speed, label = self.overtake_fsm.update(now, base_steer, base_speed)
-            return BehaviorOutput(
-                speed_pwm=speed, steer_deg=steer,
-                priority=self.PRI_MISSION,
-                state="OVERTAKE",
-                reason="DASHED LINE — overtaking obstacle",
-                maneuver="OVERTAKE",
-            )
-
+        # STRICT RIGHT LANE COMPLIANCE: Overtaking logic has been removed.
+        # The car will no longer swerve into the left lane.
+        
         return None
 
     # ── P4: Normal ────────────────────────────────────────────────────────────
