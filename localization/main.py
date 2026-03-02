@@ -1568,24 +1568,33 @@ class Orchestrator:
                     self._announce_lbl.pack_forget()
 
             # ── Camera / YOLO frame ─────────────────────────────────────────
+            yi = None
             try:
                 yi = self._q_yolo.get_nowait()
+            except queue.Empty:
+                if not self.running:
+                    yi = self.hw.read_camera()
+
+            if yi is not None and getattr(self, "CAM_W", None):
                 yi = cv2.resize(yi, (self.CAM_W, self.CAM_H))
                 self._yolo_ph = ImageTk.PhotoImage(
                     Image.fromarray(cv2.cvtColor(yi, cv2.COLOR_BGR2RGB)))
                 self._yolo_label.config(image=self._yolo_ph)
-            except queue.Empty:
-                pass
 
             # ── BEV lane frame ─────────────────────────────────────────────
+            bi = None
             try:
                 bi = self._q_bev.get_nowait()
+            except queue.Empty:
+                if not self.running:
+                    # BEV is usually warped, but before start we just show raw
+                    bi = self.hw.read_camera()
+
+            if bi is not None and getattr(self, "CAM_W", None):
                 bi = cv2.resize(bi, (self.CAM_W, self.CAM_H))
                 self._bev_ph = ImageTk.PhotoImage(
                     Image.fromarray(cv2.cvtColor(bi, cv2.COLOR_BGR2RGB)))
                 self._bev_label.config(image=self._bev_ph)
-            except queue.Empty:
-                pass
 
             # ── Localization panel ─────────────────────────────────────────
             try:
@@ -2057,26 +2066,37 @@ class Orchestrator:
                         self.hw.set_steering(ctrl.steer_angle_deg)
 
                 # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
-                push_latest(self._q_yolo,
-                            t_res.yolo_debug_frame if t_res.yolo_debug_frame is not None
-                            else raw_frame)
-                push_latest(self._q_bev, _annotate_bev(perc, ctrl))
+                yolo_frame_to_push = t_res.yolo_debug_frame if getattr(t_res, 'yolo_debug_frame', None) is not None else raw_frame
+                push_latest(self._q_yolo, yolo_frame_to_push)
+                
+                # perc and ctrl might be None if estop triggered on very first frame, use fallback
+                _perc_to_draw = perc if perc else getattr(self, '_last_perc', None)
+                _ctrl_to_draw = ctrl if ctrl else getattr(self, '_last_ctrl', None)
+                if _perc_to_draw and _ctrl_to_draw:
+                    push_latest(self._q_bev, _annotate_bev(_perc_to_draw, _ctrl_to_draw))
+                else:
+                    push_latest(self._q_bev, raw_frame)
 
                 # VIZ-03: localization panel
                 sm     = getattr(self.localizer,'_snap_miss_frames',0)
                 lx,ly,lyaw = self.localizer.get_pose()
                 yr     = self.localizer.visual_yaw_rate
-                self._loc_panel.push(yr, perc.lateral_error_px, lx, ly, sm==0)
+                
+                _p_conf  = perc.confidence if perc else 0.0
+                _p_hconf = perc.heading_conf if perc else 0.0
+                _p_lat   = perc.lateral_error_px if perc else 0.0
+
+                self._loc_panel.push(yr, _p_lat, lx, ly, sm==0)
                 loc_img = self._loc_panel.render(
                     x=lx, y=ly, yaw_deg=math.degrees(lyaw),
-                    yaw_rate=yr, heading_conf=perc.heading_conf,
-                    snap_miss=sm, confidence=perc.confidence,
+                    yaw_rate=yr, heading_conf=_p_hconf,
+                    snap_miss=sm, confidence=_p_conf,
                     upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
                     curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0),
-                    lat_err_px=perc.lateral_error_px, velocity_ms=velocity_ms,
+                    lat_err_px=_p_lat, velocity_ms=velocity_ms,
                     zone=self.localizer.current_zone, nav_state=self._nav_state,
-                    l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
-                    l2=bool(self._planned_path and perc.confidence>0.5),
+                    l1=(_p_conf>0.3 and _p_hconf>=0.35),
+                    l2=bool(self._planned_path and _p_conf>0.5),
                     l4=sm<5)
                 push_latest(self._q_loc, loc_img)
 

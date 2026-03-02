@@ -139,9 +139,6 @@ class HardwareIO:
             try:
                 frame = self.camera.capture_array()   # blocks until new frame ready
                 if frame is not None and _CV2_AVAILABLE:
-                    # Depending on the Pi OS, BGR888 may still return an RGB array
-                    if frame.ndim == 3 and frame.shape[2] == 3:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     self._push_frame(cv2.resize(frame, (640, 480)))
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")
