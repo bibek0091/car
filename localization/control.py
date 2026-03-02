@@ -180,9 +180,10 @@ class Controller:
             map_curvature=map_curvature)
 
         # ── 2. Hardware Rate Limiting ──────────────────────────────────────────
-        # CTRL-05: rate-limit delta must be computed with correct sign awareness
+        # Adaptive Slew Rate: allow fast steering at 0 m/s (parking), slow at speed
+        adaptive_rate = max(5.0, 25.0 - 15.0 * velocity_ms)
         delta = raw_steer - self.prev_steer
-        rate_delta  = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, delta))
+        rate_delta  = max(-adaptive_rate, min(adaptive_rate, delta))
         steer_angle = self.prev_steer + rate_delta
         self.prev_steer = steer_angle
 
@@ -209,7 +210,14 @@ class Controller:
             # Gentle straight-line boost — capped at 10% above base (was 20%)
             speed = min(speed * 1.08, base_speed * 1.10)
 
-        # 4c. Dead-reckoning speed penalty
+        # 4c. Lateral Acceleration Limit (Roll Instability Prevention)
+        lat_acc = (velocity_ms ** 2) * abs(curvature)
+        lat_acc_threshold = 0.5
+        if lat_acc > lat_acc_threshold:
+            roll_penalty = max(0.4, 1.0 - 1.5 * (lat_acc - lat_acc_threshold))
+            speed *= roll_penalty
+
+        # 4d. Dead-reckoning speed penalty
         if "DEAD_RECKONING" in perc_res.anchor:
             try:
                 dr_conf = float(perc_res.anchor.split("_")[2])
@@ -217,7 +225,7 @@ class Controller:
                 dr_conf = 0.5
             speed *= (0.4 + 0.4 * dr_conf)
 
-        # 4d. Divider-follow speed penalty
+        # 4e. Divider-follow speed penalty
         # Right outer edge is lost — car is shadowing the centre divider.
         # 25% speed reduction; recovers next frame sr reappears (anchor → RL_*).
         if perc_res.anchor == "DIVIDER_FOLLOW":

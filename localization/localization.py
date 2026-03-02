@@ -113,6 +113,10 @@ class LocalizationEngine:
         self._prev_cam_heading = None
         self._cam_yaw_smoothed = 0.0
         self._initialized      = False
+        
+        # Hardware hardening state
+        self.pos_var    = 0.0    # Covariance tracking
+        self.wheel_slip = False  # True if spin > speed
 
         # Public state read by main loop / dashboard
         self.upcoming_curve   = "STRAIGHT"
@@ -153,6 +157,8 @@ class LocalizationEngine:
             self.visual_yaw_rate = 0.0
             self._initialized    = True
             self._snap_miss_frames = 0
+            self.pos_var         = 0.0
+            self.wheel_slip      = False
 
             # FIX VL-07: seed EMA from actual yaw so first frame has no spike
             self._cam_yaw_smoothed = self.yaw
@@ -197,6 +203,8 @@ class LocalizationEngine:
                 "cursor":          self._path_cursor,
                 "speed_ms":        self._last_speed_ms,
                 "initialized":     self._initialized,
+                "pos_var":         self.pos_var,
+                "wheel_slip":      self.wheel_slip,
             }
 
     def check_poi_arrival(self, target_node_id: str,
@@ -384,11 +392,29 @@ class LocalizationEngine:
                     diff = (ph - self.yaw + math.pi) % (2 * math.pi) - math.pi
                     self.yaw += 0.05 * diff
                     self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
+                    
+                    # HARD YAW DRIFT CLAMP: If EKF yaw drifts > 40 degrees from the path,
+                    # force-reset to the path heading to prevent spin-drift traps.
+                    if abs(math.degrees(diff)) > 40.0:
+                        log.warning("HARD YAW DRIFT CLAMP: Drift > 40°, snapping yaw to path.")
+                        self.yaw = ph
+                        self.visual_yaw_rate = 0.0
+                        self._cam_yaw_smoothed = ph
 
             # ── Layer 3: Forward Dead-Reckoning ──────────────────────────────
             effective_v = max(0.0, velocity_ms)
             self.x += effective_v * math.cos(self.yaw) * dt
             self.y += effective_v * math.sin(self.yaw) * dt
+            
+            # Covariance Tracking: Uncertainty grows over time
+            self.pos_var += 0.02 * dt
+
+            # Slip Detection: Moving forward but spinning fast on a straightaway
+            self.wheel_slip = (velocity_ms > 0.3 
+                               and abs(self.visual_yaw_rate) > 1.0 
+                               and self.upcoming_curve == "STRAIGHT")
+            if self.wheel_slip:
+                log.warning("WHEEL SLIP DETECTED: velocity=%f, yaw_rate=%f", velocity_ms, self.visual_yaw_rate)
 
             # ── Layer 3b: Lane-Tangent Soft Heading Nudge ─────────────────────
             # LOC-FIX-02: BEV heading_rad is measured as angle of lane tangent in
@@ -584,6 +610,7 @@ class LocalizationEngine:
             self.x = self.x + pull * (best_foot[0] - self.x)
             self.y = self.y + pull * (best_foot[1] - self.y)
             self._snap_miss_frames = 0
+            self.pos_var *= 0.7
         else:
             self._snap_miss_frames += 1
             if self._snap_miss_frames >= self._SNAP_LOST_LIMIT:

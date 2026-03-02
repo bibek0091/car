@@ -46,6 +46,7 @@ from perception    import VisionPipeline
 from localization  import LocalizationEngine
 from control       import Controller, ControlOutput
 from hardware_io   import HardwareIO
+from safety_manager import GlobalSafetyManager
 
 try:
     from behavior_controller import BehaviorController
@@ -1006,6 +1007,9 @@ class Orchestrator:
         self._last_t_res = None
         self._sign_history = deque(maxlen=20)
 
+        # Safety Manager for Fused Confidence
+        self.safety_manager = GlobalSafetyManager()
+
         # Sign map — placed signs persist across restarts
         _sm_path = os.path.join(_SCRIPT_DIR, "sign_map.json")
         self.sign_map = SignMap(_sm_path) if _SIGNMAP_AVAILABLE else None
@@ -1655,13 +1659,29 @@ class Orchestrator:
         startup_time = time.time()   # reference for calibration phases
         t_prev = time.time()
         _ll = 0; _LLC = 15; _LLS = 90; _zmf = 0
+        # low resolution flag to shed load if FPS drops
+        self._low_res_mode = False
+
         try:
             while self.running:
-                ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
+                ts = time.time()
+                dt = max(ts-t_prev, 0.001)
+                t_prev = ts
                 elapsed_run = ts - startup_time
 
+                # Auto-Scaling FPS Shield: Downsample if we fell behind last frame
+                # (e.g. if the previous frame took too long to process)
+                if dt > 0.060: # 60ms is 16.6 FPS, 0.060 is 16.6 FPS
+                    if not self._low_res_mode:
+                        log.warning("FPS drop detected (dt=%.3f), entering low-res mode", dt)
+                    self._low_res_mode = True
+                elif dt < 0.040: # 40ms is 25 FPS
+                    if self._low_res_mode:
+                        log.info("FPS recovered (dt=%.3f), exiting low-res mode", dt)
+                    self._low_res_mode = False
+
                 # Always read camera & velocity so dashboard stays live
-                raw_frame   = self.hw.read_camera()
+                raw_frame = self.hw.read_camera()
                 if raw_frame is None:
                     raw_frame = np.zeros((480, 640, 3), np.uint8)
                 velocity_ms = self.hw.get_velocity_ms()
@@ -1954,6 +1974,60 @@ class Orchestrator:
                             log.debug("BEH[%d] %s: %s",
                                       beh.priority, beh.state, beh.reason)
 
+                    # --- GLOBAL SAFETY ENFORCEMENT ---
+                    snap_miss_ratio = getattr(self.localizer, '_snap_miss_frames', 0)
+                    sign_in_range   = (len(nearby_signs) > 0)
+                    yolo_active     = (len(t_res.active_labels) > 0)
+
+                    # --- DYNAMIC REPLANNING TRIGGER ---
+                    # If localizer is utterly lost for 1 full second (30 frames), force a graphical re-route
+                    if snap_miss_ratio > 30 and self._planned_path and self.localizer.planner:
+                        log.warning("REPLAN: Lost map snap for >30 frames. Forcing A* recalculation.")
+                        _rx, _ry, _ = self.localizer.get_pose()
+                        _nearest = self.localizer.planner.get_nearest_node(_rx, _ry)
+                        if _nearest and _nearest != self._target_node:
+                            _new_plan = self.localizer.planner.plan_route(
+                                _nearest, self._target_node, blocked_nodes=self._blocked_nodes)
+                            if _new_plan:
+                                self._planned_path = _new_plan
+                                self._path_cursor = 0
+                                self.localizer.reset_cursor()
+                                self.localizer._snap_miss_frames = 0
+                                log.info("REPLAN SUCCESS: New route from %s to %s.", _nearest, self._target_node)
+                            else:
+                                log.error("REPLAN FAILED: Cannot find path from %s.", _nearest)
+
+                    global_conf = self.safety_manager.update(
+                        lane_conf=perc.confidence,
+                        loc_conf=self.localizer.confidence,
+                        yolo_active=yolo_active,
+                        snap_success=(self._last_snap_id is not None),
+                        sign_in_range=sign_in_range
+                    )
+
+                    # Clamp speed based on fused global confidence
+                    safe_speed = self.safety_manager.apply_speed_limits(ctrl.speed_pwm, global_conf)
+                    
+                    # Apply Localization Hardening limits
+                    loc_pos_var = getattr(self.localizer, 'pos_var', 0.0)
+                    loc_slip    = getattr(self.localizer, 'wheel_slip', False)
+                    
+                    if loc_slip:
+                        log.warning("SAFETY [HARDENING]: Wheel slip detected. Forcing halt.")
+                        safe_speed = 0.0
+                    elif loc_pos_var > 1.0:
+                        log.warning("SAFETY [HARDENING]: Position covariance too high (%.2f). Halving speed.", loc_pos_var)
+                        safe_speed = min(safe_speed, ctrl.speed_pwm * 0.5)
+
+                    if safe_speed < ctrl.speed_pwm and not loc_slip and loc_pos_var <= 1.0:
+                        if safe_speed == 0.0:
+                            log.warning("SAFETY: Low confidence (%.2f). Force-stopping car.", global_conf)
+                        else:
+                            log.info("SAFETY: Marginal confidence (%.2f). Halving speed (%.1f -> %.1f).", 
+                                     global_conf, ctrl.speed_pwm, safe_speed)
+                                     
+                    ctrl.speed_pwm = safe_speed
+
                     # --- STARTUP CALIBRATION OVERRIDE ---
                     # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
                     # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
@@ -2009,13 +2083,26 @@ class Orchestrator:
                 push_latest(self._q_loc, loc_img)
 
                 elapsed = time.time()-ts
+                
+                # FPS Monitor & Auto-Scaling
+                # If loop takes > 60ms (<16 FPS), shed resolution next tick
+                if elapsed > 0.060 and not self._low_res_mode:
+                    log.warning("MAIN LOOP WARNING: Latency spiked to %.0f ms. Engaging low-res mode.", elapsed * 1000)
+                    self._low_res_mode = True
+                elif elapsed < 0.025 and self._low_res_mode:
+                    log.info("MAIN LOOP RECOVERY: Latency returned to %.0f ms. Restoring high-res mode.", elapsed * 1000)
+                    self._low_res_mode = False
+
                 time.sleep(max(0.001, FRAME_PERIOD-elapsed))
 
         except Exception as e:
-            log.error(f"FATAL Pilot crash: {e}", exc_info=True); self._estop=True
-
-        log.info("Pilot loop exited")
-        self.hw.set_speed(0); self.hw.set_steering(0)
+            log.critical(f"FATAL EXCEPTION SHIELD: Pilot crashed due to {e}. Halting.", exc_info=True)
+            self._estop = True
+            
+        finally:
+            log.info("Pilot loop exited")
+            self.hw.set_speed(0)
+            self.hw.set_steering(0)
 
 
     def _start_pilot(self):

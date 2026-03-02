@@ -104,25 +104,32 @@ class OvertakeStateMachine:
             self._ts   = now
             log.info("OVERTAKE: lane-change left started")
 
-    def update(self, now: float, base_steer: float, base_speed: float):
+    def update(self, now: float, base_steer: float, base_speed: float, lateral_error_px: float = 0.0, obstacle_detected: bool = False):
         """Returns (steer_deg, speed_pwm, maneuver_label)."""
         if self.state == "IDLE":
             return base_steer, base_speed, "NONE"
 
-        elapsed = now - self._ts
-
         if self.state == "CHANGE_LEFT":
-            if elapsed > self.CHANGE_DURATION:
+            # Continue swinging left until we register as being in the left lane (e.g., error < -150px)
+            if lateral_error_px < -150.0:
                 self.state, self._ts = "PASS", now
+                log.info("OVERTAKE: now in left lane, passing obstacle")
             return base_steer - self.STEER_BIAS_DEG, base_speed * self.SPEED_MULT, "OVERTAKE"
 
         if self.state == "PASS":
-            if elapsed > self.PASS_DURATION:
-                self.state, self._ts = "CHANGE_RIGHT", now
+            # Continue passing until the YOLO obstacle is no longer detected in the frame
+            if not obstacle_detected:
+                # Add a 0.5s buffer after YOLO loses sight before pulling back right
+                if now - self._ts > 0.5:
+                    self.state, self._ts = "CHANGE_RIGHT", now
+                    log.info("OVERTAKE: clear of obstacle, returning to right lane")
+            else:
+                self._ts = now # Reset buffer while obstacle is still visible
             return base_steer, base_speed * self.SPEED_MULT, "OVERTAKE"
 
         if self.state == "CHANGE_RIGHT":
-            if elapsed > self.CHANGE_DURATION:
+            # Swing right until lateral error shows we are re-centered in the right lane
+            if abs(lateral_error_px) < 40.0:
                 self.state = "IDLE"
                 log.info("OVERTAKE: complete — back in right lane")
             return base_steer + self.STEER_BIAS_DEG, base_speed * self.SPEED_MULT, "OVERTAKE"
@@ -426,19 +433,21 @@ class BehaviorController:
             self._no_entry_active = False
 
         # BC-04 Fix-4: Bus lane — check MAP POSITION first (harder rule).
-        # loc_x/loc_y passed explicitly from orchestrator via compute() —
-        # fixes the old broken getattr(perc_res, '_loc_x', None) which always
-        # returned None because PerceptionResult has no such field.
         if planner and hasattr(planner, 'is_in_bus_lane'):
             if planner.is_in_bus_lane(loc_x, loc_y):
-                hard_steer = base_steer + self.BUS_LANE_HARD_CORRECTION_DEG
-                log.warning("LEGAL: Inside bus-lane zone — hard correction")
+                # Calculate penetration depth (upper boundary is Y=2.2)
+                depth = 2.2 - loc_y
+                # Exponential repulsion: Further in = harder left push
+                repulsion_deg = 20.0 * (1.0 / max(depth, 0.1))
+                hard_steer = base_steer - repulsion_deg
+                
+                log.warning("LEGAL: Inside bus-lane zone — exponential correction (-%.1f deg)", repulsion_deg)
                 return BehaviorOutput(
                     speed_pwm=self._zone_base_speed() * self.BUS_LANE_SPEED_MULT,
                     steer_deg=hard_steer,
                     priority=self.PRI_LEGAL,
                     state="BUS_LANE_HARD",
-                    reason="BUS LANE MAP POSITION — hard left correction",
+                    reason="BUS LANE MAP POSITION — dynamic left repulsion",
                 )
 
         # Soft bus-lane correction from YOLO sign label
@@ -536,9 +545,17 @@ class BehaviorController:
         if approaching_ccw or self._roundabout_active or (roundabout_sign and sign_recent):
             self._roundabout_active = True
 
-            # Inside CCW: left steer bias + speed cap
-            ccw_steer = base_steer + self.CCW_ENTRY_STEER_DEG
+            # Inside CCW: strict validation required before left steer bias
             ccw_speed = min(base_speed, self.ROUNDABOUT_SPEED_PWM)
+            
+            # Geometric check: Only drift if the curve is sharp and heading is angled.
+            v_curv = getattr(perc_res, 'curvature', 0.0)
+            v_head = getattr(perc_res, 'heading_rad', 0.0)
+            
+            if abs(v_curv) > 0.002 and abs(v_head) > 0.10:
+                ccw_steer = base_steer + self.CCW_ENTRY_STEER_DEG
+            else:
+                ccw_steer = base_steer # Car is technically in zone bounding box, but on a straightaway
 
             # Exit condition: zone changed away from ROUNDABOUT AND no recent sign
             if (self._zone_mode != "ROUNDABOUT" and
@@ -584,8 +601,33 @@ class BehaviorController:
             )
 
         # ── Overtake (dashed line + obstacle) ────────────────────────────────
-        # STRICT RIGHT LANE COMPLIANCE: Overtaking logic has been removed.
-        # The car will no longer swerve into the left lane.
+        # Closed-loop maneuver based on lateral error and obstacle detection.
+        obstacle_detected = any(k in active_lower for k in ("car", "roadblock", "obstacle"))
+        lat_err = getattr(perc_res, 'lateral_error_px', 0.0)
+
+        if obstacle_detected and not self.overtake_fsm.active:
+            # Only trigger overtake if we are roughly in the center of the right lane
+            if abs(lat_err) < 50.0:
+                self.overtake_fsm.trigger(now)
+
+        if self.overtake_fsm.active:
+            # Pass lateral error and obstacle status into the closed-loop FSM
+            over_steer, over_speed, over_label = self.overtake_fsm.update(
+                now, base_steer, base_speed, 
+                lateral_error_px=lat_err, 
+                obstacle_detected=obstacle_detected
+            )
+            
+            if over_label == "NONE":
+                return None
+                
+            return BehaviorOutput(
+                speed_pwm=over_speed, steer_deg=over_steer,
+                priority=self.PRI_MISSION,
+                state=f"OVERTAKE_{self.overtake_fsm.state}",
+                reason=f"OVERTAKE — phase: {self.overtake_fsm.state}",
+                maneuver="OVERTAKE",
+            )
         
         return None
 

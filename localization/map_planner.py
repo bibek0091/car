@@ -341,33 +341,34 @@ class PathPlanner:
             active_blocked = {nid for nid, exp in blocked_nodes.items()
                               if exp > time.time()}
 
-        if active_blocked:
-            # Build a view with high-cost edges touching blocked nodes
-            def weight_fn(u, v, d):
-                if u in active_blocked or v in active_blocked:
-                    return 1e9
-                return d.get('weight', 1.0)
-            try:
-                return nx.astar_path(
-                    self.graph, start_id, target_id,
-                    heuristic=self.heuristic, weight=weight_fn)
-            except nx.NetworkXNoPath:
-                log.error("No path (with blocks): %s → %s", start_id, target_id)
-                return []
-            except Exception as e:
-                log.error("A* error: %s", e)
-                return []
-        else:
-            try:
-                return nx.astar_path(
-                    self.graph, start_id, target_id,
-                    heuristic=self.heuristic, weight='weight')
-            except nx.NetworkXNoPath:
-                log.error("No path: %s → %s", start_id, target_id)
-                return []
-            except Exception as e:
-                log.error("A* error: %s", e)
-                return []
+        # Node filtering helper
+        def weight_fn(u, v, d):
+            # 1. Check user-defined dynamic blocks
+            if active_blocked and (u in active_blocked or v in active_blocked):
+                return 1e9
+                
+            # 2. Check BFMC track graph attributes (no entry)
+            # Some nodes or edges may have 'no_entry' or 'oneway' flags
+            if d.get('no_entry', False):
+                return 1e9
+                
+            # 3. Prevent routing through bus-lane geometry unless both ends are also in it
+            u_pos = self.node_positions.get(u, (0,0))
+            if self.is_in_bus_lane(u_pos[0], u_pos[1]) or d.get('bus_lane', False):
+                return 1e9
+
+            return d.get('weight', 1.0)
+
+        try:
+            return nx.astar_path(
+                self.graph, start_id, target_id,
+                heuristic=self.heuristic, weight=weight_fn)
+        except nx.NetworkXNoPath:
+            log.error("No path: %s → %s", start_id, target_id)
+            return []
+        except Exception as e:
+            log.error("A* error: %s", e)
+            return []
 
 
     # ── Waypoint helpers ──────────────────────────────────────────────────────

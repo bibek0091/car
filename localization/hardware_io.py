@@ -79,6 +79,10 @@ class HardwareIO:
         self._last_cmd_steer  = 0.0
         self._encoder_fail_count = 0
         self._ENCODER_FAIL_LIMIT = 30
+        
+        # Hardware Failsafes
+        self._last_cmd_time      = time.time()
+        self._last_serial_rx_time= time.time()
 
         # ── Thread-safe frame queue (maxsize=1 → always freshest frame) ───────
         self._frame_queue = queue.Queue(maxsize=1)
@@ -116,6 +120,10 @@ class HardwareIO:
             except Exception as e:
                 log.error(f"PiCamera2 init error: {e}")
                 self.camera = None
+
+        # ── Hardware Watchdog Thread ──────────────────────────────────────────
+        threading.Thread(target=self._watchdog_worker, daemon=True,
+                         name="hw_watchdog").start()
 
     # ── Frame queue helper ────────────────────────────────────────────────────
 
@@ -166,6 +174,29 @@ class HardwareIO:
                 self._push_frame(cv2.resize(frame, (640, 480)))
             time.sleep(0.033)   # 30 Hz
 
+    def _watchdog_worker(self):
+        """Monitors for command starvation (100ms) or serial dropout (500ms)."""
+        while self._running:
+            now = time.time()
+            
+            # 1. Command Starvation Timeout (100 ms)
+            if now - self._last_cmd_time > 0.1 and self._last_cmd_speed > 0:
+                log.error("WATCHDOG: Command starvation (>100ms). Halting vehicle.")
+                self._last_cmd_speed = 0.0
+                if not self.sim_mode and hasattr(self.serial, 'set_speed'):
+                    self.serial.set_speed(0.0)
+
+            # 2. Serial Heartbeat Timeout (500 ms)
+            if not self.sim_mode and now - self._last_serial_rx_time > 0.5:
+                # If we've missed serial for 0.5s, force stop.
+                if self._last_cmd_speed > 0:
+                    log.error("WATCHDOG: STM32 Serial Heartbeat lost (>500ms). Halting vehicle.")
+                    self._last_cmd_speed = 0.0
+                    if hasattr(self.serial, 'set_speed'):
+                        self.serial.set_speed(0.0)
+
+            time.sleep(0.05)
+
     # ── Public camera read ────────────────────────────────────────────────────
 
     def read_camera(self):
@@ -197,12 +228,14 @@ class HardwareIO:
     # ── Motor commands ────────────────────────────────────────────────────────
 
     def set_steering(self, steer_angle_deg):
+        self._last_cmd_time = time.time()
         self._last_cmd_steer = max(-45.0, min(45.0, steer_angle_deg))
         if self.sim_mode:
             return
         self.serial.set_steering(self._last_cmd_steer)
 
     def set_speed(self, speed_pwm: float, highway_mode: bool = False):
+        self._last_cmd_time = time.time()
         speed_pwm = max(0.0, min(100.0, speed_pwm))
         self._last_cmd_speed = speed_pwm
         if self.sim_mode:
@@ -240,6 +273,7 @@ class HardwareIO:
                                  contextlib.nullcontext()):
                         raw_mms = getattr(self.serial, '_feedback_speed', 0.0)
                 raw = max(0.0, raw_mms / 1000.0)
+                self._last_serial_rx_time = time.time()
                 self._encoder_fail_count = 0
             except Exception as e:
                 self._encoder_fail_count += 1

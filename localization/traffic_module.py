@@ -185,24 +185,32 @@ class TrafficLightStateMachine:
     def __init__(self):
         self.state = "NO_LIGHT"
         self.last_seen_red = 0.0
+        self.red_start_time = 0.0
 
     def update(self, is_red, is_yellow, is_green, dist_cat):
         now = time.time()
 
         if is_red:
             self.last_seen_red = now
-            if dist_cat == "HALT":
-                self.state = "LIGHT_RED_STOPPED"
-            elif dist_cat == "APPROACH":
-                self.state = "LIGHT_RED_STOPPING"
-            elif self.state == "NO_LIGHT":
-                self.state = "LIGHT_DETECTED_FAR"
+            if self.red_start_time == 0.0:
+                self.red_start_time = now
+                
+            # Traffic Light Stability Window (0.5s Debounce)
+            if now - self.red_start_time > 0.5:
+                if dist_cat == "HALT":
+                    self.state = "LIGHT_RED_STOPPED"
+                elif dist_cat == "APPROACH":
+                    self.state = "LIGHT_RED_STOPPING"
+                elif self.state == "NO_LIGHT":
+                    self.state = "LIGHT_DETECTED_FAR"
 
         elif is_yellow:
+            self.red_start_time = 0.0
             # Yellow: slow down and prepare to stop or proceed with caution
             self.state = "LIGHT_YELLOW_SLOW"
 
         elif is_green:
+            self.red_start_time = 0.0
             if self.state in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"]:
                 if now - self.last_seen_red > 1.0:   # 1 s delay before moving
                     self.state = "LIGHT_GREEN_GO"
@@ -210,6 +218,7 @@ class TrafficLightStateMachine:
                 self.state = "LIGHT_GREEN_GO"
 
         else:
+            self.red_start_time = 0.0
             # Light lost
             if self.state in ["LIGHT_RED_STOPPED", "LIGHT_RED_STOPPING"]:
                 if now - self.last_seen_red > 4.0:
@@ -373,6 +382,10 @@ class TrafficDecisionEngine:
 
         # Zone tracking
         self._zone_mode = "CITY"   # "CITY" | "HIGHWAY"
+        
+        # Stability tracking (Traffic Hardening)
+        self.class_stability = {}
+        self.last_det_areas  = {}
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -504,12 +517,33 @@ class TrafficDecisionEngine:
         _nearest_sign_dist_m = 99.0   # for TrafficResult.sign_approach_m
 
         # ── Per-detection logic ───────────────────────────────────────────────
+        current_labels = set()
         for d in dets:
             lbl       = d["label"]
             lbl_lower = lbl.lower()
             x1, y1, x2, y2 = d["bbox"]
             box_h = y2 - y1
+            box_w = x2 - x1
+            box_area = float(box_w * box_h)
             dist_cat = self._dist_cat(box_h)
+            current_labels.add(lbl)
+            
+            # --- Class Stability Update ---
+            prev_area = self.last_det_areas.get(lbl, 0.0)
+            if lbl in self.class_stability:
+                # Area must be within +/- 30% to count as stable
+                if prev_area > 0 and (abs(box_area - prev_area) / prev_area) <= 0.3:
+                    self.class_stability[lbl] += 1
+                else:
+                    self.class_stability[lbl] = 1 # Reset if box jumped massively
+            else:
+                self.class_stability[lbl] = 1
+                
+            self.last_det_areas[lbl] = box_area
+            
+            # If not seen for 3 consecutive frames, ignore it to prevent flicker
+            if self.class_stability[lbl] < 3:
+                continue
 
             # Estimate approach distance for dashboard
             approx_m = self._approx_dist_m(box_h)
@@ -569,7 +603,14 @@ class TrafficDecisionEngine:
                 if now > self.stop_cd and now > self._priority_until:
                     if self.stop_timer == 0.0:
                         self.stop_timer = now
-                    commit(2, "SYS_STOP", "STOP SIGN (3 s)")
+                    
+                    # If we've been stopped for 3 seconds, release and set 5s cooldown
+                    if now - self.stop_timer > 3.0:
+                        self.stop_cd = now + 5.0
+                        self.stop_timer = 0.0
+                        # Auto-release: next frame will be CLEAR unless another sign overrides
+                    else:
+                        commit(2, "SYS_STOP", "STOP SIGN (3 s)")
 
             # ── Crosswalk sign ────────────────────────────────────────────────
             elif any(k in lbl_lower for k in ("crosswalk", "pedestrian_crossing",
@@ -636,6 +677,13 @@ class TrafficDecisionEngine:
         # ── Apply active stop-sign hold ───────────────────────────────────────
         if self.stop_timer > 0.0 and now - self.stop_timer < 3.0:
             commit(2, "SYS_STOP", "STOP SIGN (holding)")
+
+        # --- Clean up lost labels from stability tracker ---
+        lost_labels = [k for k in self.class_stability.keys() if k not in current_labels]
+        for k in lost_labels:
+            del self.class_stability[k]
+            if k in self.last_det_areas:
+                del self.last_det_areas[k]
 
         # ── Override: active red light beats everything else ──────────────────
         if "RED" in light_st:

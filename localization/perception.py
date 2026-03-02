@@ -347,10 +347,10 @@ class HybridLaneTracker:
 
 
     def _width_sane(self, lf, rf, y=400):
-        # F-06: tightened from 80<w<560 to 180<w<420
-        # BFMC lanes are ~280-350 px wide in BEV. 560 was accepting cross-lane noise.
+        # F-06: tightened from 180<w<420 to 200<w<500
+        # BFMC lanes are ~280-350 px wide in BEV. 500 prevents cross-lane noise.
         w = np.polyval(rf, y) - np.polyval(lf, y)
-        return 180 < w < 420
+        return 200 < w < 500
 
     def _ema(self, prev, new, alpha=None):
         if alpha is None:
@@ -378,10 +378,15 @@ class VisionPipeline:
                 nav_state="NORMAL", velocity_ms=0.0, last_steering=0.0,
                 upcoming_curve: str = "STRAIGHT",
                 pitch_rad: float = 0.0) -> PerceptionResult:
-        if raw_frame.shape[:2] != (480, 640):
-            process_frame = cv2.resize(raw_frame, (640, 480))
+        # Shadow / Lighting Adaptation (Auto Gamma Correction)
+        avg_brightness = np.mean(raw_frame)
+        if avg_brightness < 60:
+            process_frame = cv2.convertScaleAbs(raw_frame, alpha=1.2, beta=15)
         else:
             process_frame = raw_frame
+        
+        if process_frame.shape[:2] != (480, 640):
+            process_frame = cv2.resize(process_frame, (640, 480))
 
         # Run Visual Odometry on raw frame (ground-plane features)
         opt_yaw_rate, opt_vel = self.vo.update(process_frame, dt)
@@ -475,6 +480,23 @@ class VisionPipeline:
         elif sr is not None:
             heading_rad = _lane_heading(sr, y_eval)
             h_conf = 0.35
+            
+        # Lane Validity Model (Geometric Validation)
+        # Reject statistically improbable lane findings directly.
+        last_curv    = getattr(self, '_last_valid_curv', 0.0)
+        last_heading = getattr(self, '_last_valid_heading', 0.0)
+        
+        if conf > 0.0:
+            curv_spike = abs(curv) > 3.0 * max(0.001, abs(last_curv))
+            heading_jump = abs(math.degrees(heading_rad - last_heading)) > 15.0
+            
+            if curv_spike or heading_jump:
+                conf   = 0.0
+                h_conf = 0.0
+                anchor = "REJECTED_ANOMALY"
+            else:
+                self._last_valid_curv    = curv
+                self._last_valid_heading = heading_rad
         
         return PerceptionResult(
             warped_binary=warped_binary,
