@@ -278,7 +278,7 @@ class HybridLaneTracker:
         if fit is None: return 0.0
         a, b = fit[0], fit[1]
         denom = (1.0 + (2.0 * a * y_eval + b) ** 2) ** 1.5
-        return abs(2.0 * a) / max(denom, 1e-6)
+        return min(abs(2.0 * a) / max(denom, 1e-4), 1.0)
 
     def _sliding_window(self, warped, nzx, nzy, map_hint: str = "STRAIGHT"):
         dbg  = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
@@ -405,7 +405,18 @@ class VisionPipeline:
         
         # Adaptive Lighting Compensation
         mean_l = np.mean(L)
-        if mean_l < 100:
+        # BUG FIX: Tunnel/Dark-Frame Protection against noise amplification
+        if mean_l < 30:
+            return PerceptionResult(
+                warped_binary=np.zeros((480, 640), dtype=np.uint8),
+                lane_dbg=process_frame.copy(),
+                sl=None, sr=None,
+                target_x=self.last_target_x, lateral_error_px=0.0,
+                anchor="DARK_ABORT", confidence=0.0,
+                heading_rad=0.0, heading_conf=0.0,
+                lane_width_px=self.tracker.estimated_lane_width,
+                optical_yaw_rate=opt_yaw_rate, optical_vel=opt_vel)
+        elif mean_l < 100:
             L = cv2.convertScaleAbs(L, alpha=1.0 + (100 - mean_l)/200, beta=int((100 - mean_l)*0.6))
         elif mean_l > 180:
             L = cv2.convertScaleAbs(L, alpha=1.0 - (mean_l - 180)/350, beta=int(-(mean_l - 180)*0.4))
