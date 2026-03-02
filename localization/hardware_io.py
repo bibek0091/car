@@ -139,22 +139,18 @@ class HardwareIO:
     # ── Daemon workers ────────────────────────────────────────────────────────
 
     def _camera_worker(self):
-        """Runs in background thread: continually captures and enqueues frames.
-        F-16: capture_array() is a blocking call — it returns only when the sensor
-        delivers a new frame. No sleep needed; the sensor naturally rate-limits us
-        to ~30-60 FPS without burning CPU cycles between captures.
-        HW-FIX-01: removed extra 10ms sleep after capture — it was adding latency
-        for no benefit since capture_array() already blocks for the frame interval.
-        """
+        """Runs in background thread: continually captures and enqueues frames."""
         while self._running:
             try:
                 frame = self.camera.capture_array()   # blocks until new frame ready
                 if frame is not None and _CV2_AVAILABLE:
-                    # XRGB8888 → BGR
-                    if frame.ndim == 3 and frame.shape[2] == 4:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                    else:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    # PiCamera2 natively outputs RGB when format="XRGB8888" or "RGB888" is requested.
+                    # We just need to ensure we map it to BGR for OpenCV.
+                    if frame.ndim == 3:
+                        if frame.shape[2] == 4:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                        else:
+                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     self._push_frame(cv2.resize(frame, (640, 480)))
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")

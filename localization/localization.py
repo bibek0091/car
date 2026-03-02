@@ -402,7 +402,8 @@ class LocalizationEngine:
                     # Forces speed reduction BEFORE the 40 deg hard clamp is needed.
                     if abs(diff) > math.radians(20):
                         self.pos_var += 0.2
-                        self.confidence *= 0.8
+                        # Localizer does not own confidence directly, it tracks it via get_pose_for_dashboard etc.
+                        # The pos_var spike is enough to trigger the SafetyManager slow-down.
                         log.warning("DRIFT GROWTH MONITOR: Yaw error > 20 deg! Spiking pos_var to force slow down.")
 
                     self.yaw += 0.05 * diff
