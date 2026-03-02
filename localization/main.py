@@ -46,7 +46,6 @@ from perception    import VisionPipeline
 from localization  import LocalizationEngine
 from control       import Controller, ControlOutput
 from hardware_io   import HardwareIO
-from safety_manager import GlobalSafetyManager
 
 try:
     from behavior_controller import BehaviorController
@@ -75,13 +74,16 @@ except ImportError:
 
     @dataclass
     class TrafficResult:
-        state: str = "SYS_GO"
-        reason: str = "OK"
-        speed_multiplier: float = 1.0
-        active_labels: list = field(default_factory=list)
-        yolo_debug_frame: object = None
-        sign_approach_m: float = 99.0
-        zone_mode: str = "CITY"
+        state:               str   = "SYS_GO"
+        reason:              str   = "NO TRAFFIC MODULE"
+        speed_multiplier:    float = 1.0
+        zone_mode:           str   = "CITY"
+        parking_state:       str   = "NONE"
+        steer_bias:          float = 0.0
+        pedestrian_blocking: bool  = False
+        light_status:        str   = "NONE"
+        active_labels:       List  = field(default_factory=list)
+        yolo_debug_frame:    object = None
 
     class ThreadedYOLODetector:
         def __init__(self, *a, **kw): pass
@@ -115,11 +117,9 @@ C_BG    = ( 12,  12,  20)   # deep navy-black
 
 
 def map_to_pixel(x_m, y_m, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
-    """World-map coords (x right, y up) → image pixels (origin top-left)."""
     return int(x_m / map_w_m * img_w), int((map_h_m - y_m) / map_h_m * img_h)
 
 def pixel_to_map(px, py, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
-    """Image pixels → world-map coords. Matches the y-flip in map_to_pixel."""
     return px / img_w * map_w_m, (1.0 - py / img_h) * map_h_m
 
 
@@ -274,10 +274,6 @@ class GraphMLMapCanvas:
     def add_trail_point(self, x, y):
         self._trail.append((x, y))
 
-    def draw_map(self):
-        """Re-draws the static base map (e.g., after clearing signs)."""
-        self._base = self._build_base()
-
     def render(self, car_x, car_y, car_yaw, path, cursor, conf,
                zone, snap_miss, heading_conf, sign_map=None,
                path_signs=None, sign_milestone_idx=0):
@@ -379,10 +375,8 @@ class GraphMLMapCanvas:
         cv2.circle(img, (cx, cy), 11, (dot_col[0]//4, dot_col[1]//4, dot_col[2]//4), -1, cv2.LINE_AA)
         cv2.circle(img, (cx, cy), 8, dot_col, -1, cv2.LINE_AA)
         cv2.circle(img, (cx, cy), 13, dot_col, 1, cv2.LINE_AA)
-        # MAIN-FIX-07: image y increases DOWN but map y increases UP.
-        # cos(yaw) is correct for x; sin(yaw) must be NEGATED for image y.
         hx = cx + int(math.cos(car_yaw) * 26)
-        hy = cy - int(math.sin(car_yaw) * 26)   # negate sin for image frame
+        hy = cy - int(math.sin(car_yaw) * 26)
         cv2.arrowedLine(img, (cx, cy), (hx, hy), (240, 240, 255), 2,
                         tipLength=0.35, line_type=cv2.LINE_AA)
 
@@ -407,7 +401,6 @@ class GraphMLMapCanvas:
                         0.30, (140, 140, 160), 1, cv2.LINE_AA)
 
         return img
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SignSequencePanel  — ordered landmark list from A* path
@@ -778,7 +771,6 @@ class LocalizationPanel:
 
         return img
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # VIZ-04 — Telemetry panel
 # ══════════════════════════════════════════════════════════════════════════════
@@ -907,7 +899,7 @@ def _annotate_bev(perc, ctrl):
 
     # y_eval dashed row
     yrow = int(perc.y_eval)
-    yc   = C_GREEN if "DUAL" in perc.anchor else (C_AMBER if "DEAD" not in perc.anchor else C_RED)
+    yc   = C_GREEN if "DUAL" in ctrl.anchor else (C_AMBER if "DEAD" not in ctrl.anchor else C_RED)
     for xi in range(0,640,18): cv2.line(dbg,(xi,yrow),(xi+9,yrow),yc,1,cv2.LINE_AA)
 
     # Target dashed crosshair
@@ -958,13 +950,12 @@ def _status_bar(w, estop, fps, zone, nav_state, upcoming_curve, curve_dist_m,
 # directly from the A* path cursor. No visual fallback needed.
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Orchestrator:
-    BASE_SPEED = 22    # city base speed — matches CITY_SPEED_PWM in BehaviorController
+    BASE_SPEED = 22    # ~20 cm/s city speed (was 50 — far too fast)
     MAP_W=600; MAP_H=440
     CAM_W=480; CAM_H=360
     LOC_W=520; LOC_H=400
@@ -1007,9 +998,6 @@ class Orchestrator:
         self._last_t_res = None
         self._sign_history = deque(maxlen=20)
 
-        # Safety Manager for Fused Confidence
-        self.safety_manager = GlobalSafetyManager()
-
         # Sign map — placed signs persist across restarts
         _sm_path = os.path.join(_SCRIPT_DIR, "sign_map.json")
         self.sign_map = SignMap(_sm_path) if _SIGNMAP_AVAILABLE else None
@@ -1043,36 +1031,43 @@ class Orchestrator:
         self._q_loc   = queue.Queue(maxsize=1)
 
     def build_ui(self, root):
-        """BFMC v5 dashboard — scrollable, works on any screen size."""
+        """BFMC v5 dashboard — screen-adaptive, zero-waste compact layout."""
         self._root = root
         root.title("BFMC v5  \u2014  Autonomous Navigation Pilot")
         root.configure(bg="#080810")
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # ── Screen geometry ───────────────────────────────────────────────────
-        SW  = root.winfo_screenwidth()
-        SH  = root.winfo_screenheight()
-        self._status_bar_w = max(SW, 1200)
+        # ── Detect usable screen area ─────────────────────────────────────────
+        # Reserve headroom for OS taskbars / titlebars (~60 px).
+        SW = root.winfo_screenwidth()
+        SH = root.winfo_screenheight() - 60
 
-        # Content always uses full screen width; minimum 1200 for usability.
-        COL_GAP   = 2
-        COL_W     = (SW - COL_GAP * 2) // 3
+        # Fixed chrome heights (status bar + sign editor + control bar)
+        # Status bar: 28px, Sign editor: ~86px, Control bar: 28px → ~142px total
+        CHROME_H = 142
+        AVAIL_H  = SH - CHROME_H   # pixels available for the 3-column panel grid
 
-        # Panel height: each column stacks 2 panels.
-        # Chrome (status+editor+control) ~= 140px → each panel gets half the rest.
-        # Cap at 500, floor at 280 so it's always usable.
-        CHROME_H  = 140
-        PANEL_H   = max(280, min(500, (SH - CHROME_H) // 2))
+        # ── Compute panel sizes that fill the screen exactly ──────────────────
+        # Layout:  Col-0 (map+bev)  |  Col-1 (cam+loc)  |  Col-2 (seq+telem)
+        # Col widths: map=col1=col0_w, seq panel narrower.
+        # 3 columns + 2 gaps of 2px each → col_w = (SW - 4) / 3
+        COL_GAP  = 2
+        COL_W    = (SW - COL_GAP * 2) // 3
 
+        # Each column has 2 panels stacked; they share AVAIL_H equally.
+        PANEL_H  = AVAIL_H // 2
+
+        # Individual panel dimensions (images rendered at these sizes)
         self.MAP_W = COL_W;  self.MAP_H = PANEL_H
         self.CAM_W = COL_W;  self.CAM_H = PANEL_H
         self.LOC_W = COL_W;  self.LOC_H = PANEL_H
         self.TEL_W = COL_W;  self.TEL_H = PANEL_H
         self.SEQ_W = COL_W;  self.SEQ_H = PANEL_H
 
+        # Rebuild loc_panel at the correct size now that we know dimensions
         self._loc_panel = LocalizationPanel(self.LOC_W, self.LOC_H)
 
-        # ── Colours ───────────────────────────────────────────────────────────
+        # ── Colour tokens ─────────────────────────────────────────────────────
         BG      = "#080810"
         PANEL   = "#08080f"
         SIGN_BG = "#06060e"
@@ -1089,23 +1084,22 @@ class Orchestrator:
             value=f"{len(self.sign_map) if self.sign_map else 0} signs")
         self._sv_announce    = tk.StringVar(value="")
 
-        # ═══════════════════════════════════════════════════════════════════
-        # FIXED TOP CHROME — status bar + sign editor (never scrolls)
-        # ═══════════════════════════════════════════════════════════════════
-        top_chrome = tk.Frame(root, bg=BG)
-        top_chrome.pack(fill=tk.X, side=tk.TOP)
-
-        # Status bar
-        self._sf = tk.Frame(top_chrome, bg=BG, height=26)
-        self._sf.pack(fill=tk.X)
+        # ═════════════════════════════════════════════════════════════════════
+        # BLOCK 1 — STATUS BAR (28 px, full width)
+        # ═════════════════════════════════════════════════════════════════════
+        self._sf = tk.Frame(root, bg=BG, height=28)
+        self._sf.pack(fill=tk.X, side=tk.TOP)
         self._sf.pack_propagate(False)
         self._sl = tk.Label(self._sf, bg=BG, anchor=tk.W)
         self._sl.pack(fill=tk.BOTH, expand=True)
-        self._refresh_status_label(np.full((26, max(SW, 1200), 3), 12, np.uint8))
+        self._refresh_status_label(np.full((28, SW, 3), 12, np.uint8))
 
-        # Sign editor
-        se_outer = tk.Frame(top_chrome, bg=SIGN_BG)
-        se_outer.pack(fill=tk.X)
+        # ═════════════════════════════════════════════════════════════════════
+        # BLOCK 2 — SIGN PLACEMENT EDITOR  (compact, no wasted padding)
+        # ═════════════════════════════════════════════════════════════════════
+        se_outer = tk.Frame(root, bg=SIGN_BG)
+        se_outer.pack(fill=tk.X, side=tk.TOP)
+        # Thin accent top-border
         tk.Frame(se_outer, bg=_ACCENT, height=1).pack(fill=tk.X)
 
         ctrl_row = tk.Frame(se_outer, bg=SIGN_BG)
@@ -1168,7 +1162,7 @@ class Orchestrator:
             ("\u25a4 Save",  "#0c1e0c", "#143014", _save_signs),
         ]:
             tk.Button(ctrl_row, text=lbl, bg=bg, fg=_FG_BRIGHT,
-                      font=("Consolas", 9, "bold"),
+                      font=("Consolas", 8, "bold"),
                       relief=tk.FLAT, bd=0, padx=7, pady=2,
                       activebackground=abg, activeforeground="#fff",
                       command=fn).pack(side=tk.LEFT, padx=2)
@@ -1176,11 +1170,13 @@ class Orchestrator:
         tk.Label(ctrl_row, textvariable=self._sv_sign_count,
                  bg=SIGN_BG, fg=_ACCENT,
                  font=("Consolas", 8)).pack(side=tk.LEFT, padx=8)
+
         tk.Label(ctrl_row,
                  text="\u2460 type  \u2461 place  \u2462 L-click  \u2463 R-removes",
                  bg=SIGN_BG, fg=_FG_DIM,
                  font=("Consolas", 7)).pack(side=tk.RIGHT, padx=4)
 
+        # ── Sign-type button rows (2 × 5, ultra-compact) ──────────────────────
         SIGN_COLORS = {
             "traffic-light": ("#e63232","#fff"), "stop":    ("#c0392b","#fff"),
             "parking":       ("#e67e22","#fff"), "crosswalk":("#00ced1","#000"),
@@ -1190,10 +1186,10 @@ class Orchestrator:
         }
         SIGN_LABELS = {
             "traffic-light": "\U0001f6a6 TRF LIGHT", "stop":    "\U0001f6d1 STOP",
-            "parking":       "\U0001f17f PARKING",   "crosswalk":"\u2b1c XWALK",
-            "priority":      "\u25b2 PRIORITY",      "highway-entry":"H\u207a HWY IN",
-            "highway-exit":  "H\u207b HWY OUT",      "one-way": "\u2192 ONE-WAY",
-            "roundabout":    "\u21ba ROUNDABOUT",    "no-entry":"\u2296 NO ENTRY",
+            "parking":       "\U0001f17f PARKING",  "crosswalk":"\u2b1c XWALK",
+            "priority":      "\u25b2 PRIORITY",     "highway-entry":"H\u207a HWY IN",
+            "highway-exit":  "H\u207b HWY OUT",     "one-way": "\u2192 ONE-WAY",
+            "roundabout":    "\u21ba ROUNDABOUT",   "no-entry":"\u2296 NO ENTRY",
         }
         SIGN_DESCR = {
             "traffic-light":"Stop at RED, go on GREEN","stop":"Halt 3 s at intersection",
@@ -1202,6 +1198,7 @@ class Orchestrator:
             "highway-exit":"Switch back to city rules","one-way":"Follow one-way direction",
             "roundabout":"Follow CCW roundabout rules","no-entry":"Block node, reroute",
         }
+
         self._selected_sign_type = tk.StringVar(value=SIGN_TYPES[0])
         self._sign_btns = {}
 
@@ -1214,8 +1211,7 @@ class Orchestrator:
                     is_sel = (t2 == stype)
                     b2.config(bg="#e8e8e8" if is_sel else nc2,
                               fg="#000000" if is_sel else fc2,
-                              relief=tk.SUNKEN if is_sel else tk.FLAT,
-                              bd=1 if is_sel else 0)
+                              relief=tk.SUNKEN if is_sel else tk.FLAT, bd=1 if is_sel else 0)
                 hint = SIGN_DESCR.get(stype, "")
                 if self._sign_place_mode:
                     self._sv_hint.set(f"PLACE [{stype}] \u2014 {hint}")
@@ -1227,6 +1223,7 @@ class Orchestrator:
         btn_area.pack(fill=tk.X, padx=4, pady=(0, 2))
         sr0 = tk.Frame(btn_area, bg=SIGN_BG); sr0.pack(fill=tk.X)
         sr1 = tk.Frame(btn_area, bg=SIGN_BG); sr1.pack(fill=tk.X)
+
         for i, st in enumerate(SIGN_TYPES):
             nc, fc = SIGN_COLORS.get(st, ("#333","#fff"))
             lb     = SIGN_LABELS.get(st, st.upper())
@@ -1239,140 +1236,39 @@ class Orchestrator:
             b.pack(side=tk.LEFT, padx=1, pady=0)
             self._sign_btns[st] = b
         _make_select(SIGN_TYPES[0])()
+
+        # Thin separator under editor
         tk.Frame(se_outer, bg="#1a1a2a", height=1).pack(fill=tk.X)
 
-        # Announcement banner (hidden until triggered, sits in top chrome)
-        self._announce_lbl = tk.Label(top_chrome, textvariable=self._sv_announce,
+        # ═════════════════════════════════════════════════════════════════════
+        # BLOCK 3 — ANNOUNCEMENT BANNER (hidden until triggered)
+        # ═════════════════════════════════════════════════════════════════════
+        self._announce_lbl = tk.Label(root, textvariable=self._sv_announce,
             bg="#030f06", fg="#00ff88", font=("Consolas", 10, "bold"),
             anchor=tk.CENTER, pady=2, relief=tk.FLAT)
 
-        # ═══════════════════════════════════════════════════════════════════
-        # CONTROL BAR — inside top_chrome so it is ALWAYS visible
-        # ═══════════════════════════════════════════════════════════════════
-        tk.Frame(top_chrome, bg="#1a2a1a", height=1).pack(fill=tk.X)
-        cb = tk.Frame(top_chrome, bg="#060610", height=28)
-        cb.pack(fill=tk.X)
-        cb.pack_propagate(False)
+        # ═════════════════════════════════════════════════════════════════════
+        # BLOCK 4 — MAIN PANEL GRID (fills remaining space, zero gaps)
+        # ═════════════════════════════════════════════════════════════════════
+        main_grid = tk.Frame(root, bg=BG)
+        main_grid.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
-        tk.Label(cb, textvariable=self._sv_pose, bg="#060610", fg="#606080",
-                 font=("Consolas", 7)).pack(side=tk.LEFT, padx=6)
-        tk.Label(cb, textvariable=self._sv_hint, bg="#060610", fg="#d0b040",
-                 font=("Consolas", 8, "bold")).pack(side=tk.LEFT, padx=4)
-
-        for _lbl, _bg, _abg, _fn in [
-            ("\u26d4 E-STOP",        "#500000", "#800000", self._estop_cb),
-            ("\u25b6 RESUME",        "#0b220b", "#183018", self._resume_cb),
-            ("\u21ba RESET",         "#091830", "#102848", self._reset_route),
-            ("\u25b6\u25b6 START",   "#1e0038", "#300060", self._start_pilot),
-        ]:
-            tk.Button(cb, text=_lbl, bg=_bg, fg="#d8d8f0",
-                      font=("Consolas", 9, "bold"), relief=tk.RIDGE, bd=1,
-                      padx=10, pady=2,
-                      activebackground=_abg, activeforeground="#fff",
-                      command=_fn).pack(side=tk.RIGHT, padx=3)
-
-        tk.Frame(top_chrome, bg="#001a0a", height=1).pack(fill=tk.X)
-
-
-
-        # ═══════════════════════════════════════════════════════════════════
-        # SCROLLABLE CONTENT AREA
-        # Canvas + scrollbars.  Mouse-wheel scrolls vertically.
-        # Shift+wheel or horizontal drag scrolls horizontally.
-        # ═══════════════════════════════════════════════════════════════════
-        scroll_outer = tk.Frame(root, bg=BG)
-        scroll_outer.pack(fill=tk.BOTH, expand=True)
-
-        v_scroll = tk.Scrollbar(scroll_outer, orient=tk.VERTICAL,
-                                bg="#141420", troughcolor="#0a0a14",
-                                activebackground=_ACCENT, width=10)
-        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        h_scroll = tk.Scrollbar(scroll_outer, orient=tk.HORIZONTAL,
-                                bg="#141420", troughcolor="#0a0a14",
-                                activebackground=_ACCENT, width=10)
-        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
-
-        self._scroll_canvas = tk.Canvas(
-            scroll_outer, bg=BG, highlightthickness=0,
-            yscrollcommand=v_scroll.set,
-            xscrollcommand=h_scroll.set)
-        self._scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        v_scroll.config(command=self._scroll_canvas.yview)
-        h_scroll.config(command=self._scroll_canvas.xview)
-
-        # ── Inner frame — all panels live here ──────────────────────────────
-        inner = tk.Frame(self._scroll_canvas, bg=BG)
-        _inner_id = self._scroll_canvas.create_window(
-            (0, 0), window=inner, anchor=tk.NW)
-
-        # ── Scroll helpers ────────────────────────────────────────────────────
-        def _vscroll(event):
-            if event.num == 4:
-                self._scroll_canvas.yview_scroll(-1, "units")
-            elif event.num == 5:
-                self._scroll_canvas.yview_scroll(1, "units")
-            else:
-                self._scroll_canvas.yview_scroll(int(-event.delta / 120), "units")
-
-        def _hscroll(event):
-            if event.num == 4:
-                self._scroll_canvas.xview_scroll(-1, "units")
-            elif event.num == 5:
-                self._scroll_canvas.xview_scroll(1, "units")
-            else:
-                self._scroll_canvas.xview_scroll(int(-event.delta / 120), "units")
-
-        def _bind_scroll(widget):
-            """Recursively bind mousewheel on widget and all descendants."""
-            widget.bind("<MouseWheel>",       _vscroll, add="+")
-            widget.bind("<Button-4>",         _vscroll, add="+")
-            widget.bind("<Button-5>",         _vscroll, add="+")
-            widget.bind("<Shift-MouseWheel>", _hscroll, add="+")
-            widget.bind("<Shift-Button-4>",   _hscroll, add="+")
-            widget.bind("<Shift-Button-5>",   _hscroll, add="+")
-            for child in widget.winfo_children():
-                _bind_scroll(child)
-
-        # Bind now on root & canvas; re-bind on inner after all children exist
-        for w in (root, self._scroll_canvas):
-            _bind_scroll(w)
-
-        def _update_scrollregion(*_):
-            self._scroll_canvas.configure(
-                scrollregion=self._scroll_canvas.bbox("all"))
-
-        def _on_canvas_resize(event):
-            # Keep inner frame at least as wide as the canvas viewport
-            req = inner.winfo_reqwidth()
-            new_w = max(req, event.width)
-            self._scroll_canvas.itemconfig(_inner_id, width=new_w)
-            _update_scrollregion()
-
-        inner.bind("<Configure>", _update_scrollregion)
-        self._scroll_canvas.bind("<Configure>", _on_canvas_resize)
-
-        # ── Panel grid inside the scrollable inner frame ─────────────────────
         def _panel_label(parent, title, color):
-            """16-px accent header bar + image label — zero border waste."""
-            hdr = tk.Frame(parent, bg="#0d0d1c", height=16)
+            """Thin labelled header bar + image label — no LabelFrame border waste."""
+            hdr = tk.Frame(parent, bg="#0e0e1c", height=16)
             hdr.pack(fill=tk.X)
             hdr.pack_propagate(False)
-            tk.Label(hdr, text=f"  {title}", bg="#0d0d1c", fg=color,
+            tk.Label(hdr, text=f"  {title}", bg="#0e0e1c", fg=color,
                      font=("Consolas", 7, "bold"), anchor=tk.W).pack(
                          side=tk.LEFT, fill=tk.Y)
             lbl = tk.Label(parent, bg=PANEL, cursor="arrow")
-            lbl.pack()
+            lbl.pack(fill=tk.BOTH)
             return lbl
 
-        main_grid = tk.Frame(inner, bg=BG)
-        main_grid.pack(anchor=tk.NW)
-
-        # Column 0 — MAP + BEV
+        # Col 0 — MAP + BEV
         col0 = tk.Frame(main_grid, bg=BG)
-        col0.grid(row=0, column=0, padx=(0, COL_GAP), sticky="nw")
-        self._map_label = _panel_label(
-            col0, "MAP \u2014 GraphML Arena  [L-click place \u2022 R-click remove]", "#00e5ff")
+        col0.grid(row=0, column=0, padx=(0, COL_GAP), sticky="nsew")
+        self._map_label = _panel_label(col0, "MAP \u2014 GraphML Arena  [L-click place \u2022 R-click remove]", "#00e5ff")
         self._map_label.bind("<Button-1>", self._on_map_click)
         self._map_label.bind("<Button-3>", self._on_map_right_click)
         blank_map = np.full((self.MAP_H, self.MAP_W, 3), 8, np.uint8)
@@ -1384,9 +1280,9 @@ class Orchestrator:
         self._bev_ph = ImageTk.PhotoImage(Image.fromarray(blank_bev))
         self._bev_label.config(image=self._bev_ph)
 
-        # Column 1 — CAMERA + LOCALIZATION
+        # Col 1 — CAMERA + LOCALIZATION
         col1 = tk.Frame(main_grid, bg=BG)
-        col1.grid(row=0, column=1, padx=(0, COL_GAP), sticky="nw")
+        col1.grid(row=0, column=1, padx=(0, COL_GAP), sticky="nsew")
         self._yolo_label = _panel_label(col1, "CAMERA \u2014 YOLO Detection", "#ff9100")
         blank_cam = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
         self._yolo_ph = ImageTk.PhotoImage(Image.fromarray(blank_cam))
@@ -1397,9 +1293,9 @@ class Orchestrator:
         self._loc_ph = ImageTk.PhotoImage(Image.fromarray(blank_loc))
         self._loc_label.config(image=self._loc_ph)
 
-        # Column 2 — SIGN SEQUENCE + TELEMETRY
+        # Col 2 — SIGN SEQUENCE + TELEMETRY
         col2 = tk.Frame(main_grid, bg=BG)
-        col2.grid(row=0, column=2, sticky="nw")
+        col2.grid(row=0, column=2, sticky="nsew")
         self._seq_panel = SignSequencePanel(self.SEQ_W, self.SEQ_H)
         self._seq_label = _panel_label(col2, "SIGN ROUTE SEQUENCE", "#00e5a0")
         blank_seq = np.full((self.SEQ_H, self.SEQ_W, 3), 10, np.uint8)
@@ -1411,18 +1307,40 @@ class Orchestrator:
         self._telem_ph = ImageTk.PhotoImage(Image.fromarray(blank_tel))
         self._telem_label.config(image=self._telem_ph)
 
-        # Bind scroll on all inner widgets now that they exist
-        _bind_scroll(inner)
+        # Uniform column weights so grid fills width perfectly
+        main_grid.columnconfigure(0, weight=1)
+        main_grid.columnconfigure(1, weight=1)
+        main_grid.columnconfigure(2, weight=1)
+        main_grid.rowconfigure(0, weight=1)
 
-        # Force scrollregion after layout settles (next event-loop tick)
-        root.after(100, _update_scrollregion)
+        # ═════════════════════════════════════════════════════════════════════
+        # BLOCK 5 — CONTROL BAR (28 px, bottom)
+        # ═════════════════════════════════════════════════════════════════════
+        tk.Frame(root, bg="#00aa66", height=1).pack(fill=tk.X, side=tk.BOTTOM)
+        cb = tk.Frame(root, bg="#060610", height=28)
+        cb.pack(fill=tk.X, side=tk.BOTTOM)
+        cb.pack_propagate(False)
 
-        # Window: fill screen, let OS handle taskbar offset
-        root.geometry(f"{SW}x{SH - 40}+0+0")
+        tk.Label(cb, textvariable=self._sv_pose, bg="#060610", fg="#606080",
+                 font=("Consolas", 7)).pack(side=tk.LEFT, padx=6)
+        tk.Label(cb, textvariable=self._sv_hint, bg="#060610", fg="#d0b040",
+                 font=("Consolas", 8, "bold")).pack(side=tk.LEFT, padx=4)
 
-        # ═══════════════════════════════════════════════════════════════════
+        for lbl, bg, abg, fn in [
+            ("\u26d4 E-STOP", "#500000", "#800000", self._estop_cb),
+            ("\u25b6 RESUME", "#0b220b", "#183018", self._resume_cb),
+            ("\u21ba RESET",  "#091830", "#102848", self._reset_route),
+            ("\u25b6\u25b6 START", "#1e0038", "#300060", self._start_pilot),
+        ]:
+            tk.Button(cb, text=lbl, bg=bg, fg="#d8d8f0",
+                      font=("Consolas", 8, "bold"), relief=tk.FLAT, bd=0,
+                      padx=9, pady=2,
+                      activebackground=abg, activeforeground="#fff",
+                      command=fn).pack(side=tk.RIGHT, padx=2)
+
+        # ═════════════════════════════════════════════════════════════════════
         # Init map canvas renderer
-        # ═══════════════════════════════════════════════════════════════════
+        # ═════════════════════════════════════════════════════════════════════
         if self.localizer.planner:
             self._map_canvas = GraphMLMapCanvas(
                 self.localizer.planner, self.MAP_W, self.MAP_H)
@@ -1568,29 +1486,36 @@ class Orchestrator:
                     self._announce_lbl.pack_forget()
 
             # ── Camera / YOLO frame ─────────────────────────────────────────
-            yi = None
             try:
                 yi = self._q_yolo.get_nowait()
             except queue.Empty:
                 if not self.running:
-                    yi = self.hw.read_camera()
+                    _tmp = self.hw.read_camera()
+                    yi = _tmp if _tmp is not None else np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+                else:
+                    yi = None
 
-            if yi is not None and getattr(self, "CAM_W", None):
+            if yi is not None:
                 yi = cv2.resize(yi, (self.CAM_W, self.CAM_H))
                 self._yolo_ph = ImageTk.PhotoImage(
                     Image.fromarray(cv2.cvtColor(yi, cv2.COLOR_BGR2RGB)))
                 self._yolo_label.config(image=self._yolo_ph)
 
             # ── BEV lane frame ─────────────────────────────────────────────
-            bi = None
             try:
                 bi = self._q_bev.get_nowait()
             except queue.Empty:
                 if not self.running:
-                    # BEV is usually warped, but before start we just show raw
-                    bi = self.hw.read_camera()
+                    _tmp = self.hw.read_camera()
+                    if _tmp is not None:
+                        _tmp_perc = self.vision.process(_tmp)
+                        bi = _annotate_bev(_tmp_perc, self._last_ctrl)
+                    else:
+                        bi = np.zeros((self.CAM_H, self.CAM_W, 3), np.uint8)
+                else:
+                    bi = None
 
-            if bi is not None and getattr(self, "CAM_W", None):
+            if bi is not None:
                 bi = cv2.resize(bi, (self.CAM_W, self.CAM_H))
                 self._bev_ph = ImageTk.PhotoImage(
                     Image.fromarray(cv2.cvtColor(bi, cv2.COLOR_BGR2RGB)))
@@ -1610,24 +1535,10 @@ class Orchestrator:
             ctrl  = self._last_ctrl
             perc  = self._last_perc
             vm    = loc_data.get("speed_ms", 0.0)
-            # MAIN-FIX-02: left/right lane confidence from tracker pixel counts
-            l_conf_norm = min(1.0, perc.confidence) if perc else 0.0
-            r_conf_norm = min(1.0, perc.confidence) if perc else 0.0
-            if perc and hasattr(perc, 'sl') and hasattr(perc, 'sr'):
-                # Distinguish left vs right lane visibility from anchor
-                anchor_str = ctrl.anchor if ctrl else ""
-                if "DUAL" in anchor_str:
-                    l_conf_norm = r_conf_norm = min(1.0, perc.confidence)
-                elif perc.sl is not None and perc.sr is None:
-                    l_conf_norm = min(1.0, perc.confidence)
-                    r_conf_norm = 0.0
-                elif perc.sr is not None and perc.sl is None:
-                    l_conf_norm = 0.0
-                    r_conf_norm = min(1.0, perc.confidence)
             ti = _draw_telemetry_panel(
                 steer         = ctrl.steer_angle_deg,
                 speed_pwm     = ctrl.speed_pwm,
-                lat_err       = 320.0 - ctrl.target_x,   # MAIN-FIX-08: match perception sign
+                lat_err       = ctrl.target_x - 320.0,
                 conf          = conf,
                 anchor        = ctrl.anchor,
                 zone          = zone,
@@ -1635,8 +1546,8 @@ class Orchestrator:
                 fps           = self._fps,
                 sign_history  = list(self._sign_history),
                 nav_state     = self._nav_state,
-                l_conf        = l_conf_norm,
-                r_conf        = r_conf_norm,
+                l_conf        = perc.confidence if perc else 0.0,
+                r_conf        = perc.confidence if perc else 0.0,
                 curvature     = perc.curvature  if perc else 0.0,
                 velocity_ms   = vm,
                 w=self.TEL_W, h=self.TEL_H)
@@ -1647,8 +1558,7 @@ class Orchestrator:
             # ── Status bar ────────────────────────────────────────────────
             cd  = getattr(self.localizer, 'curve_dist_m', 99.0)
             uc  = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
-            _status_w = getattr(self, '_status_bar_w', 1280)
-            si = _status_bar(_status_w, self._estop, self._fps, zone,
+            si  = _status_bar(1280, self._estop, self._fps, zone,
                               self._nav_state, uc, cd, conf, snap_miss)
             self._refresh_status_label(si)
 
@@ -1668,29 +1578,15 @@ class Orchestrator:
         startup_time = time.time()   # reference for calibration phases
         t_prev = time.time()
         _ll = 0; _LLC = 15; _LLS = 90; _zmf = 0
-        # low resolution flag to shed load if FPS drops
-        self._low_res_mode = False
-
         try:
             while self.running:
-                ts = time.time()
-                dt = max(ts-t_prev, 0.001)
-                t_prev = ts
+                ts = time.time(); dt = max(ts-t_prev, 0.001); t_prev = ts
                 elapsed_run = ts - startup_time
 
-                # Auto-Scaling FPS Shield: Downsample if we fell behind last frame
-                # (e.g. if the previous frame took too long to process)
-                if dt > 0.060: # 60ms is 16.6 FPS, 0.060 is 16.6 FPS
-                    if not self._low_res_mode:
-                        log.warning("FPS drop detected (dt=%.3f), entering low-res mode", dt)
-                    self._low_res_mode = True
-                elif dt < 0.040: # 40ms is 25 FPS
-                    if self._low_res_mode:
-                        log.info("FPS recovered (dt=%.3f), exiting low-res mode", dt)
-                    self._low_res_mode = False
-
                 # Always read camera & velocity so dashboard stays live
-                raw_frame = self.hw.read_camera()
+                raw_frame   = self.hw.read_camera()
+                if raw_frame is None:
+                    raw_frame = np.zeros((480, 640, 3), np.uint8)
                 velocity_ms = self.hw.get_velocity_ms()
 
                 # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
@@ -1728,9 +1624,19 @@ class Orchestrator:
                         # If localization is uninitialized or low-confidence,
                         # the position could be wrong → always run YOLO to
                         # avoid missing signs.
-                        # Run YOLO unconditionally to ensure signs are never missed,
-                        # regardless of whether they have been placed on the map.
-                        run_yolo = True
+                        loc_trusted = (self.localizer.is_initialized() and
+                                       self._last_conf > 0.40)
+                        if loc_trusted:
+                            nearby_signs = self.sign_map.get_nearby(
+                                x0, y0, radius_m=self._YOLO_GATE_M)
+                            run_yolo = bool(nearby_signs)
+                            if not run_yolo:
+                                log.debug("YOLO SKIPPED — loc trusted, no signs "
+                                          "within %.1fm", self._YOLO_GATE_M)
+                        else:
+                            # Localization uncertain — run YOLO unconditionally
+                            run_yolo = True
+                            log.debug("YOLO FORCED — localization not yet trusted")
 
                     if run_yolo:
                         t_res = self.traffic_engine.process(
@@ -1747,27 +1653,26 @@ class Orchestrator:
                     t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
 
                 # --- SIGN-TRIGGERED LOCALIZATION SNAP ---
+                # When YOLO detects a label that matches a placed map sign within
+                # 3 m of the car's current estimated position, snap the localizer
+                # to that sign's known map coordinates to correct odometry drift.
                 if self.sign_map and t_res.active_labels:
                     x_snap, y_snap, _ = self.localizer.get_pose()
-                    snap_found = False
                     for lbl in t_res.active_labels:
                         matched = self.sign_map.match_detection(
                             lbl, x_snap, y_snap, radius_m=3.0)
-                        if matched:
-                            if matched["id"] != self._last_snap_id:
-                                _, _, yaw_now = self.localizer.get_pose()
-                                d_obs = min(t_res.sign_approach_m, 4.0)
-                                d_est = math.hypot(matched["x_m"] - x_snap, matched["y_m"] - y_snap)
-                                shift_m = d_est - d_obs
-                                true_x = x_snap + shift_m * math.cos(yaw_now)
-                                true_y = y_snap + shift_m * math.sin(yaw_now)
-                                self.localizer.set_pose(true_x, true_y, yaw_now)
-                                self._last_snap_id = matched["id"]
-                                log.info("SIGN SNAP: %s → shifted %+.2fm", lbl, shift_m)
-                            snap_found = True
-                            break  # Found a match — stop searching
-                    if not snap_found:
-                        # MAIN-FIX-05: only clear lock when NO labels matched anything
+                        if matched and matched["id"] != self._last_snap_id:
+                            _, _, yaw_now = self.localizer.get_pose()
+                            self.localizer.set_pose(
+                                matched["x_m"], matched["y_m"], yaw_now)
+                            self._last_snap_id = matched["id"]
+                            log.info(
+                                "SIGN SNAP: %s → (%.2f, %.2f) dist=%.2fm",
+                                lbl, matched["x_m"], matched["y_m"],
+                                matched["dist"])
+                            break  # one snap per frame
+                    else:
+                        # Reset snap lock when no sign detected nearby
                         self._last_snap_id = None
 
                 self._last_t_res = t_res
@@ -1797,7 +1702,7 @@ class Orchestrator:
                     # If lanes are visible again, clear E-STOP and resume driving.
                     try:
                         recovery_perc = self.vision.process(raw_frame, dt=dt)
-                        if recovery_perc.confidence > 0.4 and not self._dest_reached:
+                        if recovery_perc.confidence > 0.4:
                             self._estop = False
                             _ll = 0
                             log.info("F-15: E-STOP cleared — lanes re-detected (conf=%.2f)", recovery_perc.confidence)
@@ -1882,7 +1787,6 @@ class Orchestrator:
                         if self._nav_state == 'TUNNEL_ENTRY':
                             self._nav_state = 'NORMAL'
                             log.info("Fix-6: TUNNEL_EXIT — lanes resuming")
-                        
                         perc = self.vision.process(
                             raw_frame,
                             dt=dt,
@@ -1892,23 +1796,14 @@ class Orchestrator:
                             last_steering=getattr(self._last_ctrl,'steer_angle_deg',0.0),
                             upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
                             pitch_rad=_pitch_rad)
-                    
-                    self._last_conf = perc.confidence
-                    self._last_perc = perc
-
-                    # --- PATH-ACTION & NEARBY SIGNS ---
-                    nearby_signs = []
-                    if self.sign_map:
-                        sx, sy, _ = self.localizer.get_pose()
-                        nearby_signs = self.sign_map.get_nearby_signs(sx, sy, radius_m=2.0)
+                    self._last_conf = perc.confidence; self._last_perc = perc
 
                     # Fix-2: direct map-cursor action — JunctionDetector removed.
                     map_action = "STRAIGHT"
                     if self._planned_path and self.localizer.planner:
-                        _cur_x, _cur_y, _cur_yaw = self.localizer.get_pose()
+                        _xj, _yj, _yj2 = self.localizer.get_pose()
                         map_action = self.localizer.planner.get_next_action(
-                            _cur_x, _cur_y, _cur_yaw,
-                            path=self._planned_path,
+                            _xj, _yj, _yj2, path=self._planned_path,
                             cursor=self._path_cursor, velocity_ms=velocity_ms)
                         if map_action not in ("STRAIGHT", ""):
                             self._nav_state = f"JUNCTION_{map_action}"
@@ -1981,60 +1876,6 @@ class Orchestrator:
                             log.debug("BEH[%d] %s: %s",
                                       beh.priority, beh.state, beh.reason)
 
-                    # --- GLOBAL SAFETY ENFORCEMENT ---
-                    snap_miss_ratio = getattr(self.localizer, '_snap_miss_frames', 0)
-                    sign_in_range   = (len(nearby_signs) > 0)
-                    yolo_active     = (len(t_res.active_labels) > 0)
-
-                    # --- DYNAMIC REPLANNING TRIGGER ---
-                    # If localizer is utterly lost for 1 full second (30 frames), force a graphical re-route
-                    if snap_miss_ratio > 30 and self._planned_path and self.localizer.planner:
-                        log.warning("REPLAN: Lost map snap for >30 frames. Forcing A* recalculation.")
-                        _rx, _ry, _ = self.localizer.get_pose()
-                        _nearest = self.localizer.planner.get_nearest_node(_rx, _ry)
-                        if _nearest and _nearest != self._target_node:
-                            _new_plan = self.localizer.planner.plan_route(
-                                _nearest, self._target_node, blocked_nodes=self._blocked_nodes)
-                            if _new_plan:
-                                self._planned_path = _new_plan
-                                self._path_cursor = 0
-                                self.localizer.reset_cursor()
-                                self.localizer._snap_miss_frames = 0
-                                log.info("REPLAN SUCCESS: New route from %s to %s.", _nearest, self._target_node)
-                            else:
-                                log.error("REPLAN FAILED: Cannot find path from %s.", _nearest)
-
-                    global_conf = self.safety_manager.update(
-                        lane_conf=perc.confidence,
-                        loc_conf=self.localizer.confidence,
-                        yolo_active=yolo_active,
-                        snap_success=(self._last_snap_id is not None),
-                        sign_in_range=sign_in_range
-                    )
-
-                    # Clamp speed based on fused global confidence
-                    safe_speed = self.safety_manager.apply_speed_limits(ctrl.speed_pwm, global_conf)
-                    
-                    # Apply Localization Hardening limits
-                    loc_pos_var = getattr(self.localizer, 'pos_var', 0.0)
-                    loc_slip    = getattr(self.localizer, 'wheel_slip', False)
-                    
-                    if loc_slip:
-                        log.warning("SAFETY [HARDENING]: Wheel slip detected. Forcing halt.")
-                        safe_speed = 0.0
-                    elif loc_pos_var > 1.0:
-                        log.warning("SAFETY [HARDENING]: Position covariance too high (%.2f). Halving speed.", loc_pos_var)
-                        safe_speed = min(safe_speed, ctrl.speed_pwm * 0.5)
-
-                    if safe_speed < ctrl.speed_pwm and not loc_slip and loc_pos_var <= 1.0:
-                        if safe_speed == 0.0:
-                            log.warning("SAFETY: Low confidence (%.2f). Force-stopping car.", global_conf)
-                        else:
-                            log.info("SAFETY: Marginal confidence (%.2f). Halving speed (%.1f -> %.1f).", 
-                                     global_conf, ctrl.speed_pwm, safe_speed)
-                                     
-                    ctrl.speed_pwm = safe_speed
-
                     # --- STARTUP CALIBRATION OVERRIDE ---
                     # Stage 1 (0-3 s): hold stationary — let AE/AWB settle.
                     # Stage 2 (3-6 s): crawl at ≤15 PWM — warm up EMA lane tracker.
@@ -2045,7 +1886,7 @@ class Orchestrator:
                             f"CAM CALIB: {3.0 - elapsed_run:.1f}s",
                             (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
                     elif elapsed_run < 6.0:
-                        ctrl.speed_pwm = min(ctrl.speed_pwm, 17.0)
+                        ctrl.speed_pwm = min(ctrl.speed_pwm, 15.0)
                         cv2.putText(perc.lane_dbg,
                             f"LANE CALIB: {6.0 - elapsed_run:.1f}s",
                             (140, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 3)
@@ -2053,74 +1894,47 @@ class Orchestrator:
                     self._last_ctrl = ctrl
 
                     _ll = _ll+1 if (perc.sl is None and perc.sr is None) else 0
-
-                    if _ll >= _LLS and elapsed_run > 6.0:
+                    if _ll>=_LLS:
                         self.hw.set_speed(0); self.hw.set_steering(0)
                         self._estop=True
                     else:
                         speed = ctrl.speed_pwm
                         if _ll>=_LLC: speed = min(speed,20.0)
                         if 0.0<speed<PWM_DEADBAND: speed=PWM_DEADBAND
-                        _is_hwy = (self._nav_state == "HIGHWAY")
-                        self.hw.set_speed(speed, highway_mode=_is_hwy)
-                        self.hw.set_steering(ctrl.steer_angle_deg)
+                        self.hw.set_speed(speed); self.hw.set_steering(ctrl.steer_angle_deg)
 
                 # --- DASHBOARD TELEMETRY (runs always, even in E-STOP) ---
-                yolo_frame_to_push = t_res.yolo_debug_frame if getattr(t_res, 'yolo_debug_frame', None) is not None else raw_frame
-                push_latest(self._q_yolo, yolo_frame_to_push)
-                
-                # perc and ctrl might be None if estop triggered on very first frame, use fallback
-                _perc_to_draw = perc if 'perc' in locals() else getattr(self, '_last_perc', None)
-                _ctrl_to_draw = ctrl if 'ctrl' in locals() else getattr(self, '_last_ctrl', None)
-                if _perc_to_draw and _ctrl_to_draw:
-                    push_latest(self._q_bev, _annotate_bev(_perc_to_draw, _ctrl_to_draw))
-                else:
-                    push_latest(self._q_bev, raw_frame)
+                push_latest(self._q_yolo,
+                            t_res.yolo_debug_frame if t_res.yolo_debug_frame is not None
+                            else raw_frame)
+                push_latest(self._q_bev, _annotate_bev(perc, ctrl))
 
                 # VIZ-03: localization panel
                 sm     = getattr(self.localizer,'_snap_miss_frames',0)
                 lx,ly,lyaw = self.localizer.get_pose()
                 yr     = self.localizer.visual_yaw_rate
-                
-                _p_conf  = _perc_to_draw.confidence if _perc_to_draw else 0.0
-                _p_hconf = _perc_to_draw.heading_conf if _perc_to_draw else 0.0
-                _p_lat   = _perc_to_draw.lateral_error_px if _perc_to_draw else 0.0
-
-                self._loc_panel.push(yr, _p_lat, lx, ly, sm==0)
+                self._loc_panel.push(yr, perc.lateral_error_px, lx, ly, sm==0)
                 loc_img = self._loc_panel.render(
                     x=lx, y=ly, yaw_deg=math.degrees(lyaw),
-                    yaw_rate=yr, heading_conf=_p_hconf,
-                    snap_miss=sm, confidence=_p_conf,
+                    yaw_rate=yr, heading_conf=perc.heading_conf,
+                    snap_miss=sm, confidence=perc.confidence,
                     upcoming_curve=getattr(self.localizer,'upcoming_curve','STRAIGHT'),
                     curve_dist_m=getattr(self.localizer,'curve_dist_m',99.0),
-                    lat_err_px=_p_lat, velocity_ms=velocity_ms,
+                    lat_err_px=perc.lateral_error_px, velocity_ms=velocity_ms,
                     zone=self.localizer.current_zone, nav_state=self._nav_state,
-                    l1=(_p_conf>0.3 and _p_hconf>=0.35),
-                    l2=bool(self._planned_path and _p_conf>0.5),
+                    l1=(perc.confidence>0.3 and perc.heading_conf>=0.35),
+                    l2=bool(self._planned_path and perc.confidence>0.5),
                     l4=sm<5)
                 push_latest(self._q_loc, loc_img)
 
                 elapsed = time.time()-ts
-                
-                # FPS Monitor & Auto-Scaling
-                # If loop takes > 60ms (<16 FPS), shed resolution next tick
-                if elapsed > 0.060 and not self._low_res_mode:
-                    log.warning("MAIN LOOP WARNING: Latency spiked to %.0f ms. Engaging low-res mode.", elapsed * 1000)
-                    self._low_res_mode = True
-                elif elapsed < 0.025 and self._low_res_mode:
-                    log.info("MAIN LOOP RECOVERY: Latency returned to %.0f ms. Restoring high-res mode.", elapsed * 1000)
-                    self._low_res_mode = False
-
                 time.sleep(max(0.001, FRAME_PERIOD-elapsed))
 
         except Exception as e:
-            log.critical(f"FATAL EXCEPTION SHIELD: Pilot crashed due to {e}. Halting.", exc_info=True)
-            self._estop = True
-            
-        finally:
-            log.info("Pilot loop exited")
-            self.hw.set_speed(0)
-            self.hw.set_steering(0)
+            log.error(f"FATAL Pilot crash: {e}", exc_info=True); self._estop=True
+
+        log.info("Pilot loop exited")
+        self.hw.set_speed(0); self.hw.set_steering(0)
 
 
     def _start_pilot(self):
@@ -2139,17 +1953,11 @@ class Orchestrator:
         if not self.running: self._start_pilot()
         else: self._estop=False; self._sv_hint.set("Resumed")
 
-    def _reset_route(self, event=None):
-        self._start_node  = None
-        self._target_node = None
-        self._planned_path= []
-        self._path_cursor = 0
-        if self._map_canvas:
-            self._map_canvas._trail.clear()
-            self._map_canvas.draw_map()
-        self.localizer.reset_cursor()
-        self._sv_hint.set("Route cleared. Click two nodes to plan.")
-        log.info("Route reset by user.")
+    def _reset_route(self):
+        self._start_node=None; self._target_node=None
+        self._planned_path=[]; self._path_cursor=0
+        self.localizer.reset_cursor(); self._map_renderer._trail.clear()
+        self._sv_hint.set("Route cleared. Click map: set START")
 
     def _on_close(self):
         self.running=False; self._estop=True
