@@ -104,7 +104,7 @@ class HardwareIO:
             try:
                 self.camera = Picamera2()
                 cfg = self.camera.create_video_configuration(
-                    main={"size": (1280, 720), "format": "XRGB8888"},
+                    main={"size": (1280, 720), "format": "BGR888"},
                     controls={
                         "AwbEnable":   True,   # let camera balance colors naturally
                         "AeEnable":    True,
@@ -144,13 +144,9 @@ class HardwareIO:
             try:
                 frame = self.camera.capture_array()   # blocks until new frame ready
                 if frame is not None and _CV2_AVAILABLE:
-                    # PiCamera2 natively outputs RGB when format="XRGB8888" or "RGB888" is requested.
-                    # We just need to ensure we map it to BGR for OpenCV.
-                    if frame.ndim == 3:
-                        if frame.shape[2] == 4:
-                            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-                        else:
-                            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    # Depending on the Pi OS, BGR888 may still return an RGB array
+                    if frame.ndim == 3 and frame.shape[2] == 3:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     self._push_frame(cv2.resize(frame, (640, 480)))
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")
