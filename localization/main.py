@@ -992,7 +992,7 @@ class Orchestrator:
             else: raise RuntimeError
         except Exception:
             self._threaded_yolo = None
-            self.traffic_engine = TrafficDecisionEngine(None)
+            self.traffic_engine = None
 
         # jct_detector removed — direct map cursor used instead
         self.controller     = Controller()
@@ -2070,8 +2070,8 @@ class Orchestrator:
                 push_latest(self._q_yolo, yolo_frame_to_push)
                 
                 # perc and ctrl might be None if estop triggered on very first frame, use fallback
-                _perc_to_draw = perc if perc else getattr(self, '_last_perc', None)
-                _ctrl_to_draw = ctrl if ctrl else getattr(self, '_last_ctrl', None)
+                _perc_to_draw = perc if 'perc' in locals() else getattr(self, '_last_perc', None)
+                _ctrl_to_draw = ctrl if 'ctrl' in locals() else getattr(self, '_last_ctrl', None)
                 if _perc_to_draw and _ctrl_to_draw:
                     push_latest(self._q_bev, _annotate_bev(_perc_to_draw, _ctrl_to_draw))
                 else:
@@ -2082,9 +2082,9 @@ class Orchestrator:
                 lx,ly,lyaw = self.localizer.get_pose()
                 yr     = self.localizer.visual_yaw_rate
                 
-                _p_conf  = perc.confidence if perc else 0.0
-                _p_hconf = perc.heading_conf if perc else 0.0
-                _p_lat   = perc.lateral_error_px if perc else 0.0
+                _p_conf  = _perc_to_draw.confidence if _perc_to_draw else 0.0
+                _p_hconf = _perc_to_draw.heading_conf if _perc_to_draw else 0.0
+                _p_lat   = _perc_to_draw.lateral_error_px if _perc_to_draw else 0.0
 
                 self._loc_panel.push(yr, _p_lat, lx, ly, sm==0)
                 loc_img = self._loc_panel.render(
