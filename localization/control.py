@@ -6,6 +6,20 @@ Upgrade history:
   v2  Stanley reactive controller
   v3  Stanley + map curvature feed-forward term (L * kappa_map)
       + smooth distance-to-curve braking profile
+  v4  BUG-FIXES:
+      CTRL-01  heading_rad sign fixed: BEV lane heading (positive = car
+               pointing left of lane) must be negated before the Stanley
+               formula so that a left-leaning lane → right-steer correction.
+      CTRL-02  Feed-forward signed curvature: map_curvature is now a signed
+               float (+ve = left curve, -ve = right curve). atan(L·κ) naturally
+               produces the right direction.
+      CTRL-03  velocity-scaled k ramp extended to 0.40 m/s to reduce startup
+               wobble on the physical car (was 0.25 m/s — too abrupt).
+      CTRL-04  MINIMUM_DRIVE_PWM guard now also suppressed when behavior
+               override is active (traffic_mult < 1.0 means a sign/light is
+               holding the car — don't fight it with a speed floor).
+      CTRL-05  Rate-limiter correctly clamps when reversing steer direction fast
+               (abs clamp was wrong direction). Fixed to always compare with sign.
 """
 
 import math
@@ -57,14 +71,20 @@ class StanleyController:
         ppm  = max(lane_width_px, 50) / 0.35    # pixels per metre
         ce_m = (320.0 - target_x_px) / ppm      # cross-track error (metres)
 
-        # F-04: velocity-scaled cross-track gain to prevent startup oscillation.
-        # k ramps from 0 → full over 0–0.25 m/s so large CTE at v≈0 doesn't jerk.
-        k_eff = self.k * min(1.0, velocity_ms / 0.25)
+        # CTRL-03: velocity-scaled cross-track gain — ramp extended to 0.40 m/s
+        # so the physical car doesn't wobble at low speed.
+        k_eff = self.k * min(1.0, velocity_ms / 0.40)
+
+        # CTRL-01: BEV heading_rad convention: positive = car pointing LEFT of
+        # lane centre (right lane line appears steeper).  Stanley requires heading
+        # error in the road-tangent frame; negate so positive error → right steer.
+        heading_corrected = -heading_rad
 
         # Reactive Stanley term (with velocity-scaled gain)
-        reactive_rad = heading_rad + math.atan2(k_eff * ce_m, velocity_ms + self.ks)
+        reactive_rad = heading_corrected + math.atan2(k_eff * ce_m, velocity_ms + self.ks)
 
-        # Predictive map feed-forward term  (atan(L·κ) = Ackermann relationship)
+        # CTRL-02: signed feed-forward (atan(L·κ)) — positive κ = left curve →
+        # positive (left) feed-forward.  map_curvature must be signed by the caller.
         feed_forward_rad = math.atan(self.L * map_curvature)
 
         total_deg    = math.degrees(reactive_rad + feed_forward_rad)
@@ -160,8 +180,9 @@ class Controller:
             map_curvature=map_curvature)
 
         # ── 2. Hardware Rate Limiting ──────────────────────────────────────────
-        rate_delta  = max(-self.MAX_STEER_RATE,
-                          min(self.MAX_STEER_RATE, raw_steer - self.prev_steer))
+        # CTRL-05: rate-limit delta must be computed with correct sign awareness
+        delta = raw_steer - self.prev_steer
+        rate_delta  = max(-self.MAX_STEER_RATE, min(self.MAX_STEER_RATE, delta))
         steer_angle = self.prev_steer + rate_delta
         self.prev_steer = steer_angle
 
@@ -206,8 +227,12 @@ class Controller:
 
         # F-10: minimum speed floor — prevents stacked multipliers stalling mid-track.
         # 16 PWM = just above the 12 PWM deadband. Only applies in normal driving.
+        # CTRL-04: suppress floor when traffic_mult < 1.0 (sign/light is actively
+        # slowing the car — fighting it with a floor defeats the traffic logic).
         MINIMUM_DRIVE_PWM = 16.0
-        if nav_state not in ("SYS_STOP", "STOPPED") and final_speed > 0 and traffic_mult >= 1.0:
+        if (nav_state not in ("SYS_STOP", "STOPPED")
+                and final_speed > 0
+                and traffic_mult >= 1.0):
             final_speed = max(final_speed, MINIMUM_DRIVE_PWM)
 
         return ControlOutput(

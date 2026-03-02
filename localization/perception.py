@@ -439,24 +439,33 @@ class VisionPipeline:
         curv = self.tracker.get_curvature(y_eval)
         conf = 1.0 if (sl is not None and sr is not None) else 0.5 if (sl is not None or sr is not None) else 0.0
         
-        # F-02: heading averaged from BOTH lane lines when available
+        # PERC-FIX-01: heading from lane polynomial
+        # _lane_heading returns the lane tangent tilt in BEV image frame.
+        # Positive = top of lane line is to the RIGHT of bottom (lane tilts right
+        # when going upward in image = car is angled LEFT in road frame).
+        # This sign is used by localization and control — must be consistent.
+        def _lane_heading(fit, y):
+            # dy in image = -50 (going up), dx = polyval difference
+            dx = np.polyval(fit, y - 50) - np.polyval(fit, y)
+            # atan2(dx, 50) — positive dx = lane tilts right = car heading left
+            return math.atan2(dx, 50.0)
+        
         heading_rad = 0.0
         h_conf      = 0.0
-        def _lane_heading(fit, y):
-            return math.atan2(np.polyval(fit, y - 50) - np.polyval(fit, y), 50)
-        
+
         if sl is not None and sr is not None:
             hl = _lane_heading(sl, y_eval)
             hr = _lane_heading(sr, y_eval)
             heading_rad = (hl + hr) / 2.0
             # heading_conf is agreement between lane lines: lower if they diverge
             h_conf = max(0.0, 1.0 - abs(hl - hr) * 2.0)
+            h_conf = min(h_conf, 1.0)   # cap at 1.0
         elif sl is not None:
             heading_rad = _lane_heading(sl, y_eval)
-            h_conf = 0.4
+            h_conf = 0.35   # PERC-FIX-02: single-lane is less reliable — use 0.35
         elif sr is not None:
             heading_rad = _lane_heading(sr, y_eval)
-            h_conf = 0.4
+            h_conf = 0.35
         
         return PerceptionResult(
             warped_binary=warped_binary,

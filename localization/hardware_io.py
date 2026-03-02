@@ -135,6 +135,8 @@ class HardwareIO:
         F-16: capture_array() is a blocking call — it returns only when the sensor
         delivers a new frame. No sleep needed; the sensor naturally rate-limits us
         to ~30-60 FPS without burning CPU cycles between captures.
+        HW-FIX-01: removed extra 10ms sleep after capture — it was adding latency
+        for no benefit since capture_array() already blocks for the frame interval.
         """
         while self._running:
             try:
@@ -146,7 +148,6 @@ class HardwareIO:
                     else:
                         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     self._push_frame(cv2.resize(frame, (640, 480)))
-                    time.sleep(0.010)   # Throttle to ~60-90 FPS max to save CPU
             except Exception as e:
                 log.warning(f"Camera worker error: {e}")
                 time.sleep(0.033)   # brief pause only on error, then retry

@@ -140,6 +140,10 @@ class SignMap:
                 result.append(entry)
         return sorted(result, key=lambda e: e["dist"])
 
+    def get_nearby_signs(self, x_m: float, y_m: float, radius_m: float = 4.0) -> list:
+        """Alias for get_nearby, used by main.py."""
+        return self.get_nearby(x_m, y_m, radius_m)
+
     def match_detection(self, detected_label: str, x_m: float, y_m: float,
                         radius_m: float = 3.0) -> dict | None:
         """
@@ -265,4 +269,3 @@ class SignMap:
 
     def __len__(self) -> int:
         return len(self.signs)
-

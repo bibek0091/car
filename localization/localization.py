@@ -252,10 +252,10 @@ class LocalizationEngine:
         dist_out = float('inf')
 
         for la_m in self._CURVE_LA_WINDOWS:
+            accum = 0.0
             start_pos = self.planner.node_positions.get(path[cursor])
             if start_pos is None:
                 continue
-            accum = 0.0
             for i in range(cursor, min(cursor + 50, len(path) - 1)):
                 n1 = path[i]
                 n2 = path[i + 1]
@@ -266,8 +266,9 @@ class LocalizationEngine:
                 seg = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
                 accum += seg
                 if accum >= la_m:
-                    target_yaw = math.atan2(p2[1] - start_pos[1],
-                                            p2[0] - start_pos[0])
+                    # FIX: compare segment heading at lookahead point to car yaw
+                    # (not to the path[cursor] origin — that was causing wrong diff)
+                    target_yaw = math.atan2(p2[1] - p1[1], p2[0] - p1[0])
                     diff = ((target_yaw - curr_yaw + math.pi)
                             % (2 * math.pi) - math.pi)
                     deg  = math.degrees(diff)
@@ -390,9 +391,16 @@ class LocalizationEngine:
             self.y += effective_v * math.sin(self.yaw) * dt
 
             # ── Layer 3b: Lane-Tangent Soft Heading Nudge ─────────────────────
+            # LOC-FIX-02: BEV heading_rad is measured as angle of lane tangent in
+            # image frame (positive = tilting right, i.e. car pointing left).
+            # To nudge the localizer yaw toward the lane, we negate and apply a
+            # small fraction.  The old code negated inside the EMA, which caused
+            # the smoothed value to accumulate the wrong sign over time.
             if camera_confidence > 0.25 and abs(camera_heading_rad) < 0.5:
+                # Negate: BEV positive-right tilt → map positive-left (CCW) heading
+                obs_heading = -camera_heading_rad
                 self._cam_yaw_smoothed = (
-                    self._CAM_YAW_EMA * (-camera_heading_rad)
+                    self._CAM_YAW_EMA * obs_heading
                     + (1.0 - self._CAM_YAW_EMA) * self._cam_yaw_smoothed
                 )
                 nudge = self._cam_yaw_smoothed * camera_confidence
@@ -401,11 +409,11 @@ class LocalizationEngine:
                 self.yaw += nudge * 0.08
                 self.yaw  = (self.yaw + math.pi) % (2 * math.pi) - math.pi
 
-            # LOC-C: absolute heading soft-fusion
+            # LOC-C: absolute heading soft-fusion (LOC-FIX-02: only fires when
+            # heading_conf is HIGH to avoid double-correcting with Layer 3b above)
             if (heading_conf >= self._MIN_HEADING_CONF
-                    and abs(camera_heading_rad) < 0.6):
-                # camera_heading_rad is BEV frame; negate for map yaw comparison.
-                # heading_err is (visual_obs_yaw - current_localizer_yaw).
+                    and abs(camera_heading_rad) < 0.6
+                    and camera_confidence > 0.5):
                 obs_yaw     = -camera_heading_rad
                 heading_err = (obs_yaw - self.yaw + math.pi) % (2 * math.pi) - math.pi
                 if abs(heading_err) < 0.5:
@@ -569,7 +577,10 @@ class LocalizationEngine:
                 return   # don't snap — segment is perpendicular or divergent
 
             dt_clamped = min(dt, 0.10)
-            pull = self._MAP_SNAP_PULL * dt_clamped
+            # LOC-FIX-03: snap pull should be velocity-modulated — pull harder
+            # when stationary, lighter when fast so it doesn't fight dead-reckoning.
+            velocity_scale = max(0.3, 1.0 - effective_v / 0.5)
+            pull = self._MAP_SNAP_PULL * dt_clamped * velocity_scale
             self.x = self.x + pull * (best_foot[0] - self.x)
             self.y = self.y + pull * (best_foot[1] - self.y)
             self._snap_miss_frames = 0

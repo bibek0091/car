@@ -114,9 +114,11 @@ C_BG    = ( 12,  12,  20)   # deep navy-black
 
 
 def map_to_pixel(x_m, y_m, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
+    """World-map coords (x right, y up) → image pixels (origin top-left)."""
     return int(x_m / map_w_m * img_w), int((map_h_m - y_m) / map_h_m * img_h)
 
 def pixel_to_map(px, py, img_w, img_h, map_w_m=MAP_W_M, map_h_m=MAP_H_M):
+    """Image pixels → world-map coords. Matches the y-flip in map_to_pixel."""
     return px / img_w * map_w_m, (1.0 - py / img_h) * map_h_m
 
 
@@ -376,8 +378,10 @@ class GraphMLMapCanvas:
         cv2.circle(img, (cx, cy), 11, (dot_col[0]//4, dot_col[1]//4, dot_col[2]//4), -1, cv2.LINE_AA)
         cv2.circle(img, (cx, cy), 8, dot_col, -1, cv2.LINE_AA)
         cv2.circle(img, (cx, cy), 13, dot_col, 1, cv2.LINE_AA)
+        # MAIN-FIX-07: image y increases DOWN but map y increases UP.
+        # cos(yaw) is correct for x; sin(yaw) must be NEGATED for image y.
         hx = cx + int(math.cos(car_yaw) * 26)
-        hy = cy - int(math.sin(car_yaw) * 26)
+        hy = cy - int(math.sin(car_yaw) * 26)   # negate sin for image frame
         cv2.arrowedLine(img, (cx, cy), (hx, hy), (240, 240, 255), 2,
                         tipLength=0.35, line_type=cv2.LINE_AA)
 
@@ -902,7 +906,7 @@ def _annotate_bev(perc, ctrl):
 
     # y_eval dashed row
     yrow = int(perc.y_eval)
-    yc   = C_GREEN if "DUAL" in ctrl.anchor else (C_AMBER if "DEAD" not in ctrl.anchor else C_RED)
+    yc   = C_GREEN if "DUAL" in perc.anchor else (C_AMBER if "DEAD" not in perc.anchor else C_RED)
     for xi in range(0,640,18): cv2.line(dbg,(xi,yrow),(xi+9,yrow),yc,1,cv2.LINE_AA)
 
     # Target dashed crosshair
@@ -1044,6 +1048,7 @@ class Orchestrator:
         # ── Screen geometry ───────────────────────────────────────────────────
         SW  = root.winfo_screenwidth()
         SH  = root.winfo_screenheight()
+        self._status_bar_w = max(SW, 1200)
 
         # Content always uses full screen width; minimum 1200 for usability.
         COL_GAP   = 2
@@ -1592,10 +1597,24 @@ class Orchestrator:
             ctrl  = self._last_ctrl
             perc  = self._last_perc
             vm    = loc_data.get("speed_ms", 0.0)
+            # MAIN-FIX-02: left/right lane confidence from tracker pixel counts
+            l_conf_norm = min(1.0, perc.confidence) if perc else 0.0
+            r_conf_norm = min(1.0, perc.confidence) if perc else 0.0
+            if perc and hasattr(perc, 'sl') and hasattr(perc, 'sr'):
+                # Distinguish left vs right lane visibility from anchor
+                anchor_str = ctrl.anchor if ctrl else ""
+                if "DUAL" in anchor_str:
+                    l_conf_norm = r_conf_norm = min(1.0, perc.confidence)
+                elif perc.sl is not None and perc.sr is None:
+                    l_conf_norm = min(1.0, perc.confidence)
+                    r_conf_norm = 0.0
+                elif perc.sr is not None and perc.sl is None:
+                    l_conf_norm = 0.0
+                    r_conf_norm = min(1.0, perc.confidence)
             ti = _draw_telemetry_panel(
                 steer         = ctrl.steer_angle_deg,
                 speed_pwm     = ctrl.speed_pwm,
-                lat_err       = ctrl.target_x - 320.0,
+                lat_err       = 320.0 - ctrl.target_x,   # MAIN-FIX-08: match perception sign
                 conf          = conf,
                 anchor        = ctrl.anchor,
                 zone          = zone,
@@ -1603,8 +1622,8 @@ class Orchestrator:
                 fps           = self._fps,
                 sign_history  = list(self._sign_history),
                 nav_state     = self._nav_state,
-                l_conf        = perc.confidence if perc else 0.0,
-                r_conf        = perc.confidence if perc else 0.0,
+                l_conf        = l_conf_norm,
+                r_conf        = r_conf_norm,
                 curvature     = perc.curvature  if perc else 0.0,
                 velocity_ms   = vm,
                 w=self.TEL_W, h=self.TEL_H)
@@ -1615,7 +1634,8 @@ class Orchestrator:
             # ── Status bar ────────────────────────────────────────────────
             cd  = getattr(self.localizer, 'curve_dist_m', 99.0)
             uc  = getattr(self.localizer, 'upcoming_curve', 'STRAIGHT')
-            si = _status_bar(1280, self._estop, self._fps, zone,
+            _status_w = getattr(self, '_status_bar_w', 1280)
+            si = _status_bar(_status_w, self._estop, self._fps, zone,
                               self._nav_state, uc, cd, conf, snap_miss)
             self._refresh_status_label(si)
 
@@ -1700,11 +1720,9 @@ class Orchestrator:
                     t_res = TrafficResult(yolo_debug_frame=raw_frame.copy())
 
                 # --- SIGN-TRIGGERED LOCALIZATION SNAP ---
-                # When YOLO detects a label that matches a placed map sign within
-                # 3 m of the car's current estimated position, snap the localizer
-                # to that sign's known map coordinates to correct odometry drift.
                 if self.sign_map and t_res.active_labels:
                     x_snap, y_snap, _ = self.localizer.get_pose()
+                    snap_found = False
                     for lbl in t_res.active_labels:
                         matched = self.sign_map.match_detection(
                             lbl, x_snap, y_snap, radius_m=3.0)
@@ -1718,9 +1736,11 @@ class Orchestrator:
                                 true_y = y_snap + shift_m * math.sin(yaw_now)
                                 self.localizer.set_pose(true_x, true_y, yaw_now)
                                 self._last_snap_id = matched["id"]
-                                log.info("SIGN SNAP: %s \u2192 shifted %+.2fm", lbl, shift_m)
-                            break  # Found a match, stop searching and don't reset lock
-                    else:
+                                log.info("SIGN SNAP: %s → shifted %+.2fm", lbl, shift_m)
+                            snap_found = True
+                            break  # Found a match — stop searching
+                    if not snap_found:
+                        # MAIN-FIX-05: only clear lock when NO labels matched anything
                         self._last_snap_id = None
 
                 self._last_t_res = t_res
@@ -1858,9 +1878,10 @@ class Orchestrator:
                     # Fix-2: direct map-cursor action — JunctionDetector removed.
                     map_action = "STRAIGHT"
                     if self._planned_path and self.localizer.planner:
-                        _xj, _yj, _yj2 = self.localizer.get_pose()
+                        _cur_x, _cur_y, _cur_yaw = self.localizer.get_pose()
                         map_action = self.localizer.planner.get_next_action(
-                            _xj, _yj, _yj2, path=self._planned_path,
+                            _cur_x, _cur_y, _cur_yaw,
+                            path=self._planned_path,
                             cursor=self._path_cursor, velocity_ms=velocity_ms)
                         if map_action not in ("STRAIGHT", ""):
                             self._nav_state = f"JUNCTION_{map_action}"

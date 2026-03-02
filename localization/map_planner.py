@@ -338,9 +338,8 @@ class PathPlanner:
         now = time.time() if blocked_nodes else 0.0
         active_blocked: set = set()
         if blocked_nodes:
-            import time as _t
             active_blocked = {nid for nid, exp in blocked_nodes.items()
-                              if exp > _t.time()}
+                              if exp > time.time()}
 
         if active_blocked:
             # Build a view with high-cost edges touching blocked nodes
@@ -415,7 +414,12 @@ class PathPlanner:
     def get_path_curvature(self, current_x: float, current_y: float,
                            path: list, cursor: int = 0,
                            window_m: float = 1.2) -> float:
-        """Menger curvature κ = 1/R averaged over the lookahead window."""
+        """
+        Signed Menger curvature κ = ±1/R averaged over the lookahead window.
+        Positive = turning left (CCW), negative = turning right (CW).
+        MAP-FIX-01: was always returning unsigned |κ|, causing the feed-forward
+        to always steer in the same direction regardless of curve side.
+        """
         waypoints, _ = self.get_lookahead_waypoints(
             current_x, current_y, path, cursor=cursor, lookahead_m=window_m
         )
@@ -433,12 +437,13 @@ class PathPlanner:
             l3 = np.linalg.norm(p3 - p1)
             if l1 < 1e-4 or l2 < 1e-4 or l3 < 1e-4:
                 continue
-            area = abs(
-                (p2[0] - p1[0]) * (p3[1] - p1[1]) -
-                (p3[0] - p1[0]) * (p2[1] - p1[1])
-            ) / 2.0
+            # Signed cross product (z-component) determines turn direction
+            cross = (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p3[0] - p1[0]) * (p2[1] - p1[1])
+            area  = abs(cross) / 2.0
             curvature_i = (4.0 * area) / max(l1 * l2 * l3, 1e-8)
-            total_curvature += curvature_i
+            # Positive cross = CCW = left turn → positive curvature
+            signed_curv = curvature_i if cross > 0 else -curvature_i
+            total_curvature += signed_curv
             count += 1
 
         return total_curvature / max(count, 1)
