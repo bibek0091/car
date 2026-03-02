@@ -79,6 +79,7 @@ class HardwareIO:
         self._last_cmd_steer  = 0.0
         self._encoder_fail_count = 0
         self._ENCODER_FAIL_LIMIT = 30
+        self._last_frame      = None
         
         # Hardware Failsafes
         self._last_cmd_time      = time.time()
@@ -104,13 +105,7 @@ class HardwareIO:
             try:
                 self.camera = Picamera2()
                 cfg = self.camera.create_video_configuration(
-                    main={"size": (1280, 720), "format": "BGR888"},
-                    controls={
-                        "AwbEnable":   True,   # let camera balance colors naturally
-                        "AeEnable":    True,
-                        "Saturation":  1.2,
-                        "Sharpness":   1.2,
-                    }
+                    main={"size": (1280, 720), "format": "BGR888"}
                 )
                 self.camera.configure(cfg)
                 self.camera.start()
@@ -192,10 +187,13 @@ class HardwareIO:
     # ── Public camera read ────────────────────────────────────────────────────
 
     def read_camera(self):
-        """Returns the latest 640×480 BGR frame. Never blocks — returns black if queue empty."""
+        """Returns the latest 640x480 BGR frame. Never blocks — returns black if queue empty."""
         try:
-            return self._frame_queue.get_nowait()
+            self._last_frame = self._frame_queue.get_nowait()
+            return self._last_frame
         except queue.Empty:
+            if self._last_frame is not None:
+                return self._last_frame
             return np.zeros((480, 640, 3), dtype=np.uint8)
 
     def capture_frame(self):

@@ -1682,8 +1682,6 @@ class Orchestrator:
 
                 # Always read camera & velocity so dashboard stays live
                 raw_frame = self.hw.read_camera()
-                if raw_frame is None:
-                    raw_frame = np.zeros((480, 640, 3), np.uint8)
                 velocity_ms = self.hw.get_velocity_ms()
 
                 # --- EXTRACT PREDICTIVE MAP DATA (available even during E-STOP) ---
